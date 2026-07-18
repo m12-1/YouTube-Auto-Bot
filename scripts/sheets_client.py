@@ -6,6 +6,7 @@ sheets_client.py
 import json
 import gspread
 import traceback
+import base64
 from google.oauth2.service_account import Credentials
 from scripts import config
 
@@ -17,7 +18,19 @@ SCOPES = [
 
 def _client():
     config.require("GOOGLE_SERVICE_ACCOUNT_JSON")
-    creds_dict = json.loads(config.GOOGLE_SERVICE_ACCOUNT_JSON)
+    
+    # تنظيف النص من أي مسافات زائدة
+    raw_data = config.GOOGLE_SERVICE_ACCOUNT_JSON.strip()
+    
+    # محاولة فك التشفير إذا كان النص Base64، وإلا قراءته كنص عادي مباشر
+    try:
+        decoded_bytes = base64.b64decode(raw_data)
+        decoded_str = decoded_bytes.decode("utf-8")
+        creds_dict = json.loads(decoded_str)
+    except Exception:
+        # مسار احتياطي في حال كان النص عادي وليس Base64
+        creds_dict = json.loads(raw_data)
+        
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
