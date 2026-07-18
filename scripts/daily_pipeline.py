@@ -1,10 +1,9 @@
 """
 daily_pipeline.py
-المنسّق الرئيسي (Orchestrator) — محدث بمسارات مطلقة ونقل للأصول إلى مجلد public.
+المنسّق الرئيسي (Orchestrator) — يستخدم المسارات المطلقة لضمان قراءة الأصول بواسطة Remotion.
 """
 import os
 import json
-import shutil
 import subprocess
 from scripts import config, sheets_client, script_writer, quality_gate
 from scripts import voice_and_captions, asset_fetcher, thumbnail_generator
@@ -14,27 +13,19 @@ from scripts.telegram_alerts import send_alert, alert_step_failed
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 WORKDIR = "pipeline_output"
 
-def move_to_public(src_path: str) -> str:
-    """ينقل الملف إلى مجلد remotion/public/assets ليتسنى لـ Remotion استدعاؤه كمسار ثابت."""
-    dest_dir = "remotion/public/assets"
-    os.makedirs(dest_dir, exist_ok=True)
-    filename = os.path.basename(src_path)
-    dest_path = os.path.join(dest_dir, filename)
-    shutil.copy2(src_path, dest_path)
-    return f"/assets/{filename}"
-
 def render_video_via_remotion(script_data: dict, audio_path: str, captions_path: str,
                                 image_paths: list[str], composition_id: str,
                                 out_path: str, duration_seconds: int):
-    """يستدعي مشروع Remotion بمسارات ثابتة داخل مجلد public لتفادي خطأ 404."""
+    """يستدعي Remotion باستخدام المسارات المطلقة التي سيقرؤها staticFile لاحقاً."""
     payload_path = os.path.abspath(f"{WORKDIR}/render_payload.json")
     
+    # نمرر المسارات المطلقة كما هي، وسيقوم Remotion في ملفات React بوضع staticFile() حولها
     with open(payload_path, "w", encoding="utf-8") as f:
         json.dump({
             "script": script_data,
-            "audioPath": move_to_public(audio_path),
-            "captionsPath": move_to_public(captions_path),
-            "imagePaths": [move_to_public(p) for p in image_paths],
+            "audioPath": os.path.abspath(audio_path),
+            "captionsPath": os.path.abspath(captions_path),
+            "imagePaths": [os.path.abspath(p) for p in image_paths],
             "durationSeconds": duration_seconds,
             "width": config.VIDEO_WIDTH,
             "height": config.VIDEO_HEIGHT,
@@ -60,7 +51,7 @@ def run():
     os.makedirs(WORKDIR, exist_ok=True)
 
     try:
-        # 1) قراءة آخر موضوع مختار من trend_scanner
+        # 1) قراءة آخر موضوع
         trend_records = sheets_client.get_all_records(SPREADSHEET_ID, config.Paths().sheets_trend_log)
         if not trend_records:
             send_alert("لا يوجد موضوع بـ Trend_Log لبدء الإنتاج اليوم.", level="warning")
@@ -84,7 +75,7 @@ def run():
         captions_path = f"{WORKDIR}/long_captions.json"
         voice_and_captions.generate_voice_and_captions(narration_text, audio_path, captions_path)
 
-        # 4) الصور لكل مشهد
+        # 4) الصور
         image_paths = []
         for i, scene in enumerate(long_script["scenes"]):
             urls = asset_fetcher.get_images_for_scene(scene["visual_keywords"])
@@ -102,24 +93,11 @@ def run():
             duration_seconds=config.LONG_VIDEO_TARGET_SECONDS,
         )
 
-        # 6) الغلاف
-        thumbnail_path = thumbnail_generator.build_thumbnail(
-            narration_text, topic, f"{WORKDIR}/thumbnail.jpg"
-        )
-
-        # 7) السيو
+        # 6-9) الغلاف والنشر (كما هي)
+        thumbnail_path = thumbnail_generator.build_thumbnail(narration_text, topic, f"{WORKDIR}/thumbnail.jpg")
         seo_metadata = seo_optimizer.build_seo_metadata(topic, long_script)
-
-        # 8) النشر
-        video_id = publish.publish_pair(
-            long_video_path, seo_metadata, thumbnail_path, None, None
-        )
-
-        # 9) تحديث السجل
-        sheets_client.append_row(
-            SPREADSHEET_ID, config.Paths().sheets_daily_log,
-            [video_id, seo_metadata["title"], "published"],
-        )
+        video_id = publish.publish_pair(long_video_path, seo_metadata, thumbnail_path, None, None)
+        sheets_client.append_row(SPREADSHEET_ID, config.Paths().sheets_daily_log, [video_id, seo_metadata["title"], "published"])
 
     except Exception as e:
         alert_step_failed("daily_pipeline", e)
