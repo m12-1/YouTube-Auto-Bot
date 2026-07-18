@@ -7,8 +7,7 @@ import os
 import requests
 from scripts import config
 
-MIN_WIDTH = 1920  # نفرض دقة كافية لفيديو 1080p بدون تمطيط يفقد الجودة
-
+MIN_WIDTH = 1920  # نفرض دقة كافية لفيديو 1080p
 
 def fetch_pixabay(keyword: str, per_page: int = 3) -> list[str]:
     if not config.PIXABAY_API_KEY:
@@ -19,14 +18,14 @@ def fetch_pixabay(keyword: str, per_page: int = 3) -> list[str]:
         "q": keyword,
         "image_type": "photo",
         "orientation": "horizontal",
-        "min_width": MIN_WIDTH,
         "per_page": per_page,
         "safesearch": "true",
     }
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     hits = r.json().get("hits", [])
-    return [h["largeImageURL"] for h in hits]
+    # نقوم بتصفية النتائج برمجياً للتأكد من الجودة بدلاً من إرسال وسيط غير مدعوم للـ API
+    return [h["largeImageURL"] for h in hits if h.get("imageWidth", 0) >= MIN_WIDTH]
 
 
 def fetch_pexels(keyword: str, per_page: int = 3) -> list[str]:
