@@ -1,5 +1,5 @@
 import React from "react";
-import { Img, interpolate, useCurrentFrame } from "remotion";
+import { Img, interpolate, useCurrentFrame, staticFile } from "remotion";
 
 interface Props {
   src: string;
@@ -9,9 +9,6 @@ interface Props {
   isShort?: boolean; 
 }
 
-/**
- * تأثير Ken Burns: zoom + pan متغير حسب seed كل صورة.
- */
 export const KenBurnsImage: React.FC<Props> = ({
   src, startFrame, durationInFrames, seed, isShort = true,
 }) => {
@@ -40,13 +37,11 @@ export const KenBurnsImage: React.FC<Props> = ({
     translateX = interpolate(progress, [0, 1], [0, panLimit]);
   }
 
-  // إضافة file:// للمسار المطلق للصور
-  const imageSrc = src.startsWith("/") ? `file://${src}` : src;
-
   return (
     <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
+      {/* استخدام staticFile لجلب الصورة من مجلد public/assets */}
       <Img
-        src={imageSrc}
+        src={staticFile(src)}
         style={{
           width: "100%",
           height: "100%",
