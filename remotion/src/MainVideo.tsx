@@ -1,5 +1,5 @@
 import React from "react";
-import { AbsoluteFill, Audio, Sequence } from "remotion";
+import { AbsoluteFill, Audio, Sequence, staticFile } from "remotion";
 import { KenBurnsImage } from "./KenBurnsImage";
 import { SyncedCaptions } from "./SyncedCaptions";
 
@@ -14,10 +14,6 @@ interface Props {
   fps: number;
 }
 
-/**
- * يوزّع الصور على مدة الفيديو بالتساوي مع Ken Burns لكل صورة،
- * وطبقة كابشن فوقها مزامنة بالصوت.
- */
 export const MainVideo: React.FC<Props> = ({
   audioPath,
   captionsPath,
@@ -35,12 +31,10 @@ export const MainVideo: React.FC<Props> = ({
 
   const captions: any[] = []; 
 
-  // إضافة file:// للمسار المطلق حتى يقرأه Remotion من نظام التشغيل مباشرة
-  const audioSrc = audioPath.startsWith("/") ? `file://${audioPath}` : audioPath;
-
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      <Audio src={audioSrc} />
+      {/* استخدام staticFile لجلب الصوت من مجلد public/assets */}
+      <Audio src={staticFile(audioPath)} />
 
       {Array.from({ length: imageCount }).map((_, i) => {
         const src = imagePaths[i % imagePaths.length];
@@ -58,7 +52,6 @@ export const MainVideo: React.FC<Props> = ({
         );
       })}
 
-      {/* تدرّج داكن أسفل الفيديو لضمان وضوح الكابشن فوق أي خلفية */}
       <AbsoluteFill
         style={{
           background: "linear-gradient(to top, rgba(0,0,0,0.65) 0%, rgba(0,0,0,0) 30%)",
