@@ -6,6 +6,7 @@ seo_optimizer.py
 من المنافسين (تحليل نمط فقط، لتفادي "Inauthentic Content").
 """
 import json
+import re
 from scripts import config, gemini_client, competitor_seo
 
 SEO_PROMPT = """
@@ -33,6 +34,13 @@ SEO_PROMPT = """
    بدون وسوم مضللة غير متعلقة فعلياً بالمحتوى
 4. الكل باللغة الإنجليزية، موجه لجمهور أمريكي
 
+شروط تقنية حاسمة للـ JSON:
+1. أرجع JSON فقط بدون أي نصوص أو مقدمات.
+2. استخدم علامات اقتباس مزدوجة (") حصراً للمفاتيح والقيم.
+3. استبدل أي علامة اقتباس مزدوجة داخل النصوص بعلامة مفردة (').
+4. تأكد من عدم وجود فواصل (,) زائدة في نهاية القوائم أو الكائنات (No trailing commas).
+5. تأكد أن الـ JSON صالح وقابل للقراءة (Valid JSON).
+
 السكربت (للفصول والسياق):
 {script_json}
 
@@ -41,7 +49,7 @@ SEO_PROMPT = """
   "title": "...",
   "description": "...",
   "tags": ["...", "..."],
-  "chapters": [{{"timestamp": "00:00", "label": "..."}}, ...],
+  "chapters": [{{"timestamp": "00:00", "label": "..."}}],
   "hashtags": ["#...", "#..."]
 }}
 """
@@ -50,6 +58,18 @@ SEO_PROMPT = """
 def _summarize_competitors(competitors: list[dict]) -> str:
     lines = [f"- {c['title']} | {c['views']:,} views" for c in competitors]
     return "\n".join(lines) if lines else "لا توجد بيانات منافسين متاحة اليوم."
+
+
+def _clean_json_response(raw: str) -> dict:
+    """استخراج كائن JSON من النص مع تجاهل الشوائب لضمان عدم توقف الكود."""
+    try:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"[SEO ERROR] فشل تحليل JSON. سيتم استخدام SEO أساسي لضمان النشر. الخطأ: {e}")
+        return None
 
 
 def build_seo_metadata(topic: str, long_script: dict) -> dict:
@@ -63,7 +83,19 @@ def build_seo_metadata(topic: str, long_script: dict) -> dict:
         prompt, model=config.MODEL_SEO, key_type="advanced",
         json_mode=True, temperature=0.6,
     )
-    metadata = json.loads(raw)
+    
+    metadata = _clean_json_response(raw)
+
+    # نظام الإنقاذ: في حال فشل الذكاء الاصطناعي في إرجاع JSON سليم
+    if not metadata:
+        safe_topic = topic.replace('"', '').replace("'", "")
+        metadata = {
+            "title": f"The Hidden Truth About {safe_topic[:40]}",
+            "description": f"Discover amazing facts and the hidden truth about {safe_topic}.\n\nSubscribe for more daily videos!\n\n#shorts #facts",
+            "tags": ["facts", "interesting", "knowledge", safe_topic],
+            "chapters": [{"timestamp": "00:00", "label": "Intro"}],
+            "hashtags": ["#shorts", "#facts", "#viral"]
+        }
 
     # حماية إضافية: قص العنوان إذا تجاوز الحد رغم التعليمات
     if len(metadata.get("title", "")) > 70:
