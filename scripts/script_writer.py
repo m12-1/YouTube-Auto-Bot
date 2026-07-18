@@ -2,8 +2,10 @@
 script_writer.py
 يكتب سكربت الفيديو الطويل (5 دقائق ~750-800 كلمة) وسكربت الشورت (~120 كلمة)
 لنفس الموضوع، بنية story-driven مع hook قوي بأول 5 ثواني.
+مُعدل: يتضمن منطق تنظيف تلقائي لاستجابات JSON من Gemini.
 """
 import json
+import re
 from scripts import config, gemini_client
 
 LONG_SCRIPT_PROMPT = """
@@ -45,22 +47,30 @@ SHORT_SCRIPT_PROMPT = """
 {{"narration": "...", "visual_keywords": ["...", "..."]}}
 """
 
+def _clean_json_response(raw: str) -> dict:
+    """استخراج أول كائن JSON من النص وتجاهل أي نصوص إضافية."""
+    try:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] فشل تحليل JSON من استجابة Gemini: {raw[:200]}...")
+        raise e
 
 def write_long_script(topic: str) -> dict:
     prompt = LONG_SCRIPT_PROMPT.format(topic=topic)
     raw = gemini_client.generate_text(
         prompt, model=config.MODEL_SCRIPT_WRITER, key_type="advanced", json_mode=True
     )
-    return json.loads(raw)
-
+    return _clean_json_response(raw)
 
 def write_short_script(topic: str) -> dict:
     prompt = SHORT_SCRIPT_PROMPT.format(topic=topic)
     raw = gemini_client.generate_text(
         prompt, model=config.MODEL_SCRIPT_WRITER, key_type="advanced", json_mode=True
     )
-    return json.loads(raw)
-
+    return _clean_json_response(raw)
 
 def full_narration_text(long_script: dict) -> str:
     """يجمع كل السكربت كنص متصل لتمريره لـ TTS."""
