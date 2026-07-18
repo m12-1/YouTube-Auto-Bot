@@ -8,27 +8,27 @@ import re
 from scripts import config, gemini_client
 
 LONG_SCRIPT_PROMPT = """
-اكتب سكربت فيديو يوتيوب معلوماتي مشوّق باللغة الإنجليزية عن الموضوع التالي:
-"{topic}"
+Write an engaging YouTube information video script in English about: "{topic}"
 
-شروط تقنية حاسمة للـ JSON:
-1. ارجع JSON فقط (بدون أي مقدمات أو نصوص خارج الأقواس).
-2. استخدم علامات اقتباس مزدوجة (") حصراً للهيكل.
-3. إذا احتجت لاستخدام اقتباسات داخل النص، استبدلها بعلامة واحدة (').
-4. تأكد أن الـ JSON صالح (Valid JSON).
+Technical JSON Requirements:
+1. Return ONLY the JSON object. No preambles.
+2. Use double quotes (") for the structure.
+3. If quotes are needed inside text, use single quotes (').
+4. Valid JSON is mandatory.
 
-الشروط المحتوائية:
-- المدة المستهدفة: 5 دقائق (~750-800 كلمة)
-- أول جملة hook صادم (لا مقدمات).
-- بنية: hook -> 4 نقاط كقصة -> خاتمة + سؤال تفاعلي.
-- ممنوع أي محتوى سياسي أو حساس أو مخالف للقيم الإسلامية.
+Content Rules:
+- Duration: 5 mins (~750-800 words).
+- Start with a shocking hook.
+- Structure: hook -> 4 story points -> impact conclusion + call to action.
+- Content must be family-friendly and free from controversial/political topics.
+- visual_keywords: 3-5 keywords per scene in ENGLISH ONLY.
 
-أرجع JSON بهذا الشكل:
+Return JSON in this format:
 {{
   "title_draft": "...",
   "hook": "...",
   "scenes": [
-    {{"scene_number": 1, "narration": "...", "visual_keywords": ["...", "..."]}},
+    {{"scene_number": 1, "narration": "...", "visual_keywords": ["keyword1", "keyword2"]}},
     ...
   ],
   "closing_cta": "..."
@@ -36,24 +36,25 @@ LONG_SCRIPT_PROMPT = """
 """
 
 SHORT_SCRIPT_PROMPT = """
-حول هذا الموضوع لسكربت YouTube Short (أقل من 60 ثانية، ~120 كلمة)، بأسلوب صدمة.
-الموضوع: "{topic}"
+Convert the topic "{topic}" into a YouTube Short script (under 60s, ~120 words).
+Style: Fast-paced, shocking hook in the first 2 seconds.
 
-شروط تقنية حاسمة للـ JSON:
-1. ارجع JSON فقط (بدون أي مقدمات).
-2. استخدم علامات اقتباس مزدوجة (") للهيكل، واستبدل أي علامات داخل النص بعلامة (').
-3. تأكد أن الـ JSON صالح (Valid JSON).
+Technical JSON Requirements:
+1. Return ONLY the JSON object.
+2. Use double quotes (") for the structure, replace inner quotes with (').
+3. Valid JSON is mandatory.
 
-ممنوع منعاً باتاً أي محتوى مخالف للقيم الإسلامية أو إخباري حساس.
+Content Rules:
+- No controversial/political/inappropriate content.
+- visual_keywords: 3-5 keywords in ENGLISH ONLY.
 
-أرجع JSON بهذا الشكل:
-{{"narration": "...", "visual_keywords": ["...", "..."]}}
+Return JSON in this format:
+{{"narration": "...", "visual_keywords": ["keyword1", "keyword2"]}}
 """
 
 def _clean_json_response(raw: str) -> dict:
     """استخراج أول كائن JSON من النص وتجاهل أي نصوص إضافية."""
     try:
-        # البحث عن النص المحصور بين أول '{' وآخر '}'
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
             raw = match.group(0)
