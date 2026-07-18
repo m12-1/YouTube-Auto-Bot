@@ -1,7 +1,7 @@
 """
 gemini_client.py
-غلاف موحد فوق google-genai SDK — يختار المفتاح الصحيح حسب نوع المهمة
-(light / advanced / image) بدل ما كل سكربت يكرر نفس منطق الاتصال.
+مُحدث لعام 2026: يدعم موديلات Gemini 3 و Nano Banana الجديدة.
+غلاف موحد فوق google-genai SDK.
 """
 from google import genai
 from scripts import config
@@ -9,6 +9,11 @@ from scripts.retry_utils import with_backoff
 
 _clients = {}
 
+# تعريف الموديلات المحدثة لعام 2026
+MODEL_TEXT_ADVANCED = "gemini-3.5-flash"  # الموديل الأساسي للمهام البرمجية
+MODEL_TEXT_LIGHT = "gemini-3.1-flash-lite" # للمهام السريعة والخفيفة
+MODEL_IMAGE_GEN = "gemini-3.1-flash-image"  # الاسم الجديد لـ Nano Banana 2
+MODEL_EMBEDDING_NEW = "gemini-embedding-2" # الموديل الجديد الموحد للـ Embeddings
 
 def _get_client(key_type: str) -> genai.Client:
     """key_type: 'light' | 'advanced' | 'image'"""
@@ -30,15 +35,18 @@ def _get_client(key_type: str) -> genai.Client:
 
 
 @with_backoff(max_retries=4, base_delay=3.0)
-def generate_text(prompt: str, model: str, key_type: str, json_mode: bool = False,
-                   temperature: float = 0.9) -> str:
+def generate_text(prompt: str, model: str = None, key_type: str = "advanced", json_mode: bool = False,
+                  temperature: float = 0.9) -> str:
     client = _get_client(key_type)
+    # استخدام الموديل الافتراضي الجديد إذا لم يتم تمرير واحد
+    target_model = model or (MODEL_TEXT_ADVANCED if key_type == "advanced" else MODEL_TEXT_LIGHT)
+    
     config_kwargs = {"temperature": temperature}
     if json_mode:
         config_kwargs["response_mime_type"] = "application/json"
 
     response = client.models.generate_content(
-        model=model,
+        model=target_model,
         contents=prompt,
         config=config_kwargs,
     )
@@ -47,11 +55,11 @@ def generate_text(prompt: str, model: str, key_type: str, json_mode: bool = Fals
 
 @with_backoff(max_retries=4, base_delay=3.0)
 def generate_image(prompt: str, model: str = None) -> bytes:
-    """يستخدم مفتاح الصور المعزول (GEMINI_KEY_IMAGE) دائماً."""
+    """يستخدم مفتاح الصور وموديل Nano Banana 2 الجديد."""
     client = _get_client("image")
-    model = model or config.MODEL_THUMBNAIL
+    target_model = model or MODEL_IMAGE_GEN
     response = client.models.generate_content(
-        model=model,
+        model=target_model,
         contents=prompt,
     )
     for part in response.candidates[0].content.parts:
@@ -62,6 +70,7 @@ def generate_image(prompt: str, model: str = None) -> bytes:
 
 @with_backoff(max_retries=3, base_delay=2.0)
 def get_embedding(text: str, key_type: str = "light") -> list[float]:
+    """يستخدم الموديل الجديد الموحد Gemini Embedding 2."""
     client = _get_client(key_type)
-    result = client.models.embed_content(model=config.MODEL_EMBEDDING, contents=text)
+    result = client.models.embed_content(model=MODEL_EMBEDDING_NEW, contents=text)
     return result.embeddings[0].values
