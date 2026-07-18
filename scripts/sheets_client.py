@@ -5,6 +5,7 @@ sheets_client.py
 """
 import json
 import gspread
+import traceback
 from google.oauth2.service_account import Credentials
 from scripts import config
 
@@ -58,6 +59,12 @@ def is_system_enabled(spreadsheet_id: str) -> bool:
         ws = get_sheet(spreadsheet_id, config.Paths().sheets_system_control)
         status = ws.acell("A1").value
         return (status or "ON").strip().upper() != "OFF"
-    except Exception:
+    except Exception as e:
+        print("\n" + "="*50)
+        print("🚨 الخطأ الحقيقي الذي أوقف النظام:")
+        print(f"نوع الخطأ: {e}")
+        print("تفاصيل الخطأ الكاملة:")
+        traceback.print_exc()
+        print("="*50 + "\n")
         # لو فشل القراءة، الأفضل نوقف احتياطاً بدل ما نكمل بشكل أعمى
         return False
