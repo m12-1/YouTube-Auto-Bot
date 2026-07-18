@@ -67,7 +67,7 @@ MODEL_TREND_FILTER = "gemini-3.1-flash-lite"
 MODEL_QUALITY_GATE = "gemini-3.1-flash-lite"
 MODEL_SCRIPT_WRITER = "gemini-3.5-flash"
 MODEL_SEO = "gemini-3.5-flash"
-MODEL_THUMBNAIL = "gemini-3.1-flash-image"
+MODEL_THUMBNAIL = "gemini-3.1-flash-lite-image"
 MODEL_EMBEDDING = "gemini-embedding-2"
 
 
