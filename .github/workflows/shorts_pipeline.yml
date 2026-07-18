@@ -34,12 +34,7 @@ jobs:
 
       - name: تثبيت متطلبات Remotion
         working-directory: remotion
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+        run: npm install --legacy-peer-deps
 
       - name: تشغيل خط إنتاج الشورت
         env:
@@ -56,6 +51,5 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # تمرير متغير الاختبار للسكربت
           TEST_MODE: ${{ github.event.inputs.test_mode || 'true' }}
         run: python -m scripts.shorts_pipeline
