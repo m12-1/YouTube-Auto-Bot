@@ -1,5 +1,5 @@
 import React from "react";
-import { AbsoluteFill, Audio, Sequence, useVideoConfig } from "remotion";
+import { AbsoluteFill, Audio, Sequence } from "remotion";
 import { KenBurnsImage } from "./KenBurnsImage";
 import { SyncedCaptions } from "./SyncedCaptions";
 
@@ -15,9 +15,8 @@ interface Props {
 }
 
 /**
- * يوزّع الصور على مدة الفيديو بالتساوي (تبديل كل 2-3 ثوانٍ حتى لو الصوت
- * مستمر بنفس الفقرة، حسب ما اتفقنا) مع Ken Burns لكل صورة، وطبقة كابشن
- * فوقها مزامنة بالصوت.
+ * يوزّع الصور على مدة الفيديو بالتساوي مع Ken Burns لكل صورة،
+ * وطبقة كابشن فوقها مزامنة بالصوت.
  */
 export const MainVideo: React.FC<Props> = ({
   audioPath,
@@ -28,21 +27,20 @@ export const MainVideo: React.FC<Props> = ({
   width,
   height,
 }) => {
-  const isShort = height > width; // عمودي = شورت
+  const isShort = height > width; 
   const totalFrames = durationSeconds * fps;
-  // بالشورت الإيقاع أسرع (فيديو أقصر وجمهور أسرع تمريراً) — تبديل كل 2 ثانية
-  // بدل 2.5 بالطويل، يحافظ على الحيوية البصرية طوال الـ 55 ثانية
   const secondsPerImage = isShort ? 2 : 2.5;
   const framesPerImage = Math.floor(secondsPerImage * fps);
   const imageCount = Math.max(1, Math.floor(totalFrames / framesPerImage));
 
-  // ملاحظة: captions تُقرأ فعلياً وقت الرندرة عبر fetch من captionsPath
-  // (ملف JSON محلي تم تمريره بالـ props)، هنا تبسيط توضيحي للبنية.
-  const captions: any[] = []; // يُملأ فعلياً بكود تحميل JSON قبل التمرير للمكون
+  const captions: any[] = []; 
+
+  // إضافة file:// للمسار المطلق حتى يقرأه Remotion من نظام التشغيل مباشرة
+  const audioSrc = audioPath.startsWith("/") ? `file://${audioPath}` : audioPath;
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      <Audio src={audioPath} />
+      <Audio src={audioSrc} />
 
       {Array.from({ length: imageCount }).map((_, i) => {
         const src = imagePaths[i % imagePaths.length];
