@@ -8,9 +8,9 @@
     "preview": "remotion studio src/index.ts"
   },
   "dependencies": {
-    "@remotion/cli": "4.0.190",
-    "@remotion/media-utils": "4.0.190",
-    "remotion": "4.0.190",
+    "@remotion/cli": "4.0.255",
+    "@remotion/media-utils": "4.0.255",
+    "remotion": "4.0.255",
     "react": "18.3.1",
     "react-dom": "18.3.1"
   },
