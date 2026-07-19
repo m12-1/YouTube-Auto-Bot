@@ -18,8 +18,10 @@ export const SyncedCaptions: React.FC<Props> = ({ captions, wordsPerGroup = 3, i
   const { fps } = useVideoConfig();
   const currentMs = (frame / fps) * 1000;
 
-  // التحقق من وجود البيانات لتجنب أي خطأ
-  if (!captions || captions.length === 0) return null;
+  // التحقق من وجود البيانات لتجنب أي خطأ برمجياً
+  if (!captions || !Array.isArray(captions) || captions.length === 0) {
+    return null;
+  }
 
   const activeIndex = captions.findIndex(
     (c) => currentMs >= c.start_ms && currentMs < c.start_ms + c.duration_ms + 150
