@@ -23,9 +23,9 @@ from scripts import config
 
 MIN_WIDTH = 1080  # مخفّض من 1920 لأن أغلب صور Pixabay العمودية أضيق من هذا
 
-# نسبة تفضيل الفيديو مقابل الصورة لكل مشهد (0.95 = يحاول فيديو أولاً بـ 95%
-# من المشاهد، لتقريب الإنتاج لمونتاج بشري حيّ بدل الصور الثابتة)
-VIDEO_PREFERENCE_RATIO = 0.95
+# نسبة تفضيل الفيديو مقابل الصورة لكل مشهد (0.70 = يحاول فيديو أولاً بـ 70%
+# من المشاهد و30% صور، حسب الطلب: فيديوهات 70% / صور 30%)
+VIDEO_PREFERENCE_RATIO = 0.70
 
 
 def fetch_pixabay(keyword: str, per_page: int = 3, orientation: str = "horizontal") -> list[str]:
