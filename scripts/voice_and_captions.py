@@ -98,17 +98,31 @@ def generate_voice_and_captions(text: str, audio_out_path: str, captions_out_pat
     return audio_out_path, captions_out_path
 
 
+def _normalize_word(w: str) -> str:
+    """يزيل علامات الترقيم ويحوّل لحروف صغيرة، لمقارنة الكلمات بتجاهل
+    الاختلافات السطحية بين تقطيع edge-tts وتقطيع split() النصي."""
+    return re.sub(r'[^\w]', '', w).lower()
+
+
 def map_scenes_to_timing(scene_narrations: list[str], word_events: list[dict],
                           fps: int, total_frames: int) -> list[dict]:
     """
     تحل مشكلة أساسية بالنسخة السابقة: الصور كانت تتبدّل كل X ثانية ثابتة
     بدون أي علاقة بالمشهد اللي يتكلم عنه الراوي فعلياً. هذي الدالة تربط كل
-    مشهد بزمنه الحقيقي من أحداث WordBoundary (نفس الترتيب اللي انبنى منه
-    النص المُرسل لـ edge-tts، لذا الكلمات تتطابق بالتسلسل).
+    مشهد بزمنه الحقيقي من أحداث WordBoundary.
 
-    ملاحظة دقة: الفصل بـ split() تقريبي (فاصلة/نقطة قد تلتصق بكلمة)، فقد
-    يصير انزياح بسيط (أجزاء من الثانية) مع تراكم المشاهد — مقبول لتوقيت
-    تبديل مشاهد بصرية، وليس حرج مثل توقيت الكابشن كلمة-بكلمة نفسه.
+    ← إصلاح انزياح التزامن التراكمي: النسخة السابقة كانت تتقدّم بمؤشر
+    الكلمات بعدد ثابت (len(narration.split())) بدون التحقق أن هذا يطابق
+    فعلياً عدد كلمات WordBoundary لنفس المقطع. edge-tts لا يقسّم الكلمات
+    بنفس طريقة split() دائماً (اختصارات، أرقام، علامات ترقيم ملتصقة)،
+    فأي فرق ولو بكلمة واحدة في مشهد يزيح كل المشاهد اللي بعده — وهذا
+    يفسّر الملاحظة: يبدأ متزامن، ينزاح تدريجياً، وأحياناً يعود يتصادف
+    بسبب تراكم أخطاء متعاكسة.
+
+    الحل: نطابق فعلياً كلمات كل مشهد (منظّفة من الترقيم) مع كلمات
+    word_events بدءاً من موقع المؤشر الحالي، بدل الافتراض الأعمى بعدد
+    الكلمات. لو حصل عدم تطابق نبحث ضمن نافذة صغيرة حول الموقع المتوقع
+    لنعيد محاذاة المؤشر بدل ما نخليه ينجرف إلى الأبد.
 
     يرجع قائمة [{"start_frame": int, "duration_frames": int}, ...] بنفس
     عدد وترتيب scene_narrations.
@@ -123,8 +137,28 @@ def map_scenes_to_timing(scene_narrations: list[str], word_events: list[dict],
         frames_per_scene = total_frames // count
         return [{"start_frame": i * frames_per_scene, "duration_frames": frames_per_scene} for i in range(count)]
 
+    normalized_events = [_normalize_word(e["word"]) for e in word_events]
+    REALIGN_WINDOW = 6  # نافذة البحث لإعادة المحاذاة عند اكتشاف انزياح
+
     for i, narration in enumerate(scene_narrations):
-        wc = max(1, len(narration.split()))
+        scene_words = [_normalize_word(w) for w in narration.split() if _normalize_word(w)]
+        wc = max(1, len(scene_words))
+
+        # إعادة محاذاة: لو أول كلمة بالمشهد لا تطابق ما هو متوقع عند
+        # word_ptr، نبحث ضمن نافذة قريبة عن أول تطابق حقيقي بدل الاستمرار
+        # بمؤشر منزاح طوال بقية الفيديو
+        if scene_words and word_ptr < n_words_total:
+            target = scene_words[0]
+            if normalized_events[word_ptr] != target:
+                search_start = max(0, word_ptr - REALIGN_WINDOW)
+                search_end = min(n_words_total, word_ptr + REALIGN_WINDOW + 1)
+                for candidate in range(search_start, search_end):
+                    if normalized_events[candidate] == target:
+                        word_ptr = candidate
+                        break
+                # لو ما لقينا تطابق بالنافذة، نكمل بنفس word_ptr الحالي
+                # (أفضل تخمين متاح) بدل تجميد التنفيذ
+
         start_idx = min(word_ptr, max(0, n_words_total - 1))
         end_idx = min(word_ptr + wc - 1, max(0, n_words_total - 1))
 
