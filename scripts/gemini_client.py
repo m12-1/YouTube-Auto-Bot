@@ -35,22 +35,35 @@ def _get_client(key_type: str) -> genai.Client:
 
 
 @with_backoff(max_retries=4, base_delay=3.0)
-def generate_text(prompt: str, model: str = None, key_type: str = "advanced", json_mode: bool = False,
-                  temperature: float = 0.9) -> str:
+def _generate_text_internal(prompt: str, model: str, key_type: str, json_mode: bool, temperature: float) -> str:
+    """دالة داخلية مع backoff تتولى الطلب الفعلي"""
     client = _get_client(key_type)
-    # استخدام الموديل الافتراضي الجديد إذا لم يتم تمرير واحد
-    target_model = model or (MODEL_TEXT_ADVANCED if key_type == "advanced" else MODEL_TEXT_LIGHT)
-    
     config_kwargs = {"temperature": temperature}
     if json_mode:
         config_kwargs["response_mime_type"] = "application/json"
 
     response = client.models.generate_content(
-        model=target_model,
+        model=model,
         contents=prompt,
         config=config_kwargs,
     )
     return response.text
+
+
+def generate_text(prompt: str, model: str = None, key_type: str = "advanced", json_mode: bool = False,
+                  temperature: float = 0.9) -> str:
+    """دالة عامة ذكية: إذا استنفدنا حصة الموديل المتقدم، تسقط تلقائياً للموديل الخفيف"""
+    target_model = model or (MODEL_TEXT_ADVANCED if key_type == "advanced" else MODEL_TEXT_LIGHT)
+    
+    try:
+        return _generate_text_internal(prompt, target_model, key_type, json_mode, temperature)
+    except Exception as e:
+        error_str = str(e).lower()
+        # إذا نفدت الحصة بالكامل (429) وكنا نستخدم المفتاح المتقدم، نلجأ للخفيف
+        if "429" in error_str and key_type == "advanced" and config.GEMINI_KEY_LIGHT:
+            print(f"[GEMINI FALLBACK] حصة الموديل المتقدم نفدت. الانتقال للموديل الخفيف ({MODEL_TEXT_LIGHT})...")
+            return _generate_text_internal(prompt, MODEL_TEXT_LIGHT, "light", json_mode, temperature)
+        raise e
 
 
 @with_backoff(max_retries=4, base_delay=3.0)
