@@ -18,6 +18,8 @@ WORKDIR = "pipeline_output"
 def move_to_public(src_path: str) -> str:
     dest_dir = "remotion/public/assets"
     os.makedirs(dest_dir, exist_ok=True)
+    if not src_path or not os.path.exists(src_path):
+        return ""
     filename = os.path.basename(src_path)
     dest_path = os.path.join(dest_dir, filename)
     shutil.copy2(src_path, dest_path)
@@ -32,7 +34,7 @@ def render_video_via_remotion(script_data: dict, audio_path: str, captions_data:
         json.dump({
             "script": script_data,
             "audioPath": move_to_public(audio_path),
-            "captions": captions_data,  # إرسال بيانات الكابشن مباشرة بدل المسار
+            "captions": captions_data,  # إرسال بيانات الكابشن مباشرة
             "mediaItems": [
                 {
                     "type": m["type"],
@@ -47,6 +49,8 @@ def render_video_via_remotion(script_data: dict, audio_path: str, captions_data:
             "height": 1920,
             "fps": config.VIDEO_FPS,
         }, f, ensure_ascii=False)
+
+    print(f"[REMOTION] جاري الرندرة، تم تمرير {len(media_items)} مشاهد و {len(captions_data)} كلمة.")
 
     subprocess.run(
         [
@@ -142,6 +146,9 @@ def run():
         if not media_items:
             send_alert("توقف إنتاج الشورت: فشل تحميل كل الوسائط المتاحة (فيديو وصور).", level="error")
             return
+        
+        # طباعة المشاهد للتحقق المباشر في سجلات GitHub Actions
+        print(f"[DEBUG] تم تجهيز {len(media_items)} مشاهد للرندرة بنجاح.")
 
         short_video_path = render_video_via_remotion(
             short_script, audio_path, word_events, media_items,
