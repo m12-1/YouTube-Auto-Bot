@@ -81,15 +81,28 @@ CRITICAL JSON Rules (violations will break the system):
 Content Rules:
 - No controversial/political/inappropriate content.
 - STRICTLY FORBIDDEN: alcohol, drugs/narcotics, nudity, sexual content, gambling.
-- Break the narration into 3-5 short scenes (each narration MUST be one single line).
+- Break the narration into 4 short scenes (each narration MUST be one single line).
 - Each scene: one short narration chunk + its OWN visual_keywords.
+
+HOOK RULE (VERY IMPORTANT):
+- The "hook" field must start with a provocative, curiosity-sparking question or statement.
+- Example hooks: "What if I told you..." / "You won't believe what happens when..." / "99% of people don't know this..."
+- The hook sets the emotional tone for the entire video.
+
+VISUAL KEYWORDS RULE (VERY IMPORTANT):
+- visual_keywords MUST be CONCRETE, FILMABLE things that match the narration EXACTLY.
+- Use specific nouns: "ocean waves", "salt crystals", "laboratory beaker" — NOT abstract words like "shocking", "amazing", "facts".
+- If the narration mentions "sea water", use ["ocean waves", "sea surface"] NOT ["waterfall", "river"].
+- If the narration mentions "brain", use ["human brain scan", "neurons"] NOT ["thinking", "mind"].
+- Each keyword should describe a real scene or object that a camera could film.
+- Prefer keywords that return VIDEO FOOTAGE on stock sites (action shots, nature, timelapse, aerial).
 
 Return JSON in this exact format (each value on ONE line only):
 {{
   "hook": "first 1-2 sentences on a single line",
   "scenes": [
-    {{"scene_number": 1, "narration": "single line narration here", "visual_keywords": ["keyword1", "keyword2"]}},
-    {{"scene_number": 2, "narration": "single line narration here", "visual_keywords": ["keyword1", "keyword2"]}}
+    {{"scene_number": 1, "narration": "single line narration here", "visual_keywords": ["concrete noun 1", "concrete noun 2"]}},
+    {{"scene_number": 2, "narration": "single line narration here", "visual_keywords": ["concrete noun 1", "concrete noun 2"]}}
   ],
   "closing_cta": "short call to action on a single line"
 }}
