@@ -92,6 +92,19 @@ def run():
         # السكربت الجديد مقسّم مشاهد (hook/scenes/closing_cta) مثل الطويل
         # تماماً، فنبني نص السرد الكامل ونص كل مشهد بنفس الدالة المشتركة
         narration_text = script_writer.full_narration_text(short_script)
+        
+        # === إضافة فحص Quality Gate ===
+        evaluation = quality_gate.evaluate(narration_text)
+        if not evaluation["passed"]:
+            print(f"[QUALITY GATE] السكربت رسب في الفحص الأول. جاري محاولة كتابة سكربت جديد...")
+            short_script = script_writer.write_short_script(topic)
+            narration_text = script_writer.full_narration_text(short_script)
+            evaluation = quality_gate.evaluate(narration_text)
+            if not evaluation["passed"]:
+                send_alert("توقف إنتاج الشورت: السكربت رسب بـ Quality Gate مرتين.", level="error")
+                return
+        # === نهاية فحص Quality Gate ===
+
         scene_narrations = (
             [short_script["hook"]]
             + [s["narration"] for s in short_script["scenes"]]
