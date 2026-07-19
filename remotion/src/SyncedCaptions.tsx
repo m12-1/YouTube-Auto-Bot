@@ -1,5 +1,5 @@
 import React from "react";
-import { useCurrentFrame, useVideoConfig, interpolate } from "remotion";
+import { useCurrentFrame, useVideoConfig, interpolate, spring } from "remotion";
 
 interface WordEvent {
   word: string;
@@ -31,12 +31,8 @@ export const SyncedCaptions: React.FC<Props> = ({ captions, wordsPerGroup = 4, i
   const groupStart = Math.floor(activeIndex / wordsPerGroup) * wordsPerGroup;
   const groupWords = captions.slice(groupStart, groupStart + wordsPerGroup);
 
-  const pulse = interpolate(
-    currentMs - captions[activeIndex].start_ms,
-    [0, captions[activeIndex].duration_ms],
-    [1.08, 1],
-    { extrapolateRight: "clamp" }
-  );
+  // حساب فريم بداية الكلمة النشطة لعمل تأثير spring
+  const activeWordStartFrame = Math.round((captions[activeIndex].start_ms / 1000) * fps);
 
   const bottomSafe = isShort ? "26%" : "12%";
   const rightSafe = isShort ? "14%" : "6%";
@@ -50,14 +46,29 @@ export const SyncedCaptions: React.FC<Props> = ({ captions, wordsPerGroup = 4, i
         fontWeight: 800, textTransform: "uppercase", textAlign: "center",
       }}>
       {groupWords.map((w, i) => {
-        const isActive = captions.indexOf(w) === activeIndex;
+        const wordGlobalIndex = groupStart + i;
+        const isActive = wordGlobalIndex === activeIndex;
+
+        // Spring animation: الكلمة تدخل بنبضة (pop-in) ثم تستقر
+        const scaleSpring = isActive
+          ? spring({
+              frame: frame - activeWordStartFrame,
+              fps,
+              config: { damping: 12, stiffness: 200, mass: 0.6 },
+            })
+          : 1;
+
+        // حجم أكبر قليلاً للكلمة المنطوقة + glow
+        const activeScale = isActive ? 1.0 + scaleSpring * 0.12 : 1.0;
+
         return (
-          <span key={i} style={{
+          <span key={`${groupStart}-${i}`} style={{
               color: isActive ? "#00E5FF" : "#FFFFFF",
-              textShadow: "0px 4px 10px rgba(0,0,0,0.85)",
-              transform: isActive ? `scale(${pulse})` : "scale(1)",
+              textShadow: isActive
+                ? "0px 0px 20px rgba(0,229,255,0.6), 0px 4px 10px rgba(0,0,0,0.85)"
+                : "0px 4px 10px rgba(0,0,0,0.85)",
+              transform: `scale(${activeScale})`,
               display: "inline-block",
-              transition: "color 0.1s ease-in-out",
             }}>
             {w.word}
           </span>

@@ -2,6 +2,7 @@ import React from "react";
 import { AbsoluteFill, Audio, Sequence, staticFile } from "remotion";
 import { SceneMedia, MediaItem } from "./SceneMedia";
 import { SyncedCaptions } from "./SyncedCaptions";
+import { HookEffect } from "./HookEffect";
 import { TRANSITION_FRAMES } from "./transitionConfig";
 
 interface RawMediaItem extends MediaItem {
@@ -82,6 +83,9 @@ export const MainVideo: React.FC<Props> = ({
 
       {/* تمرير مصفوفة الكابشن مباشرة لتعمل فوراً بالرندرة */}
       <SyncedCaptions captions={captions || []} isShort={isShort} />
+
+      {/* تأثير بصري "خطاف" في أول 3 ثوانٍ لجذب المشاهد */}
+      <HookEffect isShort={isShort} />
     </AbsoluteFill>
   );
 };
