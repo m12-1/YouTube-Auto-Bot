@@ -18,7 +18,7 @@ interface WordEvent {
 interface Props {
   script: { hook: string; scenes: any[]; closing_cta: string };
   audioPath: string;
-  captions: WordEvent[]; // أصبحت بيانات مباشرة بدلاً من مسار
+  captions: WordEvent[]; // بيانات حية بدل رابط
   mediaItems: RawMediaItem[];
   durationSeconds: number;
   width: number;
@@ -42,7 +42,7 @@ export const MainVideo: React.FC<Props> = ({
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      <Audio src={staticFile(audioPath)} />
+      {audioPath && <Audio src={staticFile(audioPath)} />}
 
       {items.map((item, i) => {
         const isFirst = i === 0;
@@ -80,7 +80,7 @@ export const MainVideo: React.FC<Props> = ({
         }}
       />
 
-      {/* الكابشن يظهر الآن فوراً بدون انتظار تحميل */}
+      {/* تمرير مصفوفة الكابشن مباشرة لتعمل فوراً بالرندرة */}
       <SyncedCaptions captions={captions || []} isShort={isShort} />
     </AbsoluteFill>
   );
