@@ -20,12 +20,8 @@ Content Rules:
 - Duration: 5 mins (~750-800 words).
 - Start with a shocking hook.
 - Structure: hook -> 4 story points -> impact conclusion + call to action.
-- Content must be family-friendly and free from controversial/political topics,
-  and completely free of news events, real controversial public figures.
-- STRICTLY FORBIDDEN, even indirectly: alcohol, drugs/narcotics, nudity or
-  sexual content, gambling, or anything else considered inappropriate under
-  Islamic values. Do not reference these topics in any way, even briefly.
-- visual_keywords: 3-5 keywords per scene in ENGLISH ONLY.
+- Content must be family-friendly and free from controversial/political topics.
+- STRICTLY FORBIDDEN: alcohol, drugs/narcotics, nudity, sexual content, gambling.
 
 Return JSON in this format:
 {{
@@ -37,6 +33,7 @@ Return JSON in this format:
   ],
   "closing_cta": "..."
 }}
+OUTPUT JSON ONLY:
 """
 
 SHORT_SCRIPT_PROMPT = """
@@ -49,17 +46,10 @@ Technical JSON Requirements:
 3. Valid JSON is mandatory.
 
 Content Rules:
-- No controversial/political/inappropriate content, no news events or real
-  controversial public figures.
-- STRICTLY FORBIDDEN, even indirectly: alcohol, drugs/narcotics, nudity or
-  sexual content, gambling, or anything else considered inappropriate under
-  Islamic values. Do not reference these topics in any way, even briefly.
-- Break the narration into 3-5 short scenes (a natural beat/idea change each
-  time), NOT one giant block. This is required so visuals can change in sync
-  with what is being said, instead of one static topic for the whole video.
-- Each scene: one short narration chunk (1-3 sentences) + its OWN
-  visual_keywords (2-4 keywords, ENGLISH ONLY) that describe what should be
-  shown ON SCREEN during exactly that chunk, not the topic in general.
+- No controversial/political/inappropriate content.
+- STRICTLY FORBIDDEN: alcohol, drugs/narcotics, nudity, sexual content, gambling.
+- Break the narration into 3-5 short scenes.
+- Each scene: one short narration chunk + its OWN visual_keywords.
 
 Return JSON in this format:
 {{
@@ -70,14 +60,17 @@ Return JSON in this format:
   ],
   "closing_cta": "short call to action, e.g. follow for more"
 }}
+OUTPUT JSON ONLY:
 """
 
 def _clean_json_response(raw: str) -> dict:
-    """استخراج أول كائن JSON من النص وتجاهل أي نصوص إضافية."""
+    """استخراج أول كائن JSON بدقة وتجاهل أي نصوص إضافية أو تعليقات."""
     try:
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            raw = match.group(0)
+        # البحث عن أول { وآخر } لضمان استخراج الكائن كاملاً
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1:
+            raw = raw[start:end+1]
         return json.loads(raw)
     except json.JSONDecodeError as e:
         print(f"[ERROR] فشل تحليل JSON. النص المرجع: {raw[:300]}...")
@@ -98,12 +91,6 @@ def write_short_script(topic: str) -> dict:
     return _clean_json_response(raw)
 
 def full_narration_text(script: dict) -> str:
-    """
-    يجمع كل السكربت كنص متصل لتمريره لـ TTS. تعمل الآن على شكل السكربت
-    الطويل والشورت معاً لأن الاثنين صاروا بنفس البنية (hook/scenes/closing_cta)
-    بعد تحديث SHORT_SCRIPT_PROMPT — هذا ضروري لمزامنة الوسائط مع كل مشهد
-    (راجع voice_and_captions.map_scenes_to_timing).
-    """
     parts = [script["hook"]]
     parts += [s["narration"] for s in script["scenes"]]
     parts.append(script["closing_cta"])
