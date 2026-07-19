@@ -8,12 +8,36 @@ import asyncio
 import json
 import edge_tts
 
-VOICE = "en-US-GuyNeural" 
+VOICE = "en-US-GuyNeural"  # صوت أمريكي واضح، يمكن تغييره لاحقاً حسب الأداء
 
-async def _generate(text: str, audio_out_path: str, captions_out_path: str):
+
+def _build_synthetic_word_events(text: str, total_duration_ms: float = 55_000) -> list[dict]:
+    """
+    Fallback: عندما لا تصل أحداث WordBoundary من edge-tts (مشكلة شائعة فيبيئات
+    CI مثل GitHub Actions حيث يُحجب WebSocket أحياناً)، نولد توقيتاً اصطناعياً
+    بتقسيم المدة الكلية بالتساوي على عدد الكلمات الفعليين.
+
+    هذا يضمن أن الكابشن يظهر والمشاهد تتوزع بشكل صحيح بدل أن يكون
+    الفيديو بصورة واحدة فقط (كان يحدث لأن كل المشاهد تحصل على start_frame=0).
+    """
+    words = text.split()
+    if not words:
+        return []
+    ms_per_word = total_duration_ms / len(words)
+    events = []
+    for i, word in enumerate(words):
+        events.append({
+            "word": word,
+            "start_ms": round(i * ms_per_word, 2),
+            "duration_ms": round(ms_per_word * 0.85, 2),  # 85% مدة + 15% فراغ بين الكلمات
+        })
+    return events
+
+
+async def _generate(text: str, audio_out_path: str, captions_out_path: str,
+                    target_duration_ms: float = 55_000):
     communicate = edge_tts.Communicate(text, VOICE)
     word_events = []
-    words = text.split()
 
     with open(audio_out_path, "wb") as audio_file:
         async for chunk in communicate.stream():
@@ -22,60 +46,71 @@ async def _generate(text: str, audio_out_path: str, captions_out_path: str):
             elif chunk["type"] == "WordBoundary":
                 word_events.append({
                     "word": chunk["text"],
-                    "start_ms": chunk["offset"] / 10000,
+                    "start_ms": chunk["offset"] / 10000,   # يحوّل من 100-nanosecond units لـ ms
                     "duration_ms": chunk["duration"] / 10000,
                 })
 
-    # خيار احتياطي: إذا فشل الـ WordBoundary (بسبب حجب الـ WebSockets في الـ CI)
-    if not word_events and words:
-        total_duration_ms = 55000  # تقدير لـ 55 ثانية للشورت
-        ms_per_word = total_duration_ms / len(words)
-        for i, word in enumerate(words):
-            word_events.append({
-                "word": word,
-                "start_ms": i * ms_per_word,
-                "duration_ms": ms_per_word,
-            })
+    # ← إصلاح رئيسي: لو edge-tts لم يُرجع أي WordBoundary events (يحدث في CI)
+    # نولد توقيتاً اصطناعياً متساوياً بدل الاستسلام بـ [] وتحطيم الفيديو
+    if not word_events:
+        print(f"[WARNING] edge-tts لم يُنتج WordBoundary events. "
+              f"سيُستخدم توقيت اصطناعي متساوٍ لـ {len(text.split())} كلمة.")
+        word_events = _build_synthetic_word_events(text, target_duration_ms)
 
     with open(captions_out_path, "w", encoding="utf-8") as f:
         json.dump(word_events, f, ensure_ascii=False, indent=2)
 
-def generate_voice_and_captions(text: str, audio_out_path: str, captions_out_path: str):
-    asyncio.run(_generate(text, audio_out_path, captions_out_path))
+
+def generate_voice_and_captions(text: str, audio_out_path: str, captions_out_path: str,
+                                 target_duration_ms: float = 55_000):
+    asyncio.run(_generate(text, audio_out_path, captions_out_path, target_duration_ms))
     return audio_out_path, captions_out_path
+
 
 def map_scenes_to_timing(scene_narrations: list[str], word_events: list[dict],
                           fps: int, total_frames: int) -> list[dict]:
+    """
+    تحل مشكلة أساسية بالنسخة السابقة: الصور كانت تتبدّل كل X ثانية ثابتة
+    بدون أي علاقة بالمشهد اللي يتكلم عنه الراوي فعلياً. هذي الدالة تربط كل
+    مشهد بزمنه الحقيقي من أحداث WordBoundary (نفس الترتيب اللي انبنى منه
+    النص المُرسل لـ edge-tts، لذا الكلمات تتطابق بالتسلسل).
+
+    ملاحظة دقة: الفصل بـ split() تقريبي (فاصلة/نقطة قد تلتصق بكلمة)، فقد
+    يصير انزياح بسيط (أجزاء من الثانية) مع تراكم المشاهد — مقبول لتوقيت
+    تبديل مشاهد بصرية، وليس حرج مثل توقيت الكابشن كلمة-بكلمة نفسه.
+
+    يرجع قائمة [{"start_frame": int, "duration_frames": int}, ...] بنفس
+    عدد وترتيب scene_narrations.
+    """
     timings = []
+    word_ptr = 0
     n_words_total = len(word_events)
-    
-    # إصلاح: توزيع متساوٍ للمشاهد في حال فشل التوقيت الصوتي
+
     if n_words_total == 0:
-        scene_duration = total_frames // len(scene_narrations)
-        for i in range(len(scene_narrations)):
-            timings.append({
-                "start_frame": i * scene_duration,
-                "end_frame": (i + 1) * scene_duration
-            })
-    else:
-        word_ptr = 0
-        for i, narration in enumerate(scene_narrations):
-            wc = max(1, len(narration.split()))
-            start_idx = min(word_ptr, max(0, n_words_total - 1))
-            end_idx = min(word_ptr + wc - 1, max(0, n_words_total - 1))
+        # Uniform distribution fallback
+        count = len(scene_narrations)
+        frames_per_scene = total_frames // count
+        return [{"start_frame": i * frames_per_scene, "duration_frames": frames_per_scene} for i in range(count)]
 
-            start_ms = word_events[start_idx]["start_ms"]
-            end_ms = word_events[end_idx]["start_ms"] + word_events[end_idx]["duration_ms"]
+    for i, narration in enumerate(scene_narrations):
+        wc = max(1, len(narration.split()))
+        start_idx = min(word_ptr, max(0, n_words_total - 1))
+        end_idx = min(word_ptr + wc - 1, max(0, n_words_total - 1))
 
-            start_frame = round((start_ms / 1000) * fps)
-            end_frame = round((end_ms / 1000) * fps)
-            word_ptr += wc
-            timings.append({"start_frame": start_frame, "end_frame": end_frame})
+        start_ms = word_events[start_idx]["start_ms"]
+        end_ms = word_events[end_idx]["start_ms"] + word_events[end_idx]["duration_ms"]
 
-    # ضبط التسلسل
+        start_frame = round((start_ms / 1000) * fps)
+        end_frame = round((end_ms / 1000) * fps)
+        word_ptr += wc
+        timings.append({"start_frame": start_frame, "end_frame": end_frame})
+
+    # نضمن التسلسل الصحيح: كل مشهد يبدأ حيث انتهى اللي قبله بالضبط (بدون
+    # فجوة سوداء أو تراكب)، وآخر مشهد يمتد لنهاية الفيديو فعلياً
     for i in range(len(timings) - 1):
         timings[i]["end_frame"] = timings[i + 1]["start_frame"]
     if timings:
+        timings[0]["start_frame"] = 0
         timings[-1]["end_frame"] = max(timings[-1]["end_frame"], total_frames)
 
     result = []
@@ -83,3 +118,12 @@ def map_scenes_to_timing(scene_narrations: list[str], word_events: list[dict],
         duration = max(1, t["end_frame"] - t["start_frame"])
         result.append({"start_frame": t["start_frame"], "duration_frames": duration})
     return result
+
+
+if __name__ == "__main__":
+    import sys
+    generate_voice_and_captions(
+        sys.argv[1] if len(sys.argv) > 1 else "This is a test narration.",
+        "output_audio.mp3",
+        "output_captions.json",
+    )
