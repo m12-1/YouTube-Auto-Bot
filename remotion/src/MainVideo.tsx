@@ -1,8 +1,5 @@
-import React, { useEffect, useState } from "react";
-import {
-  AbsoluteFill, Audio, Sequence, staticFile,
-  continueRender, delayRender,
-} from "remotion";
+import React from "react";
+import { AbsoluteFill, Audio, Sequence, staticFile } from "remotion";
 import { SceneMedia, MediaItem } from "./SceneMedia";
 import { SyncedCaptions } from "./SyncedCaptions";
 import { TRANSITION_FRAMES } from "./transitionConfig";
@@ -12,10 +9,16 @@ interface RawMediaItem extends MediaItem {
   durationFrames: number;
 }
 
+interface WordEvent {
+  word: string;
+  start_ms: number;
+  duration_ms: number;
+}
+
 interface Props {
   script: { hook: string; scenes: any[]; closing_cta: string };
   audioPath: string;
-  captionsPath: string;
+  captions: WordEvent[]; // أصبحت بيانات مباشرة بدلاً من مسار
   mediaItems: RawMediaItem[];
   durationSeconds: number;
   width: number;
@@ -23,26 +26,9 @@ interface Props {
   fps: number;
 }
 
-/**
- * إعادة بناء كاملة لمنطق عرض الوسائط (كانت أهم نقطة بطلب "مونتاج احترافي
- * بدل سلايدشو"):
- *
- * النسخة السابقة: كانت تدور فوق imagePaths بفترة ثابتة (2/2.5 ثانية) بدون
- * أي علاقة بالمحتوى المسموع فعلياً — هذا اللي يعطي إحساس "سلايدشو آلي".
- *
- * النسخة الحالية: تستقبل mediaItems جاهزة من بايثون، كل عنصر مرتبط فعلياً
- * بزمن مشهده الحقيقي بالصوت (voice_and_captions.map_scenes_to_timing)، وقد
- * يكون فيديو (b-roll) أو صورة. كل مشهد يُمدَّد بمقدار TRANSITION_FRAMES
- * على طرفيه (إلا الأول والأخير) لخلق تراكب زمني حقيقي بين Sequence
- * ومجاوره، والتلاشي داخل SceneMedia يحوّل هذا التراكب لانتقال crossfade
- * بدل قطع جاف.
- *
- * إصلاح جوهري محفوظ من النسخة السابقة: تحميل captionsPath فعلياً عبر
- * fetch + delayRender/continueRender بدل مصفوفة فارغة ثابتة بالكود.
- */
 export const MainVideo: React.FC<Props> = ({
   audioPath,
-  captionsPath,
+  captions,
   mediaItems,
   durationSeconds,
   fps,
@@ -51,23 +37,6 @@ export const MainVideo: React.FC<Props> = ({
 }) => {
   const isShort = height > width;
   const totalFrames = durationSeconds * fps;
-
-  const [handle] = useState(() => delayRender("جاري تحميل ملف الكابشن JSON"));
-  const [captions, setCaptions] = useState<any[]>([]);
-
-  useEffect(() => {
-    fetch(staticFile(captionsPath))
-      .then((res) => res.json())
-      .then((data) => {
-        setCaptions(data);
-        continueRender(handle);
-      })
-      .catch((err) => {
-        console.error("فشل تحميل ملف الكابشن، سيُكمل الرندرة بدون كابشن:", err);
-        continueRender(handle); // نكمل الرندرة بدل ما تعلّق للأبد لو فشل التحميل
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const items = mediaItems && mediaItems.length > 0 ? mediaItems : [];
 
@@ -79,8 +48,6 @@ export const MainVideo: React.FC<Props> = ({
         const isFirst = i === 0;
         const isLast = i === items.length - 1;
 
-        // نمدّد المشهد على طرفيه بمقدار TRANSITION_FRAMES (إلا الأطراف
-        // المطلقة لبداية/نهاية الفيديو كامل) عشان يتراكب زمنياً مع جاره
         const renderFrom = isFirst
           ? item.startFrame
           : Math.max(0, item.startFrame - TRANSITION_FRAMES);
@@ -113,7 +80,8 @@ export const MainVideo: React.FC<Props> = ({
         }}
       />
 
-      <SyncedCaptions captions={captions} isShort={isShort} />
+      {/* الكابشن يظهر الآن فوراً بدون انتظار تحميل */}
+      <SyncedCaptions captions={captions || []} isShort={isShort} />
     </AbsoluteFill>
   );
 };
