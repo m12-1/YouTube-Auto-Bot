@@ -1,0 +1,60 @@
+# ⚠️ معطّل حالياً حسب قرارك: نبدأ بالشورتس فقط. لا تفعّل هذا الجدول
+# (uncomment الـ schedule بالأسفل) إلا بعد أسابيع من نتائج مستقرة على مسار
+# الشورتس (shorts_pipeline.yml). التشغيل اليدوي فقط متاح الآن للاختبار.
+name: Long Video Pipeline (FUTURE - Disabled)
+
+on:
+  # schedule:
+  #   - cron: "0 1 * * *"    # 01:00 UTC = 04:00 بتوقيت بغداد (فعّلها لاحقاً)
+  workflow_dispatch: {}
+
+jobs:
+  produce_and_publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # الرندرة قد تأخذ وقتاً، لكن المهلة القصوى لكل job هي 6 ساعات أصلاً
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: تثبيت متطلبات بايثون
+        run: pip install -r requirements.txt
+
+      - name: تثبيت ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: تثبيت متطلبات Remotion
+        working-directory: remotion
+        run: npm ci
+
+      - name: تشغيل خط الإنتاج الكامل
+        env:
+          GEMINI_KEY_LIGHT: ${{ secrets.GEMINI_KEY_LIGHT }}
+          GEMINI_KEY_ADVANCED: ${{ secrets.GEMINI_KEY_ADVANCED }}
+          GEMINI_KEY_IMAGE: ${{ secrets.GEMINI_KEY_IMAGE }}
+          YOUTUBE_SEARCH_API_KEY: ${{ secrets.YOUTUBE_SEARCH_API_KEY }}
+          YOUTUBE_OAUTH_CLIENT_ID: ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
+          YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
+          YOUTUBE_OAUTH_REFRESH_TOKEN: ${{ secrets.YOUTUBE_OAUTH_REFRESH_TOKEN }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m scripts.daily_pipeline
+
+      - name: تشخيص ذاتي عند الفشل (self-heal)
+        if: failure()
+        env:
+          GEMINI_KEY_ADVANCED: ${{ secrets.GEMINI_KEY_ADVANCED }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: echo "راجع سجل الخطأ أعلاه — self_heal.py يُستدعى يدوياً حالياً بهذا الإصدار (MVP)"
