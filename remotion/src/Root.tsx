@@ -7,7 +7,7 @@ import { MainVideo } from "./MainVideo";
 const defaultProps = {
   script: { hook: "", scenes: [], closing_cta: "" },
   audioPath: "",
-  captionsPath: "",
+  captions: [], // التعديل هنا: تم تغيير captionsPath إلى مصفوفة فارغة لتمرير البيانات مباشرة
   // mediaItems يحل محل imagePaths القديم: كل عنصر يمثل مشهد واحد بزمنه
   // الحقيقي بالصوت (startFrame/durationFrames) بدل صور تدور بفترة ثابتة
   mediaItems: [],
