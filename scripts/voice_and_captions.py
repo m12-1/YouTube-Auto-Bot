@@ -7,6 +7,7 @@ voice_and_captions.py
 import asyncio
 import json
 import edge_tts
+import re
 
 VOICE = "en-US-GuyNeural"  # صوت أمريكي واضح، يمكن تغييره لاحقاً حسب الأداء
 
@@ -23,14 +24,37 @@ def _build_synthetic_word_events(text: str, total_duration_ms: float = 55_000) -
     words = text.split()
     if not words:
         return []
-    ms_per_word = total_duration_ms / len(words)
+        
+    # حساب الأوزان الزمنية لكل كلمة: الكلمات الطويلة تستغرق وقتاً أطول، 
+    # وعلامات الترقيم تعني وجود "وقفة" (صمت) بعدها في الصوت الحقيقي.
+    weights = []
+    for word in words:
+        clean_word = re.sub(r'[^\w]', '', word)
+        char_count = max(1, len(clean_word))
+        
+        weight = char_count * 1.0
+        
+        if re.search(r'[.!?]+$', word):
+            weight += 8.0  # وقفة طويلة نهاية الجملة
+        elif re.search(r'[,;:]+$', word):
+            weight += 4.0  # وقفة قصيرة في المنتصف
+            
+        weights.append(weight)
+
+    total_weight = sum(weights)
+    ms_per_weight_unit = total_duration_ms / total_weight
+    
     events = []
-    for i, word in enumerate(words):
+    current_ms = 0.0
+    for word, weight in zip(words, weights):
+        word_duration = weight * ms_per_weight_unit
         events.append({
             "word": word,
-            "start_ms": round(i * ms_per_word, 2),
-            "duration_ms": round(ms_per_word * 0.85, 2),  # 85% مدة + 15% فراغ بين الكلمات
+            "start_ms": round(current_ms, 2),
+            "duration_ms": round(word_duration * 0.95, 2),
         })
+        current_ms += word_duration
+        
     return events
 
 
