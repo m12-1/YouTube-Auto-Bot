@@ -9,6 +9,7 @@ import traceback
 import base64
 from google.oauth2.service_account import Credentials
 from scripts import config
+from scripts.retry_utils import with_backoff
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -35,17 +36,20 @@ def _client():
     return gspread.authorize(creds)
 
 
+@with_backoff(max_retries=3, base_delay=5.0)
 def get_sheet(spreadsheet_id: str, worksheet_name: str):
     gc = _client()
     sh = gc.open_by_key(spreadsheet_id)
     return sh.worksheet(worksheet_name)
 
 
+@with_backoff(max_retries=3, base_delay=5.0)
 def append_row(spreadsheet_id: str, worksheet_name: str, row: list):
     ws = get_sheet(spreadsheet_id, worksheet_name)
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
+@with_backoff(max_retries=3, base_delay=5.0)
 def get_all_records(spreadsheet_id: str, worksheet_name: str) -> list[dict]:
     ws = get_sheet(spreadsheet_id, worksheet_name)
     return ws.get_all_records()
