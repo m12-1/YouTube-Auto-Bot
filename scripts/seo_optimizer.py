@@ -130,16 +130,34 @@ def build_seo_metadata(topic: str, long_script: dict) -> dict:
 
     metadata = None
     # محاولتان بدرجة حرارة منخفضة تدريجياً قبل اللجوء للسيو الاحتياطي الضعيف —
-    # لأن السيو هو أهم جزء بالمشروع حسب طلبك، لا نستسلم من أول فشل بارسنق
-    for attempt, temperature in enumerate([0.6, 0.3]):
-        raw = gemini_client.generate_text(
-            prompt, model=config.MODEL_SEO, key_type="advanced",
-            json_mode=True, temperature=temperature,
-        )
-        metadata = _clean_json_response(raw)
-        if metadata:
-            break
-        print(f"[SEO] محاولة {attempt + 1} فشلت بتحليل JSON، إعادة المحاولة...")
+    # لأن السيو هو أهم جزء بالمشروع حسب طلبك، لا نستسلم من أول فشل بارسنق.
+    # ملاحظة: نستخدم الموديل الخفيف (light) لأن الموديل المتقدم (advanced)
+    # ربما استنفد حصته على كتابة السكربت — كل موديل له حصته المنفصلة.
+    seo_model = config.MODEL_SEO
+    seo_key = "advanced"
+    # لو المفتاح الخفيف متاح — نستخدمه لتوزيع الحمل على مفتاح مختلف
+    if config.GEMINI_KEY_LIGHT:
+        seo_key = "light"
+
+    try:
+        for attempt, temperature in enumerate([0.6, 0.3]):
+            try:
+                raw = gemini_client.generate_text(
+                    prompt, model=seo_model, key_type=seo_key,
+                    json_mode=True, temperature=temperature,
+                )
+                metadata = _clean_json_response(raw)
+                if metadata:
+                    break
+                print(f"[SEO] محاولة {attempt + 1} فشلت بتحليل JSON، إعادة المحاولة...")
+            except Exception as inner_e:
+                print(f"[SEO WARNING] محاولة {attempt + 1} فشلت: {inner_e}")
+                # لو المفتاح الخفيف فشل، نجرب المتقدم كملاذ أخير
+                if seo_key == "light" and config.GEMINI_KEY_ADVANCED:
+                    seo_key = "advanced"
+                    print("[SEO] تبديل للمفتاح المتقدم كمحاولة أخيرة...")
+    except Exception as e:
+        print(f"[SEO ERROR] فشل توليد SEO بالكامل: {e}. سيُستخدم SEO احتياطي.")
 
     # نظام الإنقاذ الأخير: فقط لو فشلت كل المحاولات فعلياً
     if not metadata:
@@ -151,9 +169,11 @@ def build_seo_metadata(topic: str, long_script: dict) -> dict:
             "chapters": [{"timestamp": "00:00", "label": "Intro"}],
             "hashtags": ["#shorts", "#facts", "#viral"]
         }
+        print("[SEO] تم استخدام SEO احتياطي أساسي.")
 
     # حماية إضافية: قص العنوان إذا تجاوز الحد رغم التعليمات
     if len(metadata.get("title", "")) > 70:
         metadata["title"] = metadata["title"][:67] + "..."
 
     return metadata
+
