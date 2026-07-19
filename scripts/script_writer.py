@@ -149,15 +149,62 @@ def write_long_script(topic: str) -> dict:
     )
     return _clean_json_response(raw)
 
+
+def _normalize_script(script: dict) -> dict:
+    """
+    يُوحِّد أسماء المفاتيح: Gemini أحياناً يُرجع 'cta' أو 'call_to_action'
+    بدل 'closing_cta'، و'scenes' قد تكون فارغة أو مفقودة.
+    يضمن أن كل المفاتيح المطلوبة موجودة بقيمة افتراضية آمنة.
+    """
+    # توحيد closing_cta
+    if "closing_cta" not in script:
+        script["closing_cta"] = (
+            script.pop("cta", None)
+            or script.pop("call_to_action", None)
+            or script.pop("outro", None)
+            or "Follow for more amazing facts!"
+        )
+
+    # توحيد hook
+    if "hook" not in script:
+        script["hook"] = (
+            script.pop("intro", None)
+            or script.pop("opener", None)
+            or ""
+        )
+
+    # ضمان وجود scenes كقائمة
+    if "scenes" not in script or not isinstance(script.get("scenes"), list):
+        script["scenes"] = []
+
+    # ضمان أن كل مشهد عنده narration و visual_keywords
+    for scene in script["scenes"]:
+        if "narration" not in scene:
+            scene["narration"] = scene.get("text", scene.get("content", ""))
+        if "visual_keywords" not in scene:
+            scene["visual_keywords"] = scene.get("keywords", ["nature", "background"])
+
+    return script
+
+
+def write_long_script(topic: str) -> dict:
+    prompt = LONG_SCRIPT_PROMPT.format(topic=topic)
+    raw = gemini_client.generate_text(
+        prompt, model=config.MODEL_SCRIPT_WRITER, key_type="advanced", json_mode=True
+    )
+    return _normalize_script(_clean_json_response(raw))
+
+
 def write_short_script(topic: str) -> dict:
     prompt = SHORT_SCRIPT_PROMPT.format(topic=topic)
     raw = gemini_client.generate_text(
         prompt, model=config.MODEL_SCRIPT_WRITER, key_type="advanced", json_mode=True
     )
-    return _clean_json_response(raw)
+    return _normalize_script(_clean_json_response(raw))
 
 def full_narration_text(script: dict) -> str:
-    parts = [script["hook"]]
-    parts += [s["narration"] for s in script["scenes"]]
-    parts.append(script["closing_cta"])
-    return " ".join(parts)
+    parts = [script.get("hook", "")]
+    parts += [s.get("narration", "") for s in script.get("scenes", [])]
+    parts.append(script.get("closing_cta", ""))
+    # تصفية الأجزاء الفارغة لتجنب مسافات مضاعفة
+    return " ".join(p for p in parts if p.strip())
