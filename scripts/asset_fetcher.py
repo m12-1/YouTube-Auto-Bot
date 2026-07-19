@@ -32,10 +32,13 @@ def fetch_pixabay(keyword: str, per_page: int = 3, orientation: str = "horizonta
     if not config.PIXABAY_API_KEY:
         return []
 
+    # إصلاح الخطأ 400: واجهة Pixabay ترفض أي قيمة أقل من 3
+    api_per_page = max(3, per_page)
+
     encoded_keyword = quote(keyword)
     url = (
         f"https://pixabay.com/api/?key={config.PIXABAY_API_KEY}&q={encoded_keyword}"
-        f"&image_type=photo&orientation={orientation}&per_page={per_page}&safesearch=true"
+        f"&image_type=photo&orientation={orientation}&per_page={api_per_page}&safesearch=true"
     )
 
     try:
@@ -99,10 +102,13 @@ def fetch_pixabay_videos(keyword: str, per_page: int = 3, orientation: str = "ho
     if not config.PIXABAY_API_KEY:
         return []
 
+    # إصلاح الخطأ 400: واجهة Pixabay ترفض أي قيمة أقل من 3
+    api_per_page = max(3, per_page)
+
     encoded_keyword = quote(keyword)
     url = (
         f"https://pixabay.com/api/videos/?key={config.PIXABAY_API_KEY}&q={encoded_keyword}"
-        f"&video_type=film&per_page={per_page}&safesearch=true"
+        f"&video_type=film&per_page={api_per_page}&safesearch=true"
     )
 
     try:
