@@ -29,12 +29,23 @@ jobs:
       - name: تثبيت متطلبات بايثون
         run: pip install -r requirements.txt
 
-      - name: تثبيت ffmpeg والخطوط (لتوليد الغلاف بـ Pillow)
+      - name: تثبيت ffmpeg والخطوط
         run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
 
       - name: تثبيت متطلبات Remotion
         working-directory: remotion
         run: npm install --legacy-peer-deps
+
+      - name: التحقق من وجود مفاتيح API
+        env:
+          GEMINI_KEY_ADVANCED: ${{ secrets.GEMINI_KEY_ADVANCED }}
+        run: |
+          if [ -z "$GEMINI_KEY_ADVANCED" ]; then
+            echo "::error:: GEMINI_KEY_ADVANCED مفقود في GitHub Secrets!"
+            exit 1
+          else
+            echo "تم العثور على المفتاح المتقدم، جاري بدء الإنتاج..."
+          fi
 
       - name: تشغيل خط إنتاج الشورت
         env:
