@@ -81,7 +81,6 @@ def run():
         short_script = script_writer.write_short_script(topic)
         narration_text = script_writer.full_narration_text(short_script)
         
-        # === تطبيق فحص Quality Gate ===
         evaluation = quality_gate.evaluate(narration_text)
         if not evaluation["passed"]:
             print(f"[QUALITY GATE] السكربت رسب في الفحص الأول. جاري محاولة كتابة سكربت جديد...")
@@ -144,7 +143,7 @@ def run():
                 "startFrame": timing["start_frame"],
                 "durationFrames": timing["duration_frames"],
             })
-            time.sleep(4) # إبطاء وتيرة الطلبات لتجنب الحظر
+            time.sleep(4) 
 
         if not media_items:
             send_alert("توقف إنتاج الشورت: فشل تحميل كل الوسائط المتاحة.", level="error")
@@ -158,6 +157,32 @@ def run():
             duration_seconds=55,
         )
 
-        # ... (باقي كود التثبيت والنشر كالمعتاد) ...
-        # (thumbnail + seo + publish)
-        # (بقية الكود الأصلي)
+        try:
+            thumbnail_path = thumbnail_generator.build_thumbnail(
+                narration_text, topic, f"{WORKDIR}/thumbnail.jpg", is_short=True
+            )
+        except Exception as e:
+            print(f"[WARNING] فشل توليد الغلاف المركّب: {e}. استخدام أول صورة مشهد كبديل.")
+            fallback_images = [m for m in media_items if m["type"] == "image"]
+            thumbnail_path = fallback_images[0]["localPath"] if fallback_images else None
+
+        seo_metadata = seo_optimizer.build_seo_metadata(topic, short_script)
+
+        results = publish.publish_pair(
+            short_video_path=short_video_path,
+            short_meta=seo_metadata,
+            short_thumbnail=thumbnail_path,
+        )
+        video_id = results["short_id"]
+
+        sheets_client.append_row(
+            SPREADSHEET_ID, config.Paths().sheets_daily_log,
+            [video_id, seo_metadata["title"], "published"],
+        )
+
+    except Exception as e:
+        alert_step_failed("shorts_pipeline", e)
+        raise
+
+if __name__ == "__main__":
+    run()
