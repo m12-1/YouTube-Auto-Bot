@@ -59,9 +59,10 @@ def generate_text(prompt: str, model: str = None, key_type: str = "advanced", js
         return _generate_text_internal(prompt, target_model, key_type, json_mode, temperature)
     except Exception as e:
         error_str = str(e).lower()
-        # إذا نفدت الحصة بالكامل (429) وكنا نستخدم المفتاح المتقدم، نلجأ للخفيف
-        if "429" in error_str and key_type == "advanced" and config.GEMINI_KEY_LIGHT:
-            print(f"[GEMINI FALLBACK] حصة الموديل المتقدم نفدت. الانتقال للموديل الخفيف ({MODEL_TEXT_LIGHT})...")
+        # إذا نفدت الحصة (429) أو السيرفر مزدحم (503) وكنا نستخدم المفتاح المتقدم، نلجأ للخفيف
+        if ("429" in error_str or "503" in error_str) and key_type == "advanced" and config.GEMINI_KEY_LIGHT:
+            reason = "نفاد الحصة (429)" if "429" in error_str else "ازدحام السيرفر (503)"
+            print(f"[GEMINI FALLBACK] {reason} على الموديل المتقدم. الانتقال للموديل الخفيف ({MODEL_TEXT_LIGHT})...")
             return _generate_text_internal(prompt, MODEL_TEXT_LIGHT, "light", json_mode, temperature)
         raise e
 
