@@ -126,13 +126,17 @@ def run():
             scene_narrations, word_events, fps=config.VIDEO_FPS, total_frames=total_frames
         )
 
+        # Pixabay API fails with 400 if the query is too long.
+        # We extract only the first 3-4 words of the topic to provide context without breaking the API.
+        short_topic_context = " ".join(topic.split()[:4]) if topic else ""
+
         media_items = []
         for i, (keywords, timing, narration) in enumerate(zip(scene_keywords, scene_timings, scene_narrations)):
             prefer_video = random.random() < asset_fetcher.VIDEO_PREFERENCE_RATIO
             # جلب 3 خيارات لاختيار الأفضل بصرياً
             media_list = asset_fetcher.get_media_for_scene(
                 keywords, target_count=3, is_short=True, prefer_video=prefer_video,
-                topic_context=topic
+                topic_context=short_topic_context
             )
             
             local_path = None
