@@ -84,7 +84,6 @@ def generate_image(prompt: str, model: str = None) -> bytes:
     raise RuntimeError("لم يرجع Gemini أي صورة بالاستجابة")
 
 
-@with_backoff(max_retries=4, base_delay=3.0)
 def _verify_media_internal(image_path: str, narration: str, model: str, key_type: str) -> bool:
     client = _get_client(key_type)
     prompt = f"Does this image visually match and accurately represent the following narration? Answer ONLY with YES or NO.\n\nNarration: {narration}"
