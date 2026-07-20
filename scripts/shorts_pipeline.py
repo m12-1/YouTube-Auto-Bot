@@ -130,7 +130,8 @@ def run():
         for i, (keywords, timing) in enumerate(zip(scene_keywords, scene_timings)):
             prefer_video = random.random() < asset_fetcher.VIDEO_PREFERENCE_RATIO
             media_list = asset_fetcher.get_media_for_scene(
-                keywords, target_count=1, is_short=True, prefer_video=prefer_video
+                keywords, target_count=1, is_short=True, prefer_video=prefer_video,
+                topic_context=topic
             )
             
             local_path = None
@@ -187,10 +188,13 @@ def run():
         )
         video_id = results["short_id"]
 
-        sheets_client.append_row(
-            SPREADSHEET_ID, config.Paths().sheets_daily_log,
-            [video_id, seo_metadata["title"], "published"],
-        )
+        try:
+            sheets_client.append_row(
+                SPREADSHEET_ID, config.Paths().sheets_daily_log,
+                [video_id, seo_metadata["title"], "published"],
+            )
+        except Exception as e:
+            print(f"[WARNING] تم نشر الفيديو بنجاح لكن فشل تسجيله في Google Sheets: {e}")
 
     except Exception as e:
         alert_step_failed("shorts_pipeline", e)
