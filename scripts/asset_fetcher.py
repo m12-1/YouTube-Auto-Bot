@@ -12,9 +12,16 @@ asset_fetcher.py
 - fetch_pixabay_videos(): نفس مفتاح Pixabay الحالي، بدون أي سر إضافي مطلوب
   بـ GitHub Secrets، يجلب مقاطع فيديو حرة الحقوق (footage) بدل صور ثابتة فقط.
 - get_media_for_scene(): تعطي كل مشهد "وسيط" (video أو image) بدل صورة فقط،
-  مع fallback تلقائي لصورة لو ما لقى فيديو مناسب للكلمة المفتاحية — هذا هو
-  التغيير الأساسي اللي يكسر شكل "عرض الشرائح" ويقرّب الفيديو من مونتاج بشري.
+  مع fallback تلقائي لصورة لو ما لقى فيديو مناسب للكلمة المفتاحية.
+
+إصلاح مشكلة "الفيديوهات بعيدة عن الموضوع":
+- _relevance_score(): تقارن كلمات الكلمة المفتاحية مع حقل tags من Pixabay.
+- get_media_for_scene تجرب كل الكلمات المفتاحية وتختار الأفضل تطابقاً.
+- topic_context: يُرفق موضوع الفيديو مع كل بحث لمنع الانحراف عن السياق.
+- إزالة فلتر الاتجاه (vertical/horizontal) لأن 95%+ من فيديوهات Pixabay
+  أفقية — Remotion يقص ويملأ تلقائياً عبر objectFit:'cover'.
 """
+import re
 import random
 
 import requests
@@ -23,9 +30,47 @@ from scripts import config
 
 MIN_WIDTH = 1080  # مخفّض من 1920 لأن أغلب صور Pixabay العمودية أضيق من هذا
 
-# نسبة تفضيل الفيديو مقابل الصورة لكل مشهد (0.95 = يحاول فيديو أولاً بـ 95%
-# من المشاهد، لتقريب الإنتاج لمونتاج بشري حيّ بدل الصور الثابتة)
-VIDEO_PREFERENCE_RATIO = 0.95
+# نسبة تفضيل الفيديو مقابل الصورة لكل مشهد (0.70 = يحاول فيديو أولاً بـ 70%
+# من المشاهد و30% صور، حسب الطلب: فيديوهات 70% / صور 30%)
+VIDEO_PREFERENCE_RATIO = 0.70
+
+# أقل درجة تطابق (0-1) نقبلها بين الكلمة المفتاحية ووسوم Pixabay قبل اعتبار
+# النتيجة "غير ذات صلة كافية" والانتقال للكلمة المفتاحية التالية بالمشهد
+MIN_RELEVANCE_SCORE = 0.2
+
+
+def _re_split_words(text: str) -> list[str]:
+    """تقسيم بسيط لكلمات نص (يتجاهل الفواصل وعلامات الترقيم)."""
+    return [w for w in re.split(r'[^a-zA-Z0-9]+', text) if w]
+
+
+def _relevance_score(keyword: str, tags: str) -> float:
+    """
+    تقيس نسبة تداخل كلمات الكلمة المفتاحية مع وسوم Pixabay الراجعة (tags
+    نص مفصول بفواصل مثل "matrix, code, green, technology"). ترجع نسبة من
+    0 إلى 1: عدد كلمات الكلمة المفتاحية الموجودة فعلياً ضمن الوسوم مقسومة
+    على عدد كلمات الكلمة المفتاحية الكلي.
+
+    المطابقة تشمل تطابق البادئة (startswith) بطول 4 أحرف فأكثر، لالتقاط
+    اختلافات الجذر اللغوي الشائعة (Japanese/Japan, walking/walk).
+    """
+    kw_words = [w.lower() for w in _re_split_words(keyword)]
+    if not kw_words:
+        return 0.0
+    tag_words = [w.lower() for w in _re_split_words(tags)]
+    if not tag_words:
+        return 0.0
+
+    def word_matches(kw_word: str) -> bool:
+        for tw in tag_words:
+            if kw_word == tw:
+                return True
+            if len(kw_word) >= 4 and len(tw) >= 4 and (kw_word.startswith(tw) or tw.startswith(kw_word)):
+                return True
+        return False
+
+    matched = sum(1 for w in kw_words if word_matches(w))
+    return matched / len(kw_words)
 
 
 def fetch_pixabay(keyword: str, per_page: int = 3, orientation: str = "horizontal") -> list[str]:
@@ -93,8 +138,8 @@ def get_images_for_scene(keywords: list[str], target_count: int = 4,
 def fetch_pixabay_videos(keyword: str, per_page: int = 3) -> list[dict]:
     """
     يستخدم نفس PIXABAY_API_KEY الموجود أصلاً (لا يحتاج سر جديد بـ Secrets).
-    يرجع قائمة dicts فيها {"url": ..., "width": ..., "height": ...} بدل روابط
-    فقط، لأننا نحتاج الأبعاد لاحقاً لمعرفة هل المقطع يغطي الإطار بدون تشويه.
+    يرجع قائمة dicts فيها {"url", "width", "height", "score"} مرتّبة من
+    الأعلى تطابقاً مع الكلمة المفتاحية للأقل.
 
     ملاحظة مهمة: لا نفلتر حسب الاتجاه (عمودي/أفقي) لأن:
     - 95%+ من فيديوهات Pixabay أفقية
@@ -104,8 +149,9 @@ def fetch_pixabay_videos(keyword: str, per_page: int = 3) -> list[dict]:
     if not config.PIXABAY_API_KEY:
         return []
 
-    # إصلاح الخطأ 400: واجهة Pixabay ترفض أي قيمة أقل من 3
-    api_per_page = max(3, per_page)
+    # نطلب أكثر من المطلوب فعلياً (حد أقصى 10) لإعطاء خوارزمية التطابق
+    # مرشحين كفاية للاختيار بينهم بدل الاكتفاء بأول 3 نتائج فقط
+    api_per_page = max(3, min(10, per_page * 4))
 
     encoded_keyword = quote(keyword)
     url = (
@@ -120,13 +166,14 @@ def fetch_pixabay_videos(keyword: str, per_page: int = 3) -> list[dict]:
         results = []
         for h in hits:
             videos = h.get("videos", {})
-            # نفضّل "medium" (توازن جيد بين الجودة وحجم الملف لفيديو شورت
-            # قصير)، ولو غير متوفر نرجع لـ "small" ثم "large" كبديل
             chosen = videos.get("medium") or videos.get("small") or videos.get("large")
             if not chosen or not chosen.get("url"):
                 continue
             width, height = chosen.get("width", 0), chosen.get("height", 0)
-            results.append({"url": chosen["url"], "width": width, "height": height})
+            score = _relevance_score(keyword, h.get("tags", ""))
+            results.append({"url": chosen["url"], "width": width, "height": height, "score": score})
+        # الأعلى تطابقاً أولاً
+        results.sort(key=lambda x: x["score"], reverse=True)
         return results
     except Exception as e:
         print(f"[ASSET ERROR] فشل Pixabay Video لـ '{keyword}': {e}")
@@ -137,30 +184,45 @@ def get_media_for_scene(keywords: list[str], target_count: int = 1,
                          is_short: bool = True, prefer_video: bool = True,
                          topic_context: str = "") -> list[dict]:
     """
-    نسخة "مزيج" من get_images_for_scene: ترجع قائمة عناصر media بالشكل
-    {"type": "video"|"image", "url": "..."} بدل صور فقط.
+    ترجع قائمة عناصر media بالشكل {"type": "video"|"image", "url": "..."}.
 
     topic_context: الموضوع الرئيسي للفيديو — يُضاف لكل كلمة مفتاحية لضمان
     بقاء النتائج ضمن السياق الصحيح (مثلاً: "survival" → "survival gaming"
     بدل مقاطع طبيعة عن البقاء في البرية).
+
+    المنطق: تجرب كل الكلمات المفتاحية للمشهد وتحتفظ بأفضل نتيجة حسب
+    درجة التطابق مع وسوم Pixabay. لو أفضل نتيجة أقل من MIN_RELEVANCE_SCORE
+    تتجاهلها وتنتقل لكلمات fallback عامة.
     """
-    orientation = "vertical" if is_short else "horizontal"
     media: list[dict] = []
 
     # إرفاق الموضوع الرئيسي مع كل كلمة مفتاحية لمنع الانحراف عن السياق
     contextualized_keywords = []
     for kw in keywords:
-        contextualized_keywords.append(f"{kw} {topic_context}".strip())
+        if topic_context:
+            contextualized_keywords.append(f"{kw} {topic_context}".strip())
         contextualized_keywords.append(kw)  # نضيف الكلمة وحدها أيضاً كبديل
 
     if prefer_video:
+        best_score = -1.0
+        best_vids = None
         for kw in contextualized_keywords:
             vids = fetch_pixabay_videos(kw, per_page=target_count)
-            if vids:
-                media = [{"type": "video", "url": v["url"]} for v in vids[:target_count]]
-                break
-        
-        # لو فشلت كل الكلمات الخاصة بالمشهد، جرب كلمات عامة للفيديو قبل السقوط للصور
+            if not vids:
+                continue
+            top_score = vids[0]["score"]
+            if top_score > best_score:
+                best_score = top_score
+                best_vids = vids
+
+        # لو أفضل تطابق وجدناه أقل من الحد الأدنى المقبول، نعتبره غير كافٍ
+        if best_vids and best_score >= MIN_RELEVANCE_SCORE:
+            media = [{"type": "video", "url": v["url"]} for v in best_vids[:target_count]]
+        elif best_vids and best_score < MIN_RELEVANCE_SCORE:
+            print(f"[ASSET WARNING] أفضل تطابق فيديو لكلمات {keywords} كانت درجته {best_score:.2f} "
+                  f"(أقل من الحد الأدنى {MIN_RELEVANCE_SCORE})، سيتم تجربة كلمات fallback عامة.")
+
+        # لو فشلت كل الكلمات، جرب كلمات عامة للفيديو قبل السقوط للصور
         if not media:
             for fallback_vid_kw in ["cinematic", "aerial", "timelapse", "urban", "nature footage"]:
                 vids = fetch_pixabay_videos(fallback_vid_kw, per_page=target_count)
@@ -173,8 +235,6 @@ def get_media_for_scene(keywords: list[str], target_count: int = 1,
         media = [{"type": "image", "url": u} for u in images]
 
     if not media:
-        # نفس الكلمات الاحتياطية العامة المستخدمة بالصور، هذه المرة كخط
-        # دفاع أخير حتى لو فشل كل شي فوق
         for fallback_kw in ["abstract background", "nature", "sky"]:
             images = get_images_for_scene([fallback_kw], target_count=target_count, is_short=is_short)
             if images:
@@ -186,7 +246,7 @@ def get_media_for_scene(keywords: list[str], target_count: int = 1,
 
 def download_video(url: str, out_path: str):
     """نفس منطق download_image لكن للفيديو — يرجع None لو فشل التحميل فعلياً
-    بدل تمرير رابط ميت للرندرة (نفس درس الإصلاح السابق مع الصور)."""
+    بدل تمرير رابط ميت للرندرة."""
     try:
         r = requests.get(url, timeout=40, stream=True)
         r.raise_for_status()
@@ -200,8 +260,7 @@ def download_video(url: str, out_path: str):
 
 
 def download_image(url: str, out_path: str):
-    """يرجع المسار لو نجح التحميل فعلياً، أو None لو فشل — لازم يُفحص بالمستدعي
-    قبل إضافته لقائمة الصور، وإلا يتسبب بفشل صامت لاحقاً بالرندرة."""
+    """يرجع المسار لو نجح التحميل فعلياً، أو None لو فشل."""
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
