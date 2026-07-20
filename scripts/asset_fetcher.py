@@ -23,9 +23,9 @@ from scripts import config
 
 MIN_WIDTH = 1080  # مخفّض من 1920 لأن أغلب صور Pixabay العمودية أضيق من هذا
 
-# نسبة تفضيل الفيديو مقابل الصورة لكل مشهد (0.70 = يحاول فيديو أولاً بـ 70%
-# من المشاهد و30% صور، حسب الطلب: فيديوهات 70% / صور 30%)
-VIDEO_PREFERENCE_RATIO = 0.70
+# نسبة تفضيل الفيديو مقابل الصورة لكل مشهد (0.95 = يحاول فيديو أولاً بـ 95%
+# من المشاهد، لتقريب الإنتاج لمونتاج بشري حيّ بدل الصور الثابتة)
+VIDEO_PREFERENCE_RATIO = 0.95
 
 
 def fetch_pixabay(keyword: str, per_page: int = 3, orientation: str = "horizontal") -> list[str]:
@@ -90,14 +90,16 @@ def get_images_for_scene(keywords: list[str], target_count: int = 4,
     return images[:target_count]
 
 
-def fetch_pixabay_videos(keyword: str, per_page: int = 3, orientation: str = "horizontal") -> list[dict]:
+def fetch_pixabay_videos(keyword: str, per_page: int = 3) -> list[dict]:
     """
     يستخدم نفس PIXABAY_API_KEY الموجود أصلاً (لا يحتاج سر جديد بـ Secrets).
     يرجع قائمة dicts فيها {"url": ..., "width": ..., "height": ...} بدل روابط
     فقط، لأننا نحتاج الأبعاد لاحقاً لمعرفة هل المقطع يغطي الإطار بدون تشويه.
 
-    ملاحظة: video_type="film" يعطي لقطات سينمائية (b-roll) بدل "animation"
-    (رسوم متحركة/موشن جرافيك) اللي ما يناسب أسلوب القناة الواقعي.
+    ملاحظة مهمة: لا نفلتر حسب الاتجاه (عمودي/أفقي) لأن:
+    - 95%+ من فيديوهات Pixabay أفقية
+    - Remotion يتعامل مع القص تلقائياً عبر objectFit:'cover'
+    - حذف الفلتر يعني نتائج فيديو أكثر بكثير بدل السقوط للصور الثابتة
     """
     if not config.PIXABAY_API_KEY:
         return []
@@ -124,36 +126,36 @@ def fetch_pixabay_videos(keyword: str, per_page: int = 3, orientation: str = "ho
             if not chosen or not chosen.get("url"):
                 continue
             width, height = chosen.get("width", 0), chosen.get("height", 0)
-            # فلترة اتجاه تقريبية يدوياً لأن Pixabay Video API لا يدعم
-            # فلتر orientation مباشر بعكس API الصور
-            is_vertical_clip = height >= width
-            wants_vertical = orientation == "vertical"
-            if wants_vertical != is_vertical_clip:
-                continue
             results.append({"url": chosen["url"], "width": width, "height": height})
         return results
     except Exception as e:
-        print(f"[ASSET ERROR] فشل Pixabay Video لـ '{keyword}' (orientation={orientation}): {e}")
+        print(f"[ASSET ERROR] فشل Pixabay Video لـ '{keyword}': {e}")
         return []
 
 
 def get_media_for_scene(keywords: list[str], target_count: int = 1,
-                         is_short: bool = True, prefer_video: bool = True) -> list[dict]:
+                         is_short: bool = True, prefer_video: bool = True,
+                         topic_context: str = "") -> list[dict]:
     """
     نسخة "مزيج" من get_images_for_scene: ترجع قائمة عناصر media بالشكل
     {"type": "video"|"image", "url": "..."} بدل صور فقط.
 
-    المنطق: لو prefer_video=True (يُقرَّر عشوائياً لكل مشهد بـ VIDEO_PREFERENCE_RATIO
-    بالسكربت المستدعي)، يحاول أول كلمة مفتاحية بفيديو، ولو ما رجعت نتيجة
-    (كلمات مجردة كثيرة ما عندها لقطات فيديو مناسبة) يجرب الكلمة اللي بعدها،
-    وبالنهاية يتراجع للصور تلقائياً بدل ما يفشل السيناريو كامل.
+    topic_context: الموضوع الرئيسي للفيديو — يُضاف لكل كلمة مفتاحية لضمان
+    بقاء النتائج ضمن السياق الصحيح (مثلاً: "survival" → "survival gaming"
+    بدل مقاطع طبيعة عن البقاء في البرية).
     """
     orientation = "vertical" if is_short else "horizontal"
     media: list[dict] = []
 
+    # إرفاق الموضوع الرئيسي مع كل كلمة مفتاحية لمنع الانحراف عن السياق
+    contextualized_keywords = []
+    for kw in keywords:
+        contextualized_keywords.append(f"{kw} {topic_context}".strip())
+        contextualized_keywords.append(kw)  # نضيف الكلمة وحدها أيضاً كبديل
+
     if prefer_video:
-        for kw in keywords:
-            vids = fetch_pixabay_videos(kw, per_page=target_count, orientation=orientation)
+        for kw in contextualized_keywords:
+            vids = fetch_pixabay_videos(kw, per_page=target_count)
             if vids:
                 media = [{"type": "video", "url": v["url"]} for v in vids[:target_count]]
                 break
@@ -161,7 +163,7 @@ def get_media_for_scene(keywords: list[str], target_count: int = 1,
         # لو فشلت كل الكلمات الخاصة بالمشهد، جرب كلمات عامة للفيديو قبل السقوط للصور
         if not media:
             for fallback_vid_kw in ["cinematic", "aerial", "timelapse", "urban", "nature footage"]:
-                vids = fetch_pixabay_videos(fallback_vid_kw, per_page=target_count, orientation=orientation)
+                vids = fetch_pixabay_videos(fallback_vid_kw, per_page=target_count)
                 if vids:
                     media = [{"type": "video", "url": v["url"]} for v in vids[:target_count]]
                     break
