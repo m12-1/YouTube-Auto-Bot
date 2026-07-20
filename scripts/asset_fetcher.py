@@ -1,204 +1,213 @@
 """
-shorts_pipeline.py
-المنسق الخاص بفيديوهات الشورت - حل نهائي لمشكلة المسارات + تخطي الغلاف.
+asset_fetcher.py
+يعتمد على Pixabay حصرياً حالياً (Pexels معطّل بسبب مشكلة مفتاح سابقة، يمكن
+إعادة تفعيله لاحقاً بـ fetch_pexels أدناه إذا صار المفتاح صالحاً).
+
+إصلاحات هذه النسخة:
+- إزالة رابط placeholder وهمي غير حقيقي كان يسبب فشل تحميل صامت
+- دعم orientation ديناميكي (عمودي للشورت، أفقي للطويل) بدل "horizontal" ثابت
+- get_images_for_scene يرجع فقط روابط، والتحقق من نجاح التحميل الفعلي بـ download_image
+
+إضافة جديدة (مزيج فيديو + صور):
+- fetch_pixabay_videos(): نفس مفتاح Pixabay الحالي، بدون أي سر إضافي مطلوب
+  بـ GitHub Secrets، يجلب مقاطع فيديو حرة الحقوق (footage) بدل صور ثابتة فقط.
+- get_media_for_scene(): تعطي كل مشهد "وسيط" (video أو image) بدل صورة فقط،
+  مع fallback تلقائي لصورة لو ما لقى فيديو مناسب للكلمة المفتاحية — هذا هو
+  التغيير الأساسي اللي يكسر شكل "عرض الشرائح" ويقرّب الفيديو من مونتاج بشري.
 """
-import os
-import json
 import random
-import shutil
-import subprocess
-import time
-from mutagen.mp3 import MP3
-from scripts import config, sheets_client, script_writer, quality_gate
-from scripts import voice_and_captions, asset_fetcher, thumbnail_generator
-from scripts import seo_optimizer, publish
-from scripts.telegram_alerts import send_alert, alert_step_failed
 
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-WORKDIR = "pipeline_output"
+import requests
+from requests.utils import quote
+from scripts import config
 
-def move_to_public(src_path: str) -> str:
-    dest_dir = "remotion/public/assets"
-    os.makedirs(dest_dir, exist_ok=True)
-    if not src_path or not os.path.exists(src_path):
-        return ""
-    filename = os.path.basename(src_path)
-    dest_path = os.path.join(dest_dir, filename)
-    shutil.copy2(src_path, dest_path)
-    return f"assets/{filename}"
+MIN_WIDTH = 1080  # مخفّض من 1920 لأن أغلب صور Pixabay العمودية أضيق من هذا
 
-def render_video_via_remotion(script_data: dict, audio_path: str, captions_data: list,
-                                media_items: list[dict], composition_id: str,
-                                out_path: str, duration_seconds: int):
-    payload_path = os.path.abspath(f"{WORKDIR}/render_payload.json")
+# نسبة تفضيل الفيديو مقابل الصورة لكل مشهد (0.95 = يحاول فيديو أولاً بـ 95%
+# من المشاهد، لتقريب الإنتاج لمونتاج بشري حيّ بدل الصور الثابتة)
+VIDEO_PREFERENCE_RATIO = 0.95
 
-    with open(payload_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "script": script_data,
-            "audioPath": move_to_public(audio_path),
-            "captions": captions_data,
-            "mediaItems": [
-                {
-                    "type": m["type"],
-                    "src": move_to_public(m["localPath"]),
-                    "startFrame": m["startFrame"],
-                    "durationFrames": m["durationFrames"],
-                }
-                for m in media_items
-            ],
-            "durationSeconds": duration_seconds,
-            "width": 1080,
-            "height": 1920,
-            "fps": config.VIDEO_FPS,
-        }, f, ensure_ascii=False)
 
-    print(f"[REMOTION] جاري الرندرة، تم تمرير {len(media_items)} مشاهد و {len(captions_data)} كلمة.")
+def fetch_pixabay(keyword: str, per_page: int = 3, orientation: str = "horizontal") -> list[str]:
+    if not config.PIXABAY_API_KEY:
+        return []
 
-    subprocess.run(
-        [
-            "npx", "remotion", "render", composition_id,
-            os.path.abspath(out_path),
-            "--props", payload_path,
-        ],
-        cwd="remotion",
-        check=True,
+    # إصلاح الخطأ 400: واجهة Pixabay ترفض أي قيمة أقل من 3
+    api_per_page = max(3, per_page)
+
+    encoded_keyword = quote(keyword)
+    url = (
+        f"https://pixabay.com/api/?key={config.PIXABAY_API_KEY}&q={encoded_keyword}"
+        f"&image_type=photo&orientation={orientation}&per_page={api_per_page}&safesearch=true"
     )
-    return out_path
-
-def run():
-    if not sheets_client.is_system_enabled(SPREADSHEET_ID):
-        print("النظام متوقف عبر System_Control. تخطي.")
-        return
-
-    os.makedirs(WORKDIR, exist_ok=True)
 
     try:
-        trend_records = sheets_client.get_all_records(SPREADSHEET_ID, config.Paths().sheets_trend_log)
-        if not trend_records:
-            send_alert("لا يوجد موضوع بـ Trend_Log لبدء الإنتاج اليوم.", level="warning")
-            return
-        topic = trend_records[-1]["core_topic"]
-
-        short_script = script_writer.write_short_script(topic)
-        narration_text = script_writer.full_narration_text(short_script)
-        
-        evaluation = quality_gate.evaluate(narration_text)
-        if not evaluation["passed"]:
-            print(f"[QUALITY GATE] السكربت رسب في الفحص الأول. جاري محاولة كتابة سكربت جديد...")
-            short_script = script_writer.write_short_script(topic)
-            narration_text = script_writer.full_narration_text(short_script)
-            evaluation = quality_gate.evaluate(narration_text)
-            if not evaluation["passed"]:
-                send_alert("توقف إنتاج الشورت: السكربت رسب بـ Quality Gate مرتين.", level="error")
-                return
-
-        scenes = short_script.get("scenes", [])
-        fallback_kw = ["nature", "background", "sky"]
-
-        scene_narrations = (
-            [short_script.get("hook", "")]
-            + [s.get("narration", "") for s in scenes]
-            + [short_script.get("closing_cta", "")]
-        )
-        scene_keywords = (
-            [scenes[0].get("visual_keywords", fallback_kw) if scenes else fallback_kw]
-            + [s.get("visual_keywords", fallback_kw) for s in scenes]
-            + [scenes[-1].get("visual_keywords", fallback_kw) if scenes else fallback_kw]
-        )
-
-        audio_path = f"{WORKDIR}/short_audio.mp3"
-        captions_path = f"{WORKDIR}/short_captions.json"
-        voice_and_captions.generate_voice_and_captions(narration_text, audio_path, captions_path)
-
-        with open(captions_path, "r", encoding="utf-8") as f:
-            word_events = json.load(f)
-
-        try:
-            audio_info = MP3(audio_path)
-            audio_duration_sec = min(audio_info.info.length, 59)
-        except Exception as e:
-            print(f"[WARNING] فشل حساب مدة الصوت: {e}. سيتم افتراض 55 ثانية.")
-            audio_duration_sec = 55
-
-        total_frames = round(audio_duration_sec * config.VIDEO_FPS)
-
-        scene_timings = voice_and_captions.map_scenes_to_timing(
-            scene_narrations, word_events, fps=config.VIDEO_FPS, total_frames=total_frames
-        )
-
-        media_items = []
-        for i, (keywords, timing) in enumerate(zip(scene_keywords, scene_timings)):
-            prefer_video = random.random() < asset_fetcher.VIDEO_PREFERENCE_RATIO
-            media_list = asset_fetcher.get_media_for_scene(
-                keywords, target_count=1, is_short=True, prefer_video=prefer_video,
-                topic_context=topic
-            )
-            
-            local_path = None
-            media_type = "image"
-            if media_list:
-                item = media_list[0]
-                media_type = item["type"]
-                if media_type == "video":
-                    local_path = asset_fetcher.download_video(item["url"], f"{WORKDIR}/short_scene_{i}.mp4")
-                else:
-                    local_path = asset_fetcher.download_image(item["url"], f"{WORKDIR}/short_scene_{i}.jpg")
-
-            if not local_path:
-                print(f"[WARNING] فشل تحميل وسائط المشهد {i}. سيتم تمديد المشهد السابق لتغطية الفراغ.")
-                if media_items:
-                    media_items[-1]["durationFrames"] += timing["duration_frames"]
-                continue
-
-            media_items.append({
-                "type": media_type,
-                "localPath": local_path,
-                "startFrame": timing["start_frame"],
-                "durationFrames": timing["duration_frames"],
-            })
-            time.sleep(4) 
-
-        if not media_items:
-            send_alert("توقف إنتاج الشورت: فشل تحميل كل الوسائط المتاحة.", level="error")
-            return
-
-        print(f"[DEBUG] تم تجهيز {len(media_items)} مشاهد للرندرة بنجاح.")
-
-        short_video_path = render_video_via_remotion(
-            short_script, audio_path, word_events, media_items,
-            composition_id="ShortVideo", out_path=f"{WORKDIR}/short_video.mp4",
-            duration_seconds=audio_duration_sec,
-        )
-
-        try:
-            thumbnail_path = thumbnail_generator.build_thumbnail(
-                narration_text, topic, f"{WORKDIR}/thumbnail.jpg", is_short=True
-            )
-        except Exception as e:
-            print(f"[WARNING] فشل توليد الغلاف المركّب: {e}. استخدام أول صورة مشهد كبديل.")
-            fallback_images = [m for m in media_items if m["type"] == "image"]
-            thumbnail_path = fallback_images[0]["localPath"] if fallback_images else None
-
-        seo_metadata = seo_optimizer.build_seo_metadata(topic, short_script)
-
-        results = publish.publish_pair(
-            short_video_path=short_video_path,
-            short_meta=seo_metadata,
-            short_thumbnail=thumbnail_path,
-        )
-        video_id = results["short_id"]
-
-        try:
-            sheets_client.append_row(
-                SPREADSHEET_ID, config.Paths().sheets_daily_log,
-                [video_id, seo_metadata["title"], "published"],
-            )
-        except Exception as e:
-            print(f"[WARNING] تم نشر الفيديو بنجاح لكن فشل تسجيله في Google Sheets: {e}")
-
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        hits = r.json().get("hits", [])
+        return [h["largeImageURL"] for h in hits]
     except Exception as e:
-        alert_step_failed("shorts_pipeline", e)
-        raise
+        print(f"[ASSET ERROR] فشل Pixabay لـ '{keyword}' (orientation={orientation}): {e}")
+        return []
 
-if __name__ == "__main__":
-    run()
+
+def fetch_pexels(keyword: str, per_page: int = 3, orientation: str = "landscape") -> list[str]:
+    if not config.PEXELS_API_KEY:
+        return []
+    url = "https://api.pexels.com/v1/search"
+    headers = {"Authorization": config.PEXELS_API_KEY}
+    params = {"query": keyword, "per_page": per_page, "orientation": orientation}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        r.raise_for_status()
+        photos = r.json().get("photos", [])
+        return [p["src"]["large2x"] for p in photos]
+    except Exception as e:
+        print(f"[ASSET ERROR] فشل Pexels لـ '{keyword}': {e}")
+        return []
+
+
+def get_images_for_scene(keywords: list[str], target_count: int = 4,
+                          is_short: bool = True) -> list[str]:
+    """
+    is_short=True يطلب صوراً عمودية (تناسب 1080x1920 بدون قص كبير)، وإلا يطلب
+    أفقية. لو الكلمة المحددة ما رجعت نتائج، يجرب كلمات احتياطية عامة بدل ما
+    يرجع placeholder وهمي غير قابل للتحميل (كان هذا الخطأ بالنسخة السابقة).
+    """
+    orientation = "vertical" if is_short else "horizontal"
+    images = []
+    for kw in keywords:
+        images += fetch_pixabay(kw, per_page=target_count, orientation=orientation)
+        if len(images) >= target_count:
+            break
+
+    if not images:
+        for fallback_kw in ["abstract background", "nature", "sky"]:
+            images += fetch_pixabay(fallback_kw, per_page=target_count, orientation=orientation)
+            if images:
+                break
+
+    return images[:target_count]
+
+
+def fetch_pixabay_videos(keyword: str, per_page: int = 3) -> list[dict]:
+    """
+    يستخدم نفس PIXABAY_API_KEY الموجود أصلاً (لا يحتاج سر جديد بـ Secrets).
+    يرجع قائمة dicts فيها {"url": ..., "width": ..., "height": ...} بدل روابط
+    فقط، لأننا نحتاج الأبعاد لاحقاً لمعرفة هل المقطع يغطي الإطار بدون تشويه.
+
+    ملاحظة مهمة: لا نفلتر حسب الاتجاه (عمودي/أفقي) لأن:
+    - 95%+ من فيديوهات Pixabay أفقية
+    - Remotion يتعامل مع القص تلقائياً عبر objectFit:'cover'
+    - حذف الفلتر يعني نتائج فيديو أكثر بكثير بدل السقوط للصور الثابتة
+    """
+    if not config.PIXABAY_API_KEY:
+        return []
+
+    # إصلاح الخطأ 400: واجهة Pixabay ترفض أي قيمة أقل من 3
+    api_per_page = max(3, per_page)
+
+    encoded_keyword = quote(keyword)
+    url = (
+        f"https://pixabay.com/api/videos/?key={config.PIXABAY_API_KEY}&q={encoded_keyword}"
+        f"&video_type=film&per_page={api_per_page}&safesearch=true"
+    )
+
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        hits = r.json().get("hits", [])
+        results = []
+        for h in hits:
+            videos = h.get("videos", {})
+            # نفضّل "medium" (توازن جيد بين الجودة وحجم الملف لفيديو شورت
+            # قصير)، ولو غير متوفر نرجع لـ "small" ثم "large" كبديل
+            chosen = videos.get("medium") or videos.get("small") or videos.get("large")
+            if not chosen or not chosen.get("url"):
+                continue
+            width, height = chosen.get("width", 0), chosen.get("height", 0)
+            results.append({"url": chosen["url"], "width": width, "height": height})
+        return results
+    except Exception as e:
+        print(f"[ASSET ERROR] فشل Pixabay Video لـ '{keyword}': {e}")
+        return []
+
+
+def get_media_for_scene(keywords: list[str], target_count: int = 1,
+                         is_short: bool = True, prefer_video: bool = True,
+                         topic_context: str = "") -> list[dict]:
+    """
+    نسخة "مزيج" من get_images_for_scene: ترجع قائمة عناصر media بالشكل
+    {"type": "video"|"image", "url": "..."} بدل صور فقط.
+
+    topic_context: الموضوع الرئيسي للفيديو — يُضاف لكل كلمة مفتاحية لضمان
+    بقاء النتائج ضمن السياق الصحيح (مثلاً: "survival" → "survival gaming"
+    بدل مقاطع طبيعة عن البقاء في البرية).
+    """
+    orientation = "vertical" if is_short else "horizontal"
+    media: list[dict] = []
+
+    # إرفاق الموضوع الرئيسي مع كل كلمة مفتاحية لمنع الانحراف عن السياق
+    contextualized_keywords = []
+    for kw in keywords:
+        contextualized_keywords.append(f"{kw} {topic_context}".strip())
+        contextualized_keywords.append(kw)  # نضيف الكلمة وحدها أيضاً كبديل
+
+    if prefer_video:
+        for kw in contextualized_keywords:
+            vids = fetch_pixabay_videos(kw, per_page=target_count)
+            if vids:
+                media = [{"type": "video", "url": v["url"]} for v in vids[:target_count]]
+                break
+        
+        # لو فشلت كل الكلمات الخاصة بالمشهد، جرب كلمات عامة للفيديو قبل السقوط للصور
+        if not media:
+            for fallback_vid_kw in ["cinematic", "aerial", "timelapse", "urban", "nature footage"]:
+                vids = fetch_pixabay_videos(fallback_vid_kw, per_page=target_count)
+                if vids:
+                    media = [{"type": "video", "url": v["url"]} for v in vids[:target_count]]
+                    break
+
+    if not media:
+        images = get_images_for_scene(keywords, target_count=target_count, is_short=is_short)
+        media = [{"type": "image", "url": u} for u in images]
+
+    if not media:
+        # نفس الكلمات الاحتياطية العامة المستخدمة بالصور، هذه المرة كخط
+        # دفاع أخير حتى لو فشل كل شي فوق
+        for fallback_kw in ["abstract background", "nature", "sky"]:
+            images = get_images_for_scene([fallback_kw], target_count=target_count, is_short=is_short)
+            if images:
+                media = [{"type": "image", "url": u} for u in images]
+                break
+
+    return media[:target_count]
+
+
+def download_video(url: str, out_path: str):
+    """نفس منطق download_image لكن للفيديو — يرجع None لو فشل التحميل فعلياً
+    بدل تمرير رابط ميت للرندرة (نفس درس الإصلاح السابق مع الصور)."""
+    try:
+        r = requests.get(url, timeout=40, stream=True)
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 16):
+                f.write(chunk)
+        return out_path
+    except Exception as e:
+        print(f"[ASSET ERROR] فشل تحميل الفيديو من {url}: {e}")
+        return None
+
+
+def download_image(url: str, out_path: str):
+    """يرجع المسار لو نجح التحميل فعلياً، أو None لو فشل — لازم يُفحص بالمستدعي
+    قبل إضافته لقائمة الصور، وإلا يتسبب بفشل صامت لاحقاً بالرندرة."""
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+        return out_path
+    except Exception as e:
+        print(f"[ASSET ERROR] فشل تحميل الصورة من {url}: {e}")
+        return None
