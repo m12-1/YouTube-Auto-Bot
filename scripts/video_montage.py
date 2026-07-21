@@ -206,15 +206,39 @@ def _resolve_visual_units(visual_units: list[dict], workdir: str, file_prefix: s
 
         if not local_path:
             print(f"[MONTAGE WARNING] فشلت كل محاولات الوحدة {i} (بما فيها استبدال Gemini). "
-                  f"جاري تجربة احتياط عام حي...")
+                  f"جاري تجربة احتياط عام حي (سيُفحص تطابقه أيضاً قبل القبول)...")
+            # ملاحظة مهمة: هذا الاحتياط كان سابقاً يقبل أول نتيجة يجدها مباشرة
+            # بدون أي فحص تطابق (verify_media_file) — وهذا هو سبب ظهور مشاهد
+            # عشوائية تماماً (بطريق، كلاكيت سينمائي...الخ) رغم أن كل الطبقات
+            # الأخرى (Gemini/Groq/CLIP) كانت ترفضها بشكل صحيح؛ الاحتياط وحده
+            # كان "باباً خلفياً" يتجاوز الفحص بالكامل. الآن: نفس فحص التطابق
+            # يُطبَّق هنا أيضاً (verify=True دائماً بغض النظر عن verify الممرر
+            # للوحدة، لأن هذا احتياط أخير وليس مساراً بدون فحص أصلاً)، ولو فشل
+            # كل مرشحي الاحتياط أيضاً، نُمدّد مدة الوحدة السابقة بدل عرض شيء
+            # لا علاقة له بالنص — تماماً كما هو موصوف بتوثيق الدالة أعلاه.
             fallback_list = asset_fetcher.get_media_for_scene(
-                GENERIC_LAST_RESORT_KEYWORDS, target_count=1, is_short=is_short,
+                GENERIC_LAST_RESORT_KEYWORDS, target_count=3, is_short=is_short,
                 prefer_video=False, topic_context="",
             )
-            if fallback_list:
-                temp_path = f"{workdir}/{file_prefix}_{i}_fallback.jpg"
-                if asset_fetcher.download_image(fallback_list[0]["url"], temp_path):
-                    local_path, media_type = temp_path, "image"
+            for fb_item in fallback_list:
+                fb_type = fb_item["type"]
+                fb_temp_path = f"{workdir}/{file_prefix}_{i}_fallback" + (".mp4" if fb_type == "video" else ".jpg")
+                fb_downloaded = (
+                    asset_fetcher.download_video(fb_item["url"], fb_temp_path) if fb_type == "video"
+                    else asset_fetcher.download_image(fb_item["url"], fb_temp_path)
+                )
+                if not fb_downloaded:
+                    continue
+                if media_relevance_checker.verify_media_file(fb_temp_path, narration):
+                    local_path, media_type = fb_temp_path, fb_type
+                    break
+                try:
+                    os.remove(fb_temp_path)
+                except Exception:
+                    pass
+            if not local_path:
+                print(f"[MONTAGE WARNING] حتى الاحتياط العام لم يطابق النص لوحدة {i}. "
+                      f"سيتم تمديد الوحدة السابقة بدلاً من عرض مشهد غير مرتبط.")
 
         if not local_path:
             print(f"[MONTAGE ERROR] فشل تام في توفير وسائط الوحدة {i} (حتى الاحتياط العام فشل).")
