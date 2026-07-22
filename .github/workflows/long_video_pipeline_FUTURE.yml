@@ -38,6 +38,7 @@ jobs:
           GEMINI_KEY_LIGHT: ${{ secrets.GEMINI_KEY_LIGHT }}
           GEMINI_KEY_ADVANCED: ${{ secrets.GEMINI_KEY_ADVANCED }}
           GEMINI_KEY_IMAGE: ${{ secrets.GEMINI_KEY_IMAGE }}
+          GEMINI_KEY_FILTER: ${{ secrets.GEMINI_KEY_FILTER }}
           YOUTUBE_SEARCH_API_KEY: ${{ secrets.YOUTUBE_SEARCH_API_KEY }}
           YOUTUBE_OAUTH_CLIENT_ID: ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
           YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
@@ -48,6 +49,9 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PUTER_USERNAME: ${{ secrets.PUTER_USERNAME }}
+          PUTER_PASSWORD: ${{ secrets.PUTER_PASSWORD }}
         run: python -m scripts.daily_pipeline
 
       - name: تشخيص ذاتي عند الفشل (self-heal)
