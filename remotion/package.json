@@ -1,0 +1,21 @@
+{
+  "name": "youtube-automation-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "render-long": "remotion render src/index.ts LongVideo out/long.mp4",
+    "render-short": "remotion render src/index.ts ShortVideo out/short.mp4",
+    "preview": "remotion studio src/index.ts"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.255",
+    "@remotion/media-utils": "4.0.255",
+    "remotion": "4.0.255",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "typescript": "5.4.5",
+    "@types/react": "18.3.1"
+  }
+}
