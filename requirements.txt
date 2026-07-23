@@ -1,0 +1,25 @@
+google-genai>=0.3.0
+google-api-python-client>=2.140.0
+google-auth>=2.34.0
+google-auth-oauthlib>=1.2.1
+gspread>=6.1.2
+edge-tts>=6.1.12
+requests>=2.32.3
+groq>=1.5.0  # طبقة التحليل البصري الثانية (احتياطية) — راجع scripts/groq_client.py
+puter-python-sdk==0.5.0  # طبقة التحليل البصري الثالثة (Puter AI) — مثبَّتة عمداً على هذه
+                          # النسخة بالذات لأن الكود بـ scripts/puter_client.py مبني على
+                          # توقيعها الحقيقي (chat(prompt=..., images=[...])؛ ترك هذا
+                          # بلا رقم نسخة يعني أن أي تشغيل جديد على GitHub Actions قد
+                          # يُنزّل نسخة أحدث غيّرت التوقيع بصمت، فيفشل كل مشهد بخطأ
+                          # TypeError متطابق (راجع الفحص التمهيدي بـ puter_client.py الذي
+                          # يكتشف هذا التغيّر عند أول استدعاء بدل انتظار فشل كل مشهد).
+numpy>=1.26.4
+Pillow>=10.4.0
+json-repair>=0.28.0
+mutagen>=1.47.0
+
+# حارس الجودة المحلي (CLIP) — يعمل فقط كطبقة احتياطية لو فشلت كل نماذج
+# Gemini Vision بالتحقق من تطابق الوسائط (راجع scripts/media_relevance_checker.py)
+torch>=2.2.0
+open_clip_torch>=2.24.0
+
