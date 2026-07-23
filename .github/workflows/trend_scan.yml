@@ -1,0 +1,29 @@
+name: Trend Scan
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # كل 6 ساعات
+  workflow_dispatch: {}       # تشغيل يدوي للاختبار
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: تثبيت المتطلبات
+        run: pip install -r requirements.txt
+
+      - name: تشغيل trend_scanner
+        env:
+          GEMINI_KEY_LIGHT: ${{ secrets.GEMINI_KEY_LIGHT }}
+          YOUTUBE_SEARCH_API_KEY: ${{ secrets.YOUTUBE_SEARCH_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m scripts.trend_scanner
