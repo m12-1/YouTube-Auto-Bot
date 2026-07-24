@@ -281,7 +281,15 @@ def _render_with_moviepy(
         composite.write_videofile(
             output_paths["final_video_path"], fps=fps, codec="libx264", audio_codec="aac", logger=None
         )
-        composite.save_frame(output_paths["thumbnail_path"], t=min(0.5, composite.duration))
+        # withmask=False: the composite includes TextClip subtitle overlays,
+        # which carry an alpha mask. save_frame's default (withmask=True)
+        # would produce an RGBA frame, and JPEG has no alpha channel, so
+        # saving thumbnail.jpg always failed with "cannot write mode RGBA
+        # as JPEG". The mask is only needed for video compositing, not for
+        # a flattened thumbnail still image.
+        composite.save_frame(
+            output_paths["thumbnail_path"], t=min(0.5, composite.duration), withmask=False
+        )
 
     except RenderError:
         raise
