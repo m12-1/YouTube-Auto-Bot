@@ -101,6 +101,17 @@ from modules.voice_generator.voice_generator import run as run_voice_generator
 from shared.json_contract import build_response
 from shared.logger import get_logger
 
+# The publisher lives under future/modules because most Phase 2 modules
+# (analytics, learning engine, etc.) aren't ready yet -- but publishing is
+# the entire point of a "PUBLISH" run (main.py's --privacy flag, the
+# YOUTUBE_OAUTH_* secrets wired through the CI workflow, the "mode=PUBLISH"
+# log banner) and it already has a safe, complete implementation with a
+# simulated fallback when credentials are missing. Leaving it unwired meant
+# every run silently stopped at quality_inspector: the CLI would print
+# "Pipeline finished successfully" and the video simply never reached
+# YouTube, with nothing in the logs to explain why.
+from future.modules.publisher.publisher import run as run_publisher
+
 logger = get_logger(__name__)
 
 MODULE_NAME = "pipeline_controller"
@@ -168,6 +179,60 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         current_payload = _merge_stage_output(
             current_payload, stage_result.get("data", {})
         )
+
+    # publisher is deliberately NOT in _STAGE_SEQUENCE: it must only ever
+    # run after every prior stage succeeded AND the quality gate passed, and
+    # it must be skippable for --dry-run without that counting as a pipeline
+    # failure. Folding those two conditions into the generic stage loop
+    # (which just checks status == "success") would either publish
+    # FAIL-verdict videos or force a fake "error" for an intentional dry run.
+    if failed_stage is None:
+        quality_data = stage_outputs.get("quality_inspector", {}).get("data", {})
+        verdict = quality_data.get("verdict")
+        dry_run = bool(input_json.get("dry_run"))
+
+        if dry_run:
+            logger.info("Dry run requested -- skipping publish step.")
+        elif verdict != "PASS":
+            logger.warning(
+                "Skipping publish step: quality_inspector verdict was '%s', not 'PASS'.",
+                verdict,
+            )
+        else:
+            logger.info("Pipeline running stage 'publisher'...")
+            publisher_input = dict(current_payload)
+            # publisher.py expects "video_output_path"; video_renderer's
+            # envelope calls the same thing "final_video_path". Bridging the
+            # field name here is just JSON plumbing between two existing
+            # contracts, not business logic, so it stays in the controller.
+            publisher_input["video_output_path"] = current_payload.get("final_video_path")
+
+            try:
+                publisher_result = run_publisher(publisher_input)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Stage 'publisher' raised an unhandled exception.")
+                publisher_result = build_response(
+                    module="publisher", status="error", error=str(exc)
+                )
+
+            stage_outputs["publisher"] = publisher_result
+
+            if publisher_result.get("status") != "success":
+                logger.error(
+                    "Stage 'publisher' reported failure: %s",
+                    publisher_result.get("error"),
+                )
+                failed_stage = "publisher"
+            else:
+                current_payload = _merge_stage_output(
+                    current_payload, publisher_result.get("data", {})
+                )
+                logger.info(
+                    "Published video_id=%s url=%s upload_status=%s",
+                    publisher_result.get("data", {}).get("video_id"),
+                    publisher_result.get("data", {}).get("video_url"),
+                    publisher_result.get("data", {}).get("upload_status"),
+                )
 
     overall_status = "error" if failed_stage else "success"
     error_message = (
