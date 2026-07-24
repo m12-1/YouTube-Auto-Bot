@@ -96,6 +96,78 @@ class RenderError(RuntimeError):
     """Raised when MoviePy rendering cannot be completed."""
 
 
+# Fonts to try, in order of preference, for burned-in subtitles. "Arial-Bold"
+# was previously hardcoded here, but Arial is a Microsoft font that is not
+# installed on the GitHub Actions ubuntu-latest runner (or most Linux boxes)
+# -- ImageMagick has no such font registered, so every TextClip call failed
+# with "unable to read font `Arial-Bold'" and the renderer silently fell
+# back to manifest-only output on every run. DejaVu Sans Bold is the actual
+# font this project's CI workflow now installs (see
+# .github/workflows/Run pipeline.yml), with a couple of other common Linux
+# bold-sans fallbacks in case someone runs this on a different distro/image.
+_SUBTITLE_FONT_CANDIDATES = (
+    "DejaVu-Sans-Bold",
+    "DejaVuSans-Bold",
+    "Liberation-Sans-Bold",
+    "Nimbus-Sans-Bold",
+    "FreeSans-Bold",
+)
+
+_resolved_subtitle_font: str | None = None
+_font_resolution_attempted = False
+
+
+def _resolve_subtitle_font() -> str | None:
+    """
+    Pick a bold sans-serif font that's actually registered with ImageMagick
+    on this machine, instead of assuming a hardcoded name exists.
+
+    Returns:
+        A font name MoviePy's TextClip can use, or None if no candidate
+        (and no font at all) could be found -- in which case the caller
+        should let TextClip fail fast rather than silently mis-render.
+    """
+    global _resolved_subtitle_font, _font_resolution_attempted
+
+    if _font_resolution_attempted:
+        return _resolved_subtitle_font
+    _font_resolution_attempted = True
+
+    try:
+        available = {name.lower(): name for name in TextClip.list("font")}
+    except Exception:  # noqa: BLE001 - ImageMagick not queryable; fall through
+        available = {}
+
+    for candidate in _SUBTITLE_FONT_CANDIDATES:
+        match = available.get(candidate.lower())
+        if match:
+            _resolved_subtitle_font = match
+            return _resolved_subtitle_font
+
+    # None of our preferred fonts are registered. Rather than hand TextClip
+    # a name we know is wrong, fall back to whatever bold-ish font is
+    # available so rendering can still proceed, and log clearly so this is
+    # diagnosable instead of surfacing only as an opaque ImageMagick error.
+    bold_fallback = next((name for name in available.values() if "bold" in name.lower()), None)
+    if bold_fallback:
+        logger.warning(
+            "None of the preferred subtitle fonts %s are installed; "
+            "falling back to '%s'. Consider installing fonts-dejavu-core.",
+            _SUBTITLE_FONT_CANDIDATES,
+            bold_fallback,
+        )
+        _resolved_subtitle_font = bold_fallback
+        return _resolved_subtitle_font
+
+    logger.warning(
+        "No usable font found via ImageMagick (checked %s); subtitle "
+        "rendering will use MoviePy/ImageMagick's default and may fail. "
+        "Install fonts-dejavu-core (or another bold sans font) on this machine.",
+        _SUBTITLE_FONT_CANDIDATES,
+    )
+    return None
+
+
 def _run_output_paths(run_id: str) -> Dict[str, str]:
     """Build stable output paths for all render artifacts for this run."""
     safe_digest = sanitize_filename(run_id)
@@ -158,9 +230,14 @@ def _subtitle_clips(subtitle_lines: List[Dict[str, Any]], width: int, height: in
         A list of positioned, timed TextClips.
     """
     clips = []
+    font = _resolve_subtitle_font()
+    text_clip_kwargs: Dict[str, Any] = {"fontsize": 64, "color": "white", "stroke_color": "black", "stroke_width": 2}
+    if font:
+        text_clip_kwargs["font"] = font
+
     for line in subtitle_lines:
         text_clip = (
-            TextClip(line["text"], fontsize=64, color="white", font="Arial-Bold", stroke_color="black", stroke_width=2)
+            TextClip(line["text"], **text_clip_kwargs)
             .set_start(line["start"])
             .set_duration(line["end"] - line["start"])
             .set_position(("center", height * 0.75))
