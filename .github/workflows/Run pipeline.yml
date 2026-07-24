@@ -76,10 +76,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install system dependencies (ffmpeg, ImageMagick)
+      - name: Install system dependencies (ffmpeg, ImageMagick, fonts)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg imagemagick
+          # fonts-dejavu-core provides DejaVu Sans Bold, which video_renderer.py
+          # resolves and uses for burned-in subtitles. Without an actual font
+          # package installed, ImageMagick has nothing to render text with and
+          # every TextClip call fails (previously masked by a hardcoded,
+          # nonexistent "Arial-Bold" font name -- see video_renderer.py).
+          sudo apt-get install -y --no-install-recommends ffmpeg imagemagick fonts-dejavu-core
 
       - name: Relax ImageMagick policy for MoviePy TextClip
         run: |
