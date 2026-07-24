@@ -1,8 +1,0 @@
-{
-  "tests/test_filesystem_security.py::TestFilesystemSecurity::test_sanitize_filename": true,
-  "tests/test_part2_modules.py::test_video_renderer_falls_back_to_manifest_when_media_missing": true,
-  "tests/test_pipeline_controller.py::test_competitor_analyzer_returns_competitors": true,
-  "tests/test_pipeline_controller.py::test_fact_collector_respects_max_facts": true,
-  "tests/test_pipeline_controller.py::test_fact_verifier_filters_by_confidence": true,
-  "tests/test_pipeline_controller.py::test_full_pipeline_runs_successfully": true
-}
