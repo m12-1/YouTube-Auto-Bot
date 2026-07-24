@@ -145,7 +145,32 @@ privacy options:
         )
         sys.exit(1)
 
-    logger.info("Pipeline finished successfully.")
+    if args.dry_run:
+        logger.info(
+            "Pipeline finished successfully (dry run -- video rendered but not uploaded)."
+        )
+        return
+
+    publisher_stage = result.get("data", {}).get("stages", {}).get("publisher", {})
+    publisher_data = publisher_stage.get("data", {})
+    upload_status = publisher_data.get("upload_status")
+
+    if upload_status == "simulated":
+        logger.warning(
+            "Pipeline finished, but the video was NOT actually uploaded to "
+            "YouTube -- publisher fell back to a simulated upload because "
+            "YouTube OAuth credentials are missing or incomplete "
+            "(YOUTUBE_OAUTH_CLIENT_ID / YOUTUBE_OAUTH_CLIENT_SECRET / "
+            "YOUTUBE_OAUTH_REFRESH_TOKEN). Simulated id: %s",
+            publisher_data.get("video_id"),
+        )
+    elif upload_status == "published":
+        logger.info(
+            "Pipeline finished successfully. Video published: %s",
+            publisher_data.get("video_url"),
+        )
+    else:
+        logger.info("Pipeline finished successfully.")
 
 
 
