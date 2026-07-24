@@ -31,7 +31,7 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         cleanup_interval = input_json.get('cleanup_interval')
         
         run_id = str(uuid.uuid4())
-        started_at = datetime.datetime.utcnow().isoformat() + "Z"
+        started_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
         
         # Build scheduled_jobs list for info
         scheduled_jobs: List[Dict[str, Any]] = []
