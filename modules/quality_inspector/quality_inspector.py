@@ -200,6 +200,19 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
             "failure_reasons": failure_reasons,
         }
 
+        if verdict == "FAIL":
+            # A FAIL verdict must stop the pipeline (and must block publishing).
+            # Previously this always returned status="success", so the
+            # pipeline_controller never recorded a failed_stage and the run
+            # was reported as an overall success even though no real video
+            # was produced.
+            return build_response(
+                module=MODULE_NAME,
+                status="error",
+                data=data,
+                error="; ".join(failure_reasons) or "Quality inspection failed.",
+            )
+
         return build_response(module=MODULE_NAME, status="success", data=data)
 
     except ContractError as exc:
