@@ -124,7 +124,29 @@ privacy options:
         )
         sys.exit(1)
 
+    # A stage reporting status="success" only means it ran without a
+    # technical error -- it does NOT mean the video is fit to publish.
+    # quality_inspector reports its PASS/FAIL business verdict inside its
+    # own data, not through the envelope status (see quality_inspector.py),
+    # so that verdict must be checked here explicitly. Without this check,
+    # a run with missing media or a manifest-only render would print
+    # "Pipeline finished successfully" and exit 0 even though no usable
+    # video was produced.
+    quality_stage = result.get("data", {}).get("stages", {}).get("quality_inspector", {})
+    quality_data = quality_stage.get("data", {})
+    verdict = quality_data.get("verdict")
+
+    if verdict != "PASS":
+        logger.error(
+            "Pipeline completed all stages but the video failed the final "
+            "quality gate (verdict=%s): %s",
+            verdict,
+            "; ".join(quality_data.get("failure_reasons", [])) or "unknown reason",
+        )
+        sys.exit(1)
+
     logger.info("Pipeline finished successfully.")
+
 
 
 if __name__ == "__main__":
