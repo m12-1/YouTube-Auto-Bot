@@ -1,0 +1,335 @@
+"""
+modules/ai_media_verification/ai_media_verification.py
+
+For every scene, scores each quality-filtered candidate against its
+narration sentence using a vision-capable AI model, and returns the
+best match, its score/reason, and the rejected candidates.
+
+The vision model call goes through `shared.gemini_client`, which is
+intentionally abstract (`generate_vision_score`) so a different model
+provider can be swapped in later without touching this module's
+contract. If no API key is configured or the call fails for a given
+candidate, a deterministic keyword-overlap heuristic is used instead.
+
+Public contract:
+    run(input_json) -> output_json
+
+input_json (required keys):
+    {
+        "run_id": str,
+        "topic": str,
+        "storyboard": [ {"scene_id": str, "narration": str, "keywords": [str,...]}, ... ],
+        "filtered": [
+            {
+                "scene_id": str,
+                "accepted_candidates": [ {"candidate_id": str, "url": str, ...}, ... ],
+                "rejected_candidates": [...]
+            },
+            ...
+        ]
+    }
+
+output_json:
+    {
+        "status": "success" | "error",
+        "module": "ai_media_verification",
+        "data": {
+            "run_id": str,
+            "topic": str,
+            "verifications": [
+                {
+                    "scene_id": str,
+                    "best_media": {...candidate...} | null,
+                    "score": float,
+                    "reason": str,
+                    "rejected_candidates": [ {"candidate_id": str, "score": float, "reason": str}, ... ],
+                    "source": "ai" | "heuristic_fallback"
+                },
+                ...
+            ]
+        },
+        "error": str | null
+    }
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from config import pipeline_config, settings
+from shared.gemini_client import (
+    GeminiUnavailableError,
+    generate_vision_verification,
+    pick_api_key,
+)
+from shared.json_contract import ContractError, build_response, require_keys
+from shared.logger import get_logger
+from shared.retry import retry
+
+logger = get_logger(__name__)
+
+MODULE_NAME = "ai_media_verification"
+
+
+def _forbidden_match(candidate: Dict[str, Any], forbidden_objects: List[str]) -> Optional[str]:
+    """
+    Cheap, free pre-filter run BEFORE any Gemini call: if the
+    candidate's own provider metadata (tags/alt text, carried through
+    as "source_text" by media_downloader) mentions a forbidden object,
+    reject it outright without spending AI verification budget on it.
+
+    Args:
+        candidate: A media candidate dict.
+        forbidden_objects: Scene Analyzer's forbidden object/setting list.
+
+    Returns:
+        The forbidden term matched, or None if the candidate is clean.
+    """
+    if not forbidden_objects:
+        return None
+    haystack = f"{candidate.get('source_text', '')} {candidate.get('url', '')}".lower()
+    for forbidden in forbidden_objects:
+        needle = forbidden.strip().lower()
+        if needle and needle in haystack:
+            return needle
+    return None
+
+
+def _keyword_overlap_score(
+    narration: str, candidate: Dict[str, Any], forbidden_objects: List[str]
+) -> Tuple[float, str]:
+    """
+    Deterministic fallback scorer (used only if Gemini is unavailable):
+    how many narration words appear in the candidate's own search
+    keywords / URL slug, penalized if a forbidden object is mentioned.
+
+    Args:
+        narration: The scene's narration sentence.
+        candidate: A media candidate dict.
+        forbidden_objects: Scene Analyzer's forbidden object/setting list.
+
+    Returns:
+        A tuple of (score between 0.0 and 1.0, human-readable reason).
+    """
+    forbidden_hit = _forbidden_match(candidate, forbidden_objects)
+    if forbidden_hit:
+        return 0.0, f"Heuristic fallback: matched forbidden term '{forbidden_hit}'."
+
+    narration_words = set(re.findall(r"[a-zA-Z']+", narration.lower()))
+    candidate_text = (
+        f"{candidate.get('url', '')} {candidate.get('candidate_id', '')} "
+        f"{candidate.get('source_text', '')}"
+    ).lower()
+    candidate_words = set(re.findall(r"[a-zA-Z']+", candidate_text))
+
+    overlap = narration_words & candidate_words
+    score = min(1.0, 0.4 + 0.15 * len(overlap))
+    reason = (
+        f"Heuristic keyword overlap: {len(overlap)} shared term(s)."
+        if overlap
+        else "Heuristic fallback: no strong keyword overlap, default baseline score."
+    )
+    return round(score, 3), reason
+
+
+@retry(max_attempts=2, exceptions=(GeminiUnavailableError,))
+def _score_candidate_with_ai(
+    narration: str,
+    candidate: Dict[str, Any],
+    required_objects: List[str],
+    environment: str,
+    forbidden_objects: List[str],
+) -> Dict[str, Any]:
+    """
+    Score a single candidate against a narration sentence and its Scene
+    Analyzer requirements using multi-criteria Gemini vision scoring
+    (main subject, environment, motion, sentence fit, contradictions,
+    viewer comprehension) instead of one generic relevance question.
+
+    Raises:
+        GeminiUnavailableError: If no key is configured or the call fails.
+    """
+    api_key = pick_api_key(settings.GEMINI_KEY_IMAGE, settings.GEMINI_KEY_ADVANCED)
+    if not api_key:
+        raise GeminiUnavailableError("No Gemini API key configured for ai_media_verification.")
+
+    url = candidate.get("url", "")
+    if not url:
+        raise GeminiUnavailableError("Candidate has no URL to verify.")
+
+    return generate_vision_verification(
+        narration_sentence=narration,
+        image_url=url,
+        api_key=api_key,
+        required_objects=required_objects,
+        environment=environment,
+        forbidden_objects=forbidden_objects,
+    )
+
+
+def _score_candidate(
+    narration: str,
+    candidate: Dict[str, Any],
+    required_objects: List[str],
+    environment: str,
+    forbidden_objects: List[str],
+) -> Tuple[Dict[str, Any], str]:
+    """
+    Score a candidate: reject instantly (no AI call) if a forbidden
+    object is already evident from provider metadata; otherwise prefer
+    the multi-criteria AI verifier, falling back to the keyword-overlap
+    heuristic on any AI failure.
+
+    Returns:
+        A tuple of (score_result dict with "score"/"reason", source string).
+    """
+    forbidden_hit = _forbidden_match(candidate, forbidden_objects)
+    if forbidden_hit:
+        return (
+            {"score": 0.0, "reason": f"Rejected pre-Gemini: matched forbidden term '{forbidden_hit}'."},
+            "forbidden_prefilter",
+        )
+
+    try:
+        result = _score_candidate_with_ai(
+            narration, candidate, required_objects, environment, forbidden_objects
+        )
+        return result, "ai"
+    except GeminiUnavailableError as exc:
+        logger.warning(
+            "ai_media_verification falling back to heuristic for candidate=%s: %s",
+            candidate.get("candidate_id"),
+            exc,
+        )
+        score, reason = _keyword_overlap_score(narration, candidate, forbidden_objects)
+        return {"score": score, "reason": reason}, "heuristic_fallback"
+
+
+def _verify_scene(
+    scene_id: str,
+    narration: str,
+    accepted_candidates: List[Dict[str, Any]],
+    required_objects: List[str],
+    environment: str,
+    forbidden_objects: List[str],
+) -> Dict[str, Any]:
+    """
+    Score all accepted candidates for one scene and pick the best one.
+
+    Args:
+        scene_id: The storyboard scene identifier.
+        narration: The scene's narration sentence.
+        accepted_candidates: Quality-filtered candidates for this scene.
+        required_objects: Scene Analyzer's expected objects/subjects.
+        environment: Scene Analyzer's expected environment/setting.
+        forbidden_objects: Scene Analyzer's forbidden objects/settings.
+
+    Returns:
+        A verification result dict for this scene.
+    """
+    if not accepted_candidates:
+        return {
+            "scene_id": scene_id,
+            "best_media": None,
+            "score": 0.0,
+            "reason": "No quality-approved candidates available for this scene.",
+            "rejected_candidates": [],
+            "source": "n/a",
+        }
+
+    scored: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
+    for candidate in accepted_candidates:
+        score_result, source = _score_candidate(
+            narration, candidate, required_objects, environment, forbidden_objects
+        )
+        scored.append((candidate, score_result, source))
+
+    scored.sort(key=lambda item: item[1].get("score", 0.0), reverse=True)
+    best_candidate, best_score_result, best_source = scored[0]
+
+    rejected = [
+        {
+            "candidate_id": candidate.get("candidate_id"),
+            "score": score_result.get("score", 0.0),
+            "reason": score_result.get("reason", ""),
+        }
+        for candidate, score_result, _ in scored[1:]
+    ]
+
+    return {
+        "scene_id": scene_id,
+        "best_media": best_candidate,
+        "score": best_score_result.get("score", 0.0),
+        "reason": best_score_result.get("reason", ""),
+        "rejected_candidates": rejected,
+        "source": best_source,
+    }
+
+
+def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Verify quality-filtered media candidates against each scene's
+    narration using an (abstracted) AI vision model.
+
+    Args:
+        input_json: Must contain "run_id", "topic", "storyboard", and
+            "filtered" (see `media_quality_filter` output shape).
+
+    Returns:
+        A standardized JSON response envelope (see module docstring).
+    """
+    try:
+        require_keys(input_json, ["run_id", "topic", "storyboard", "filtered"])
+
+        run_id = input_json["run_id"]
+        topic = input_json["topic"]
+        storyboard = input_json["storyboard"]
+        filtered = input_json["filtered"]
+
+        if not isinstance(storyboard, list) or not isinstance(filtered, list):
+            raise ContractError("storyboard and filtered must both be lists")
+
+        scenes_by_id = {scene["scene_id"]: scene for scene in storyboard}
+        filtered_by_scene = {entry["scene_id"]: entry for entry in filtered}
+
+        verifications: List[Dict[str, Any]] = []
+        for scene_id, scene in scenes_by_id.items():
+            scene_filtered = filtered_by_scene.get(scene_id, {})
+            accepted_candidates = scene_filtered.get("accepted_candidates", [])
+            verifications.append(
+                _verify_scene(
+                    scene_id,
+                    scene.get("narration", ""),
+                    accepted_candidates,
+                    scene.get("objects", []),
+                    scene.get("environment", ""),
+                    scene.get("forbidden", []),
+                )
+            )
+
+        scenes_without_media = sum(1 for v in verifications if v["best_media"] is None)
+        logger.info(
+            "AI media verification complete for run_id=%s topic='%s' "
+            "-> %d scenes verified, %d without usable media",
+            run_id,
+            topic,
+            len(verifications),
+            scenes_without_media,
+        )
+
+        data = {
+            "run_id": run_id,
+            "topic": topic,
+            "verifications": verifications,
+        }
+
+        return build_response(module=MODULE_NAME, status="success", data=data)
+
+    except ContractError as exc:
+        logger.error("AI Media Verification contract violation: %s", exc)
+        return build_response(module=MODULE_NAME, status="error", error=str(exc))
+
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("AI Media Verification failed unexpectedly.")
+        return build_response(module=MODULE_NAME, status="error", error=str(exc))
