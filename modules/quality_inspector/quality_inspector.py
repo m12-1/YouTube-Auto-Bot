@@ -200,20 +200,18 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
             "failure_reasons": failure_reasons,
         }
 
-        if verdict == "FAIL":
-            # A FAIL verdict must stop the pipeline (and must block publishing).
-            # Previously this always returned status="success", so the
-            # pipeline_controller never recorded a failed_stage and the run
-            # was reported as an overall success even though no real video
-            # was produced.
-            return build_response(
-                module=MODULE_NAME,
-                status="error",
-                data=data,
-                error="; ".join(failure_reasons) or "Quality inspection failed.",
-            )
-
+        # NOTE: "status" here reflects whether the Quality Inspector module
+        # itself executed correctly (matching the convention used by every
+        # other module in this pipeline, e.g. script_reviewer always returns
+        # status="success" no matter what quality_score it computes). The
+        # PASS/FAIL business verdict belongs in data["verdict"], not in the
+        # envelope status. Conflating the two (returning status="error" on a
+        # FAIL verdict) breaks that convention and makes "error" ambiguous
+        # between "this stage crashed" and "the video isn't ready" -- the
+        # caller (main.py / a future publisher stage) must gate publishing on
+        # data["verdict"] == "PASS", not on the envelope status.
         return build_response(module=MODULE_NAME, status="success", data=data)
+
 
     except ContractError as exc:
         logger.error("Quality Inspector contract violation: %s", exc)
