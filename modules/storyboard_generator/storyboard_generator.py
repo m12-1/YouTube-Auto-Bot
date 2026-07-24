@@ -160,6 +160,50 @@ def _build_storyboard(scene_breakdown: List[Dict[str, Any]], run_id: str) -> Lis
     return storyboard
 
 
+def _rescale_to_narration_length(
+    storyboard: List[Dict[str, Any]], full_narration: str
+) -> List[Dict[str, Any]]:
+    """
+    Rescale storyboard scene timings so the total duration matches the
+    actual narrated text length, not the sum of per-scene excerpt
+    estimates.
+
+    AI-generated scripts sometimes give scene_breakdown excerpts that
+    don't exactly match the "narration" field that voice_generator
+    actually narrates (e.g. a scene's excerpt repeats the hook/question
+    while "narration" starts later). Left uncorrected, the video track
+    ends up longer than the narrated audio, so subtitles (timed to the
+    real narration) stop covering the video well before it ends -- this
+    is exactly what the Quality Inspector's "no_missing_subtitles" check
+    catches. Scaling every scene's start/end time by the same factor
+    preserves each scene's *relative* share of screen time while making
+    the total match reality.
+
+    Args:
+        storyboard: Storyboard scenes with raw (unscaled) timings.
+        full_narration: The script's actual "narration" text.
+
+    Returns:
+        The same storyboard list, with timings rescaled in place.
+    """
+    if not storyboard:
+        return storyboard
+
+    raw_total = storyboard[-1]["end_time"]
+    word_count = len(full_narration.split())
+    target_total = word_count / 2.5 if word_count else raw_total
+
+    if raw_total <= 0 or target_total <= 0:
+        return storyboard
+
+    scale = target_total / raw_total
+    for scene in storyboard:
+        scene["start_time"] = round(scene["start_time"] * scale, 2)
+        scene["end_time"] = round(scene["end_time"] * scale, 2)
+
+    return storyboard
+
+
 def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build a timed storyboard from a reviewed script.
@@ -186,6 +230,7 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
             raise ContractError("script.scene_breakdown must be a non-empty list")
 
         storyboard = _build_storyboard(scene_breakdown, run_id)
+        storyboard = _rescale_to_narration_length(storyboard, script.get("narration", ""))
         total_duration = storyboard[-1]["end_time"] if storyboard else 0.0
 
         logger.info(
