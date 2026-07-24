@@ -123,7 +123,7 @@ VOICE_CANDIDATES: List[str] = _get_env_list(
     "VOICE_CANDIDATES",
     ["en-US-GuyNeural", "en-US-JennyNeural", "en-GB-RyanNeural", "en-GB-SoniaNeural"],
 )
-VOICE_SPEED_RANGE: List[str] = _get_env_list("VOICE_SPEED_RANGE", ["-10%", "0%", "10%"])
+VOICE_SPEED_RANGE: List[str] = _get_env_list("VOICE_SPEED_RANGE", ["-10%", "+0%", "+10%"])
 VOICE_PITCH_RANGE: List[str] = _get_env_list("VOICE_PITCH_RANGE", ["-2Hz", "0Hz", "2Hz"])
 VOICE_NATURAL_PAUSE_MS: int = _get_env_int("VOICE_NATURAL_PAUSE_MS", 250)
 
@@ -168,4 +168,3 @@ MONTHLY_UPLOAD_TARGET: int = _get_env_int("MONTHLY_UPLOAD_TARGET", 30)
 SCHEDULER_TIMEZONE: str = _get_env("SCHEDULER_TIMEZONE", "UTC") or "UTC"
 API_HOST: str = _get_env("API_HOST", "0.0.0.0") or "0.0.0.0"
 API_PORT: int = _get_env_int("API_PORT", 8000)
-
