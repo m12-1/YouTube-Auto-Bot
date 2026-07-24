@@ -65,6 +65,19 @@ logger = get_logger(__name__)
 MODULE_NAME = "video_renderer"
 
 try:
+    # Pillow >= 10 removed the long-deprecated Image.ANTIALIAS constant, but
+    # moviepy 1.x (the last version that still exposes `moviepy.editor`)
+    # still references it internally for resizing. Restore it as an alias
+    # for the equivalent Image.LANCZOS filter so moviepy keeps working
+    # without pinning Pillow to an old version that lacks Python 3.12 wheels.
+    from PIL import Image as _PILImage
+
+    if not hasattr(_PILImage, "ANTIALIAS"):
+        _PILImage.ANTIALIAS = _PILImage.LANCZOS
+except ImportError:  # pragma: no cover - Pillow always present as a dependency
+    pass
+
+try:
     from moviepy.editor import (
         AudioFileClip,
         CompositeVideoClip,
