@@ -76,10 +76,21 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install system dependencies (ffmpeg)
+      - name: Install system dependencies (ffmpeg, ImageMagick)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg imagemagick
+
+      - name: Relax ImageMagick policy for MoviePy TextClip
+        run: |
+          # Ubuntu's default ImageMagick policy blocks several operations
+          # (including text/label rendering paths MoviePy's TextClip relies
+          # on) via /etc/ImageMagick-6/policy.xml. Without this, TextClip
+          # calls can still fail even with ImageMagick installed.
+          POLICY_FILE="/etc/ImageMagick-6/policy.xml"
+          if [ -f "$POLICY_FILE" ]; then
+            sudo sed -i 's/rights="none"/rights="read|write"/g' "$POLICY_FILE"
+          fi
 
       - name: Install Python dependencies
         run: |
