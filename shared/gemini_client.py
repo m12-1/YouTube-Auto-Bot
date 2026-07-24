@@ -25,8 +25,14 @@ from shared.retry import retry
 
 logger = get_logger(__name__)
 
-_DEFAULT_TEXT_MODEL = "gemini-2.5-flash-lite"
-_DEFAULT_VISION_MODEL = "gemini-2.5-flash-lite"
+_MODEL_FALLBACK_CHAIN: List[str] = [
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
+_DEFAULT_TEXT_MODEL = _MODEL_FALLBACK_CHAIN[0]
+_DEFAULT_VISION_MODEL = _MODEL_FALLBACK_CHAIN[0]
 _API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
@@ -55,32 +61,19 @@ def _post(url: str, payload: Dict[str, Any], timeout_seconds: float) -> Dict[str
     return response.json()
 
 
-def generate_text(
+def _generate_text_single_model(
     prompt: str,
-    api_key: Optional[str],
-    model: str = _DEFAULT_TEXT_MODEL,
-    temperature: float = 0.7,
-    timeout_seconds: float = 20.0,
+    api_key: str,
+    model: str,
+    temperature: float,
+    timeout_seconds: float,
 ) -> str:
     """
-    Generate text from a Gemini text model.
-
-    Args:
-        prompt: The fully-rendered prompt text to send.
-        api_key: A Gemini API key from `config.settings`.
-        model: Gemini model name to call.
-        temperature: Sampling temperature.
-        timeout_seconds: Request timeout, in seconds.
-
-    Returns:
-        The generated text.
-
-    Raises:
-        GeminiUnavailableError: If `api_key` is missing or the call fails.
+    Call one specific Gemini model. Raises GeminiUnavailableError on any
+    failure (network, HTTP error, empty/malformed response) so the caller
+    in `generate_text` can decide whether to fall back to the next model
+    in the chain.
     """
-    if not api_key:
-        raise GeminiUnavailableError("No Gemini API key configured for this call.")
-
     url = f"{_API_BASE_URL}/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -91,24 +84,85 @@ def generate_text(
         body = _post(url, payload, timeout_seconds)
         candidates = body.get("candidates", [])
         if not candidates:
-            raise GeminiUnavailableError("Gemini returned no candidates.")
+            raise GeminiUnavailableError(f"Gemini model '{model}' returned no candidates.")
         parts = candidates[0].get("content", {}).get("parts", [])
         text = "".join(part.get("text", "") for part in parts)
         if not text:
-            raise GeminiUnavailableError("Gemini returned an empty response.")
+            raise GeminiUnavailableError(f"Gemini model '{model}' returned an empty response.")
         return text
     except GeminiUnavailableError:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Gemini text generation failed: %s", exc)
         raise GeminiUnavailableError(str(exc)) from exc
+
+
+def generate_text(
+    prompt: str,
+    api_key: Optional[str],
+    model: Optional[str | List[str]] = None,
+    temperature: float = 0.7,
+    timeout_seconds: float = 20.0,
+) -> str:
+    """
+    Generate text from a Gemini text model, trying a fallback chain of
+    lightweight/free-tier models for this same API key if one model is
+    unavailable (e.g. rate-limited with 429, retired with 404, or any
+    other transient error). Only once every model in the chain has
+    failed does this raise `GeminiUnavailableError`, at which point the
+    caller falls back to its own deterministic heuristic/template.
+
+    Args:
+        prompt: The fully-rendered prompt text to send.
+        api_key: A Gemini API key from `config.settings`.
+        model: A single model name, a list of model names to try in
+            order, or None to use the default fallback chain
+            (`_MODEL_FALLBACK_CHAIN`).
+        temperature: Sampling temperature.
+        timeout_seconds: Request timeout, in seconds.
+
+    Returns:
+        The generated text.
+
+    Raises:
+        GeminiUnavailableError: If `api_key` is missing, or every model
+            in the chain fails.
+    """
+    if not api_key:
+        raise GeminiUnavailableError("No Gemini API key configured for this call.")
+
+    if model is None:
+        models_to_try = _MODEL_FALLBACK_CHAIN
+    elif isinstance(model, str):
+        models_to_try = [model]
+    else:
+        models_to_try = list(model)
+
+    last_error: Optional[Exception] = None
+    for candidate_model in models_to_try:
+        try:
+            return _generate_text_single_model(
+                prompt, api_key, candidate_model, temperature, timeout_seconds
+            )
+        except GeminiUnavailableError as exc:
+            last_error = exc
+            logger.warning(
+                "Gemini model '%s' unavailable, trying next model in chain: %s",
+                candidate_model,
+                exc,
+            )
+            continue
+
+    logger.warning("Gemini text generation failed for all models tried: %s", last_error)
+    raise GeminiUnavailableError(
+        f"All Gemini models exhausted for this key: {last_error}"
+    ) from last_error
 
 
 def generate_vision_score(
     narration_sentence: str,
     image_url: str,
     api_key: Optional[str],
-    model: str = _DEFAULT_VISION_MODEL,
+    model: Optional[str | List[str]] = None,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
     """
