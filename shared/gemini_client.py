@@ -25,8 +25,8 @@ from shared.retry import retry
 
 logger = get_logger(__name__)
 
-_DEFAULT_TEXT_MODEL = "gemini-2.0-flash"
-_DEFAULT_VISION_MODEL = "gemini-2.0-flash"
+_DEFAULT_TEXT_MODEL = "gemini-2.5-flash-lite"
+_DEFAULT_VISION_MODEL = "gemini-2.5-flash-lite"
 _API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
