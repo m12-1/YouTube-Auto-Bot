@@ -1,0 +1,8 @@
+types-Pygments
+types-cachetools
+types-defusedxml
+types-gunicorn
+types-psutil
+types-pyasn1
+types-pywin32
+types-requests
