@@ -106,6 +106,77 @@ MEDIA_BLUR_THRESHOLD: float = _get_env_float("MEDIA_BLUR_THRESHOLD", 100.0)
 MEDIA_BRIGHTNESS_MIN: float = _get_env_float("MEDIA_BRIGHTNESS_MIN", 25.0)
 
 # ---------------------------------------------------------------------------
+# Media Ranker (Semantic Ranking -- Stage 5)
+# ---------------------------------------------------------------------------
+# How many raw candidates media_downloader should fetch per scene per
+# search attempt before quality filtering / ranking narrows them down.
+MEDIA_MAX_CANDIDATES: int = _get_env_int("MEDIA_MAX_CANDIDATES", 15)
+
+# How many of the top-ranked candidates get forwarded to Gemini Vision.
+# Gemini must never see the full candidate pool -- only this slice.
+MEDIA_MAX_VERIFIED_CANDIDATES: int = _get_env_int("MEDIA_MAX_VERIFIED_CANDIDATES", 5)
+
+# Minimum final_rank_score a candidate needs to even be considered for
+# AI verification. Candidates below this are set aside as low-rank.
+MEDIA_MIN_RANK_SCORE: float = _get_env_float("MEDIA_MIN_RANK_SCORE", 0.60)
+
+# Fallback value used for a ranking sub-score when the signal it would
+# compare against is missing/empty (e.g. no camera_movement configured),
+# so an absent signal never silently drags a candidate's score to zero.
+MEDIA_RANK_NEUTRAL_BASELINE: float = _get_env_float("MEDIA_RANK_NEUTRAL_BASELINE", 0.5)
+
+# Relative weights combined into final_rank_score. They do not need to
+# sum to 1.0 -- media_ranker normalizes by their total automatically,
+# so any weight can be tuned independently.
+MEDIA_RANK_WEIGHT_SEMANTIC_SIMILARITY: float = _get_env_float(
+    "MEDIA_RANK_WEIGHT_SEMANTIC_SIMILARITY", 0.20
+)
+MEDIA_RANK_WEIGHT_SCIENTIFIC_DOMAIN: float = _get_env_float(
+    "MEDIA_RANK_WEIGHT_SCIENTIFIC_DOMAIN", 0.10
+)
+MEDIA_RANK_WEIGHT_REQUIRED_OBJECTS: float = _get_env_float(
+    "MEDIA_RANK_WEIGHT_REQUIRED_OBJECTS", 0.15
+)
+MEDIA_RANK_WEIGHT_REQUIRED_ACTIONS: float = _get_env_float(
+    "MEDIA_RANK_WEIGHT_REQUIRED_ACTIONS", 0.10
+)
+MEDIA_RANK_WEIGHT_ENVIRONMENT: float = _get_env_float("MEDIA_RANK_WEIGHT_ENVIRONMENT", 0.10)
+MEDIA_RANK_WEIGHT_CAMERA_STYLE: float = _get_env_float("MEDIA_RANK_WEIGHT_CAMERA_STYLE", 0.05)
+MEDIA_RANK_WEIGHT_VISUAL_THEME: float = _get_env_float("MEDIA_RANK_WEIGHT_VISUAL_THEME", 0.08)
+MEDIA_RANK_WEIGHT_RESOLUTION: float = _get_env_float("MEDIA_RANK_WEIGHT_RESOLUTION", 0.08)
+MEDIA_RANK_WEIGHT_ORIENTATION: float = _get_env_float("MEDIA_RANK_WEIGHT_ORIENTATION", 0.06)
+MEDIA_RANK_WEIGHT_DURATION: float = _get_env_float("MEDIA_RANK_WEIGHT_DURATION", 0.08)
+MEDIA_RANK_WEIGHT_GENERIC_STOCK_PENALTY: float = _get_env_float(
+    "MEDIA_RANK_WEIGHT_GENERIC_STOCK_PENALTY", 0.10
+)
+
+# Generic (non-topic-specific) indicator phrases that flag a candidate
+# as subject-less stock filler rather than a real match for the scene.
+MEDIA_GENERIC_STOCK_TERMS: List[str] = _get_env_list(
+    "MEDIA_GENERIC_STOCK_TERMS",
+    [
+        "stock footage",
+        "stock video",
+        "template",
+        "abstract background",
+        "placeholder",
+        "sample clip",
+        "loop background",
+        "generic background",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Media Engine -- Fallback / Re-search Loop (Stage 8)
+# ---------------------------------------------------------------------------
+# How many times the media engine regenerates search queries and
+# retries PER PROVIDER before moving on to the next provider in
+# MEDIA_PROVIDER_PRIORITY. If every provider is exhausted without a
+# candidate clearing MEDIA_MIN_VERIFICATION_SCORE, the scene is left
+# without media rather than accepting a weak match.
+MEDIA_MAX_SEARCH_ATTEMPTS: int = _get_env_int("MEDIA_MAX_SEARCH_ATTEMPTS", 3)
+
+# ---------------------------------------------------------------------------
 # AI Media Verification
 # ---------------------------------------------------------------------------
 # Minimum overall_score (see shared.gemini_client.generate_vision_verification)
