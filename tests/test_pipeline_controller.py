@@ -83,6 +83,7 @@ def test_full_pipeline_runs_successfully() -> None:
         "media_planner",
         "media_downloader",
         "media_quality_filter",
+        "media_ranker",
         "ai_media_verification",
         "voice_generator",
         "subtitle_generator",
