@@ -91,6 +91,152 @@ _DEFAULT_TOPIC_CONTEXT = {
 _DEFAULT_FORBIDDEN = ["office", "podcast", "studio interview", "kitchen", "meeting room"]
 
 
+def _canonicalize_style(raw_style: str) -> str:
+    """
+    Map a free-text visual-style/scene-type string (from the AI Topic
+    Analyzer's "visual_style" or the Scene Analyzer's "scene_type") onto
+    one of the fixed `pipeline_config.MEDIA_STYLE_CATEGORIES`.
+
+    This is what makes "Visual Style Consistency" enforceable: once a
+    style is canonicalized, every OTHER category's indicator terms
+    (`pipeline_config.MEDIA_STYLE_TERMS`) can be merged into this
+    scene/video's forbidden list, blocking cross-style mixing (e.g. a
+    cartoon or vector clip slipping into a Real Footage video) through
+    the exact same forbidden/negative-keyword plumbing every other
+    filter already uses.
+
+    Args:
+        raw_style: Free-text style/scene-type description.
+
+    Returns:
+        One of `pipeline_config.MEDIA_STYLE_CATEGORIES`, defaulting to
+        `pipeline_config.MEDIA_STYLE_DEFAULT` when nothing matches.
+    """
+    text = (raw_style or "").strip().lower()
+    if not text:
+        return pipeline_config.MEDIA_STYLE_DEFAULT
+
+    for category in pipeline_config.MEDIA_STYLE_CATEGORIES:
+        if category.lower() in text:
+            return category
+
+    best_category = None
+    best_hits = 0
+    for category, terms in pipeline_config.MEDIA_STYLE_TERMS.items():
+        hits = sum(1 for term in terms if term in text)
+        if hits > best_hits:
+            best_hits = hits
+            best_category = category
+
+    return best_category or pipeline_config.MEDIA_STYLE_DEFAULT
+
+
+def _forbidden_style_terms(locked_style: str, extra_forbidden_styles: List[str] | None = None) -> List[str]:
+    """
+    Build the list of style-indicator terms that must NOT appear for a
+    scene/video locked to `locked_style` -- i.e. every OTHER canonical
+    style's own indicator terms, so a candidate visibly belonging to a
+    different visual style (cartoon, vector, CGI, ...) gets caught by
+    the same forbidden/negative-keyword filters as any other content
+    mismatch. `extra_forbidden_styles` (from a matched Domain Template's
+    "forbidden_styles") is folded in defensively even if it overlaps.
+
+    Args:
+        locked_style: The video/scene's canonical visual style.
+        extra_forbidden_styles: Additional style names to forbid.
+
+    Returns:
+        A deduplicated, lowercase list of forbidden style terms.
+    """
+    terms: List[str] = []
+    for category, category_terms in pipeline_config.MEDIA_STYLE_TERMS.items():
+        if category == locked_style:
+            continue
+        if extra_forbidden_styles and category not in extra_forbidden_styles:
+            # If the caller supplied an explicit forbidden-styles list
+            # (from a Domain Template), respect it as authoritative
+            # rather than blocking every non-locked style -- some
+            # domains (e.g. Technology) legitimately allow more than
+            # one style side by side.
+            if extra_forbidden_styles:
+                continue
+        terms.extend(category_terms)
+    return list(dict.fromkeys(t.lower() for t in terms))
+
+
+def _match_domain_template(scientific_domain: str, visual_theme: str, topic: str) -> Dict[str, Any] | None:
+    """
+    Find the best-matching Domain Template (`pipeline_config.DOMAIN_TEMPLATES`)
+    for this video, by simple case-insensitive substring matching of the
+    template's name against the AI-derived scientific_domain/visual_theme
+    or the raw topic. Returns None if nothing matches -- in that case the
+    pipeline behaves exactly as it did before Domain Templates existed
+    (pure AI-derived topic_context, no template applied).
+
+    Args:
+        scientific_domain: Global Topic Understanding's scientific_domain.
+        visual_theme: Global Topic Understanding's visual_theme.
+        topic: The raw video topic string.
+
+    Returns:
+        The matched template dict, or None.
+    """
+    haystack = f"{scientific_domain} {visual_theme} {topic}".lower()
+    for name, template in pipeline_config.DOMAIN_TEMPLATES.items():
+        if name.lower() in haystack:
+            return template
+    return None
+
+
+def _apply_domain_template(topic_context: Dict[str, Any], topic: str) -> Dict[str, Any]:
+    """
+    Merge a matched Domain Template's allowed/forbidden lists into the
+    video's topic_context (union, never overwrite -- the AI's own
+    per-video read always stays, the template only adds extra guardrails
+    a specific domain is known to need). Also canonicalizes the video's
+    locked visual style and folds in any template-forbidden styles.
+
+    Args:
+        topic_context: Global Topic Understanding's output (AI or default).
+        topic: The raw video topic string.
+
+    Returns:
+        A new topic_context dict, augmented with "visual_style_locked"
+        and (when a template matched) "domain_template_matched" plus
+        merged forbidden_domains/forbidden_objects.
+    """
+    topic_context = dict(topic_context)
+    locked_style = _canonicalize_style(topic_context.get("visual_style", ""))
+
+    template = _match_domain_template(
+        topic_context.get("scientific_domain", ""), topic_context.get("visual_theme", ""), topic
+    )
+
+    if template:
+        topic_context["domain_template_matched"] = True
+        topic_context["forbidden_objects"] = list(
+            dict.fromkeys(list(topic_context.get("forbidden_objects", [])) + list(template.get("forbidden_objects", [])))
+        )
+        allowed_styles = template.get("allowed_styles") or []
+        if allowed_styles and locked_style not in allowed_styles:
+            # The AI's free-text style read didn't land inside this
+            # domain's known-good styles (e.g. it said something that
+            # canonicalized to "Vector" for an Animals video) -- prefer
+            # the template's first allowed style instead, since the
+            # template encodes a stronger domain-specific prior than a
+            # single free-text field.
+            locked_style = allowed_styles[0]
+        topic_context["forbidden_styles"] = list(
+            dict.fromkeys(template.get("forbidden_styles", []))
+        )
+    else:
+        topic_context["domain_template_matched"] = False
+        topic_context.setdefault("forbidden_styles", [])
+
+    topic_context["visual_style_locked"] = locked_style
+    return topic_context
+
+
 def _estimate_scene_duration(narration_excerpt: str) -> float:
     """
     Estimate how long a scene should last on screen based on how many
@@ -184,12 +330,18 @@ def _analyze_topic(topic: str, narration: str) -> Dict[str, Any]:
     Run Global Topic Understanding, preferring AI and falling back to a
     conservative default context (no domain lock, generic forbidden
     list) on any failure so the pipeline still runs without an API key.
+    Always passes the result through `_apply_domain_template`, which
+    canonicalizes the video's locked visual style and merges in any
+    matching Domain Template's guardrails (works on both the AI and the
+    default-fallback path).
     """
     try:
-        return _analyze_topic_with_ai(topic, narration)
+        topic_context = _analyze_topic_with_ai(topic, narration)
     except GeminiUnavailableError as exc:
         logger.warning("Topic Analyzer falling back to default context: %s", exc)
-        return dict(_DEFAULT_TOPIC_CONTEXT)
+        topic_context = dict(_DEFAULT_TOPIC_CONTEXT)
+
+    return _apply_domain_template(topic_context, topic)
 
 
 @retry(max_attempts=2, exceptions=(GeminiUnavailableError,))
@@ -251,22 +403,51 @@ def _analyze_scene_with_ai(
 
 def _apply_domain_lock(analysis: Dict[str, Any], topic_context: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Domain Lock (Stage 2), enforced in code so it can't be skipped by a
-    prompt the model ignores: hard-merge the video's topic-level
-    forbidden domains/objects into every scene's forbidden/negative
-    lists, regardless of whether the AI Scene Analyzer remembered to.
+    Domain Lock (Stage 2) + Visual Style Consistency lock, both enforced
+    in code so neither can be skipped by a prompt the model ignores:
+
+    1. Hard-merge the video's topic-level forbidden domains/objects into
+       every scene's forbidden/negative lists, regardless of whether the
+       AI Scene Analyzer remembered to.
+    2. Resolve this scene's canonical visual style -- the AI Scene
+       Analyzer's own per-scene "scene_type" is trusted as an explicit
+       override when it clearly canonicalizes to a *different* style
+       than the video's locked one (the same "unless the scene's own
+       narration explicitly moves elsewhere" principle already used for
+       domain), otherwise the scene inherits the video-wide locked
+       style. Either way, every OTHER style's indicator terms get merged
+       into this scene's forbidden/negative lists, so a cartoon/vector/
+       CGI clip can't slip into a Real Footage video (or vice versa)
+       through the same filters that already block wrong domains.
     """
+    analysis = dict(analysis)
+
     topic_forbidden = list(topic_context.get("forbidden_domains", [])) + list(
         topic_context.get("forbidden_objects", [])
     )
-    if not topic_forbidden:
+
+    locked_style = topic_context.get("visual_style_locked") or pipeline_config.MEDIA_STYLE_DEFAULT
+    scene_style = _canonicalize_style(analysis.get("scene_type", ""))
+    template_forbidden_styles = topic_context.get("forbidden_styles") or []
+
+    # Trust the scene-level override only if it disagrees with the
+    # video-wide lock AND is not itself a Domain-Template-forbidden
+    # style (a template's forbidden_styles are a stronger, domain-wide
+    # guarantee than one scene's own free-text read).
+    if scene_style != locked_style and scene_style in template_forbidden_styles:
+        scene_style = locked_style
+    analysis["visual_style"] = scene_style
+
+    forbidden_style_terms = _forbidden_style_terms(scene_style, template_forbidden_styles or None)
+
+    combined_forbidden = list(dict.fromkeys(topic_forbidden + forbidden_style_terms))
+    if not combined_forbidden:
         return analysis
 
-    analysis = dict(analysis)
-    analysis["forbidden"] = list(dict.fromkeys(list(analysis.get("forbidden", [])) + topic_forbidden))
+    analysis["forbidden"] = list(dict.fromkeys(list(analysis.get("forbidden", [])) + combined_forbidden))
     analysis["keywords_negative"] = list(
         dict.fromkeys(
-            list(analysis.get("keywords_negative", [])) + [w.lower() for w in topic_forbidden]
+            list(analysis.get("keywords_negative", [])) + [w.lower() for w in combined_forbidden]
         )
     )
     return analysis
@@ -363,6 +544,7 @@ def _build_storyboard(
                 "visual_description": description,
                 "keywords": _extract_scene_keywords(f"{description} {narration_excerpt}"),
                 "scene_type": analysis["scene_type"],
+                "visual_style": analysis["visual_style"],
                 "environment": analysis["environment"],
                 "objects": analysis["objects"],
                 "forbidden": analysis["forbidden"],
