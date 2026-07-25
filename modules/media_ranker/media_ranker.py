@@ -92,12 +92,31 @@ MODULE_NAME = "media_ranker"
 
 _WORD_RE = re.compile(r"[a-zA-Z']+")
 
+# Generic English function words -- not topic-specific vocabulary. Without
+# filtering these, any reference text built from full sentences (narration,
+# visual_description) is dominated by words like "the"/"you"/"it" that can
+# never meaningfully appear in a stock provider's tag list, which silently
+# drags every overlap-based score toward zero regardless of subject.
+_STOPWORDS = frozenset(
+    """
+    a an the this that these those is are was were be been being to of in on
+    at for with without by from as it its it's you your yours we our ours
+    they their theirs he she his her him them i me my mine and or but if
+    then than so not no yes do does did done doing have has had having will
+    would shall should can could may might must just very really quite here
+    there what which who whom whose why how when where all any both each
+    few more most other some such only own same too also into onto out up
+    down over under again further once about above below between through
+    """.split()
+)
+
 
 def _tokenize(text: str) -> set:
-    """Lowercase word-tokenize free text for overlap-based scoring."""
+    """Lowercase word-tokenize free text for overlap-based scoring, dropping
+    generic stopwords so scores reflect meaningful vocabulary overlap."""
     if not text:
         return set()
-    return set(_WORD_RE.findall(text.lower()))
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS}
 
 
 def _candidate_text(candidate: Dict[str, Any]) -> str:
@@ -107,8 +126,15 @@ def _candidate_text(candidate: Dict[str, Any]) -> str:
 
 def _overlap_score(reference_words: set, candidate_text: str) -> float:
     """
-    Generic word-overlap relevance score in [0, 1]: what fraction of the
-    reference terms show up somewhere in the candidate's own text.
+    Generic word-overlap relevance score in [0, 1] using the Dice
+    coefficient (2 * shared / (|reference| + |candidate|)) rather than
+    plain recall. Recall alone (matched / len(reference)) collapses
+    toward zero whenever the reference set is large relative to a
+    candidate's short tag list -- e.g. a reference built from full
+    narration sentences vs. a candidate with a dozen one-word tags --
+    even when every one of the candidate's tags is a genuine hit. Dice
+    balances both set sizes so a strong, on-topic tag list still scores
+    well regardless of how verbose the reference text was.
 
     Returns the configured neutral baseline when there is nothing to
     compare against (empty reference), so an absent signal never
@@ -119,8 +145,11 @@ def _overlap_score(reference_words: set, candidate_text: str) -> float:
     candidate_words = _tokenize(candidate_text)
     if not candidate_words:
         return 0.0
-    matched = sum(1 for word in reference_words if word in candidate_words)
-    return round(min(1.0, matched / len(reference_words)), 4)
+    matched = len(reference_words & candidate_words)
+    if matched == 0:
+        return 0.0
+    dice = (2 * matched) / (len(reference_words) + len(candidate_words))
+    return round(min(1.0, dice), 4)
 
 
 def _list_match_score(terms: List[str], candidate_text: str) -> float:
@@ -322,9 +351,7 @@ def _rank_scene(
     covered_words = _tokenize(" ".join(required_objects + primary + secondary)) | _tokenize(environment)
     action_words = [w for w in _tokenize(visual_description) if w not in covered_words and len(w) > 2]
 
-    semantic_reference_words = _tokenize(narration) | _tokenize(" ".join(primary)) | _tokenize(
-        " ".join(secondary)
-    ) | _tokenize(visual_description) | _tokenize(topic)
+    semantic_reference_words = _tokenize(" ".join(primary + secondary)) | _tokenize(topic)
     domain_words = _tokenize(scientific_domain)
     environment_words = _tokenize(environment)
     camera_words = _tokenize(camera_movement.replace("_", " "))
