@@ -145,7 +145,18 @@ def _review_with_ai(script: Dict[str, Any]) -> Dict[str, Any]:
     if cleaned.lower().startswith("json"):
         cleaned = cleaned[4:].strip()
 
-    parsed = json.loads(cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        # The model occasionally emits malformed JSON (e.g. an unescaped
+        # apostrophe/quote inside a string value). Treat this the same as
+        # an unavailable API response so the caller falls back to the
+        # deterministic heuristic reviewer instead of crashing the stage.
+        raise GeminiUnavailableError(f"AI review response was not valid JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise GeminiUnavailableError("AI review response was not a JSON object.")
+
     for key in ("hook", "question", "narration", "cta", "scene_breakdown", "review_notes", "quality_score"):
         if key not in parsed:
             raise GeminiUnavailableError(f"AI review response missing key '{key}'.")
