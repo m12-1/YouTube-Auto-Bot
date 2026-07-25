@@ -140,12 +140,16 @@ def _score_candidate_with_ai(
     required_objects: List[str],
     environment: str,
     forbidden_objects: List[str],
+    topic: str,
+    scientific_domain: str,
+    previous_scene: str,
+    next_scene: str,
 ) -> Dict[str, Any]:
     """
-    Score a single candidate against a narration sentence and its Scene
-    Analyzer requirements using multi-criteria Gemini vision scoring
-    (main subject, environment, motion, sentence fit, contradictions,
-    viewer comprehension) instead of one generic relevance question.
+    Score a single candidate using multi-signal Gemini vision scoring:
+    semantic fit, scientific-domain lock, visual continuity with the
+    previous/next scene, and a generic-stock-footage check — not just
+    one generic relevance question.
 
     Raises:
         GeminiUnavailableError: If no key is configured or the call fails.
@@ -165,6 +169,10 @@ def _score_candidate_with_ai(
         required_objects=required_objects,
         environment=environment,
         forbidden_objects=forbidden_objects,
+        topic=topic,
+        scientific_domain=scientific_domain,
+        previous_scene=previous_scene,
+        next_scene=next_scene,
     )
 
 
@@ -174,11 +182,15 @@ def _score_candidate(
     required_objects: List[str],
     environment: str,
     forbidden_objects: List[str],
+    topic: str,
+    scientific_domain: str,
+    previous_scene: str,
+    next_scene: str,
 ) -> Tuple[Dict[str, Any], str]:
     """
     Score a candidate: reject instantly (no AI call) if a forbidden
     object is already evident from provider metadata; otherwise prefer
-    the multi-criteria AI verifier, falling back to the keyword-overlap
+    the multi-signal AI verifier, falling back to the keyword-overlap
     heuristic on any AI failure.
 
     Returns:
@@ -193,7 +205,15 @@ def _score_candidate(
 
     try:
         result = _score_candidate_with_ai(
-            narration, candidate, required_objects, environment, forbidden_objects
+            narration,
+            candidate,
+            required_objects,
+            environment,
+            forbidden_objects,
+            topic,
+            scientific_domain,
+            previous_scene,
+            next_scene,
         )
         return result, "ai"
     except GeminiUnavailableError as exc:
@@ -213,9 +233,17 @@ def _verify_scene(
     required_objects: List[str],
     environment: str,
     forbidden_objects: List[str],
+    topic: str,
+    scientific_domain: str,
+    previous_scene: str,
+    next_scene: str,
 ) -> Dict[str, Any]:
     """
-    Score all accepted candidates for one scene and pick the best one.
+    Score all accepted candidates for one scene and pick the best one
+    that clears the minimum relevance threshold (Fallback stage): a
+    candidate that doesn't reach `MEDIA_MIN_VERIFICATION_SCORE` is
+    treated the same as having no usable media for this scene, rather
+    than being used just to fill the gap.
 
     Args:
         scene_id: The storyboard scene identifier.
@@ -224,6 +252,10 @@ def _verify_scene(
         required_objects: Scene Analyzer's expected objects/subjects.
         environment: Scene Analyzer's expected environment/setting.
         forbidden_objects: Scene Analyzer's forbidden objects/settings.
+        topic: The video's overall topic.
+        scientific_domain: The video's Global Topic Understanding domain.
+        previous_scene: Previous scene's narration (Visual Consistency Engine).
+        next_scene: Next scene's narration (Visual Consistency Engine).
 
     Returns:
         A verification result dict for this scene.
@@ -241,12 +273,21 @@ def _verify_scene(
     scored: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
     for candidate in accepted_candidates:
         score_result, source = _score_candidate(
-            narration, candidate, required_objects, environment, forbidden_objects
+            narration,
+            candidate,
+            required_objects,
+            environment,
+            forbidden_objects,
+            topic,
+            scientific_domain,
+            previous_scene,
+            next_scene,
         )
         scored.append((candidate, score_result, source))
 
     scored.sort(key=lambda item: item[1].get("score", 0.0), reverse=True)
     best_candidate, best_score_result, best_source = scored[0]
+    best_score = best_score_result.get("score", 0.0)
 
     rejected = [
         {
@@ -257,10 +298,37 @@ def _verify_scene(
         for candidate, score_result, _ in scored[1:]
     ]
 
+    threshold = pipeline_config.MEDIA_MIN_VERIFICATION_SCORE
+    if best_score < threshold:
+        # Fallback stage: nothing cleared the bar, so this scene gets no
+        # media rather than settling for a weak match. video_composer /
+        # video_renderer already handle a scene with no verified media by
+        # skipping it instead of failing the whole render.
+        rejected.insert(
+            0,
+            {
+                "candidate_id": best_candidate.get("candidate_id"),
+                "score": best_score,
+                "reason": best_score_result.get("reason", ""),
+            },
+        )
+        return {
+            "scene_id": scene_id,
+            "best_media": None,
+            "score": best_score,
+            "reason": (
+                f"No candidate reached the minimum relevance score "
+                f"({best_score} < {threshold}). Best attempt: "
+                f"{best_score_result.get('reason', '')}"
+            ),
+            "rejected_candidates": rejected,
+            "source": best_source,
+        }
+
     return {
         "scene_id": scene_id,
         "best_media": best_candidate,
-        "score": best_score_result.get("score", 0.0),
+        "score": best_score,
         "reason": best_score_result.get("reason", ""),
         "rejected_candidates": rejected,
         "source": best_source,
@@ -290,13 +358,18 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(storyboard, list) or not isinstance(filtered, list):
             raise ContractError("storyboard and filtered must both be lists")
 
-        scenes_by_id = {scene["scene_id"]: scene for scene in storyboard}
+        topic_context = input_json.get("topic_context", {}) or {}
+        scientific_domain = topic_context.get("scientific_domain", "")
+
         filtered_by_scene = {entry["scene_id"]: entry for entry in filtered}
 
         verifications: List[Dict[str, Any]] = []
-        for scene_id, scene in scenes_by_id.items():
+        for index, scene in enumerate(storyboard):
+            scene_id = scene["scene_id"]
             scene_filtered = filtered_by_scene.get(scene_id, {})
             accepted_candidates = scene_filtered.get("accepted_candidates", [])
+            previous_scene = storyboard[index - 1].get("narration", "") if index > 0 else ""
+            next_scene = storyboard[index + 1].get("narration", "") if index + 1 < len(storyboard) else ""
             verifications.append(
                 _verify_scene(
                     scene_id,
@@ -305,6 +378,10 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
                     scene.get("objects", []),
                     scene.get("environment", ""),
                     scene.get("forbidden", []),
+                    topic,
+                    scientific_domain,
+                    previous_scene,
+                    next_scene,
                 )
             )
 
