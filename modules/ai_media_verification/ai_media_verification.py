@@ -191,16 +191,24 @@ def _score_candidate_with_ai(
     if not api_keys:
         raise GeminiUnavailableError("No Gemini API key configured for ai_media_verification.")
 
-    url = candidate.get("url", "")
-    if not url:
-        raise GeminiUnavailableError("Candidate has no URL to verify.")
+    # THE FIX: prefer "thumbnail_url" (always a real JPEG/PNG image, set by
+    # media_downloader for both video and image candidates) over "url",
+    # which for video candidates is the .mp4 file itself. Gemini's
+    # inline_data image parts cannot decode a video container, so passing
+    # "url" straight through for videos meant the vision call either had
+    # nothing valid to look at, or (before this fix) never actually looked
+    # at anything at all. Falls back to "url" only for older cached
+    # candidate shapes that predate the thumbnail_url field.
+    image_url = candidate.get("thumbnail_url") or candidate.get("url", "")
+    if not image_url:
+        raise GeminiUnavailableError("Candidate has no image/thumbnail URL to verify.")
 
     last_error: Optional[Exception] = None
     for api_key in api_keys:
         try:
             return generate_vision_verification(
                 narration_sentence=narration,
-                image_url=url,
+                image_url=image_url,
                 api_key=api_key,
                 required_objects=required_objects,
                 environment=environment,
