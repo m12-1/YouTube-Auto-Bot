@@ -1,412 +1,505 @@
 """
-config/pipeline_config.py
+modules/media_downloader/media_downloader.py
 
-Non-secret, module-agnostic configuration for the content generation
-engine introduced in Part 2. Secrets stay in `config/settings.py` —
-this file only holds structural/tunable values (durations, resolution,
-thresholds, cache locations) so nothing is hardcoded inside modules.
+Receives a media plan and downloads matching stock video/image
+candidates from Pexels and/or Pixabay, with on-disk caching, retries,
+and progress logging.
 
-Every value can be overridden via an environment variable, following
-the same pattern as `config/settings.py`.
+Public contract:
+    run(input_json) -> output_json
+
+input_json (required keys):
+    {
+        "run_id": str,
+        "topic": str,
+        "media_plan": [
+            {
+                "scene_id": str, "media_type": "video" | "image",
+                "duration_seconds": float, "priority": str,
+                "search_keywords": [str, ...], "alternative_keywords": [str, ...],
+                "camera_movement": str
+            },
+            ...
+        ]
+    }
+
+input_json (optional keys):
+    {
+        "candidates_per_scene": int   # defaults to 3
+    }
+
+output_json:
+    {
+        "status": "success" | "error",
+        "module": "media_downloader",
+        "data": {
+            "run_id": str,
+            "topic": str,
+            "downloads": [
+                {
+                    "scene_id": str,
+                    "provider": "pexels" | "pixabay" | "unavailable",
+                    "candidates": [
+                        {
+                            "candidate_id": str,
+                            "url": str,
+                            "local_path": str,
+                            "width": int,
+                            "height": int,
+                            "duration_seconds": float | null,
+                            "cached": bool
+                        },
+                        ...
+                    ]
+                },
+                ...
+            ]
+        },
+        "error": str | null
+    }
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+
+from config import pipeline_config, settings
+from shared.json_contract import ContractError, build_response, require_keys
+from shared.logger import get_logger
+from shared.retry import retry
+from shared.path_utils import safe_path, sanitize_filename, PROJECT_ROOT
+
+logger = get_logger(__name__)
+
+MODULE_NAME = "media_downloader"
+
+_PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
+_PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
+_PIXABAY_SEARCH_URL = "https://pixabay.com/api/"
+_PIXABAY_VIDEO_SEARCH_URL = "https://pixabay.com/api/videos/"
+
+DEFAULT_CANDIDATES_PER_SCENE = 3
 
 
-def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
+def _cache_path(provider: str, media_type: str, query: str, candidate_id: str) -> str:
     """
-    Read an environment variable.
+    Build a stable local cache path for a given candidate, so repeated
+    downloads of the same exact candidate reuse the cached file.
+
+    IMPORTANT: this is keyed by candidate_id (not just provider/media_type/
+    query). Earlier this only hashed provider+media_type+query, so every
+    distinct candidate returned for the same search query collapsed onto
+    the *same* cache file -- the first candidate's bytes got silently
+    reused (or overwritten) for every other candidate "downloaded" for
+    that query, even though each had its own id/url. That meant multiple
+    "different" candidates for a scene could all actually be the same
+    physical file on disk, defeating quality filtering/ranking picking
+    between genuinely different options.
 
     Args:
-        name: Environment variable name.
-        default: Value returned when the variable is not set.
+        provider: "pexels" or "pixabay".
+        media_type: "video" or "image".
+        query: The search keyword string.
+        candidate_id: The provider's unique id for this specific candidate.
 
     Returns:
-        The environment variable's value, or `default` if unset.
+        A local filesystem path under `config.pipeline_config.MEDIA_CACHE_DIR`.
     """
-    return os.environ.get(name, default)
+    digest = hashlib.sha256(
+        f"{provider}:{media_type}:{query}:{candidate_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    extension = "mp4" if media_type == "video" else "jpg"
+    safe_provider = sanitize_filename(provider)
+    target_path = safe_path(pipeline_config.MEDIA_CACHE_DIR, safe_provider, f"{digest}.{extension}")
+    return str(target_path)
 
 
-def _get_env_int(name: str, default: int) -> int:
-    """Read an environment variable as an int, falling back to `default`."""
-    raw = _get_env(name)
+@retry(
+    max_attempts=pipeline_config.MEDIA_DOWNLOAD_MAX_ATTEMPTS,
+    exceptions=(requests.RequestException,),
+)
+def _search_pexels(query: str, media_type: str, per_page: int) -> List[Dict[str, Any]]:
+    """
+    Search Pexels for candidate media matching a query.
+
+    Args:
+        query: Search keyword.
+        media_type: "video" or "image".
+        per_page: Number of results to request.
+
+    Returns:
+        A list of raw candidate dicts (provider-specific shape).
+
+    Raises:
+        requests.RequestException: On network failure (retried by decorator).
+    """
+    if not settings.PEXELS_API_KEY:
+        raise RuntimeError("PEXELS_API_KEY not configured.")
+
+    url = _PEXELS_VIDEO_SEARCH_URL if media_type == "video" else _PEXELS_SEARCH_URL
+    headers = {"Authorization": settings.PEXELS_API_KEY}
+    params = {"query": query, "per_page": per_page, "orientation": "portrait"}
+
+    response = requests.get(
+        url, headers=headers, params=params, timeout=pipeline_config.MEDIA_DOWNLOAD_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    body = response.json()
+    return body.get("videos", []) if media_type == "video" else body.get("photos", [])
+
+
+@retry(
+    max_attempts=pipeline_config.MEDIA_DOWNLOAD_MAX_ATTEMPTS,
+    exceptions=(requests.RequestException,),
+)
+def _search_pixabay(query: str, media_type: str, per_page: int) -> List[Dict[str, Any]]:
+    """
+    Search Pixabay for candidate media matching a query.
+
+    Args:
+        query: Search keyword.
+        media_type: "video" or "image".
+        per_page: Number of results to request.
+
+    Returns:
+        A list of raw candidate dicts (provider-specific shape).
+
+    Raises:
+        requests.RequestException: On network failure (retried by decorator).
+    """
+    if not settings.PIXABAY_API_KEY:
+        raise RuntimeError("PIXABAY_API_KEY not configured.")
+
+    url = _PIXABAY_VIDEO_SEARCH_URL if media_type == "video" else _PIXABAY_SEARCH_URL
+    params = {
+        "key": settings.PIXABAY_API_KEY,
+        "q": query,
+        "per_page": max(per_page, 3),
+        "orientation": "vertical",
+    }
+
+    response = requests.get(
+        url, params=params, timeout=pipeline_config.MEDIA_DOWNLOAD_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    body = response.json()
+    return body.get("hits", [])
+
+
+@retry(
+    max_attempts=pipeline_config.MEDIA_DOWNLOAD_MAX_ATTEMPTS,
+    exceptions=(requests.RequestException,),
+)
+def _download_file(url: str, local_path: str) -> None:
+    """
+    Download a remote file to a local path, creating parent directories
+    as needed.
+
+    Args:
+        url: Remote file URL.
+        local_path: Destination path on disk.
+
+    Raises:
+        requests.RequestException: On network failure (retried by decorator).
+    """
+    local_p = Path(local_path)
+    local_p.parent.mkdir(parents=True, exist_ok=True)
+    response = requests.get(url, stream=True, timeout=pipeline_config.MEDIA_DOWNLOAD_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    with open(local_path, "wb") as handle:
+        for chunk in response.iter_content(chunk_size=8192):
+            handle.write(chunk)
+
+
+def _normalize_pexels_candidate(raw: Dict[str, Any], media_type: str) -> Dict[str, Any]:
+    """Normalize a raw Pexels result into the module's candidate shape."""
+    if media_type == "video":
+        video_files = sorted(
+            raw.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True
+        )
+        best = video_files[0] if video_files else {}
+        return {
+            "candidate_id": str(raw.get("id")),
+            "url": best.get("link", ""),
+            "width": best.get("width", 0),
+            "height": best.get("height", 0),
+            "duration_seconds": raw.get("duration"),
+            "source_text": _raw_candidate_text(raw, "pexels"),
+        }
+    return {
+        "candidate_id": str(raw.get("id")),
+        "url": raw.get("src", {}).get("original", ""),
+        "width": raw.get("width", 0),
+        "height": raw.get("height", 0),
+        "duration_seconds": None,
+        "source_text": _raw_candidate_text(raw, "pexels"),
+    }
+
+
+def _normalize_pixabay_candidate(raw: Dict[str, Any], media_type: str) -> Dict[str, Any]:
+    """Normalize a raw Pixabay result into the module's candidate shape."""
+    if media_type == "video":
+        videos = raw.get("videos", {})
+        best = videos.get("large") or videos.get("medium") or {}
+        return {
+            "candidate_id": str(raw.get("id")),
+            "url": best.get("url", ""),
+            "width": best.get("width", 0),
+            "height": best.get("height", 0),
+            "duration_seconds": raw.get("duration"),
+            "source_text": _raw_candidate_text(raw, "pixabay"),
+        }
+    return {
+        "candidate_id": str(raw.get("id")),
+        "url": raw.get("largeImageURL", ""),
+        "width": raw.get("imageWidth", 0),
+        "height": raw.get("imageHeight", 0),
+        "duration_seconds": None,
+        "source_text": _raw_candidate_text(raw, "pixabay"),
+    }
+
+
+def _raw_candidate_text(raw: Dict[str, Any], provider: str) -> str:
+    """
+    Extract whatever free text a provider gives us about a raw result
+    (tags, alt text, url slug, uploader-written title) so it can be
+    checked against negative keywords before we ever download it.
+    """
+    if provider == "pixabay":
+        return f"{raw.get('tags', '')}".lower()
+    # Pexels doesn't expose tags; use alt text / photographer-provided
+    # description and the URL slug (Pexels URLs embed a short description).
+    return f"{raw.get('alt', '')} {raw.get('url', '')}".lower()
+
+
+def _matches_negative_keywords(text: str, negative_keywords: List[str]) -> Optional[str]:
+    """
+    Return the first negative keyword found in `text`, or None if the
+    text is clean. Cheap string containment is intentional: this is a
+    pre-Gemini filter meant to reject obviously-wrong results (e.g. a
+    "podcast"/"office" clip for a black-hole scene) before spending any
+    AI verification budget on them.
+    """
+    for negative in negative_keywords:
+        needle = negative.strip().lower()
+        if needle and needle in text:
+            return needle
+    return None
+
+
+def _fetch_candidates_for_scene(
+    keywords: List[str],
+    media_type: str,
+    candidates_per_scene: int,
+    negative_keywords: Optional[List[str]] = None,
+    providers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Try each configured provider, in priority order, for the given
+    keywords until candidates are found.
+
+    Args:
+        keywords: Ordered list of search keywords to try (primary first).
+        media_type: "video" or "image".
+        candidates_per_scene: How many candidates to request.
+        providers: Optional override of which providers to try, and in
+            what order. Used by the media engine's Fallback/re-search
+            loop (core.pipeline_controller) to force a single, specific
+            provider on a given retry attempt instead of always
+            restarting from `MEDIA_PROVIDER_PRIORITY[0]`. Defaults to
+            `pipeline_config.MEDIA_PROVIDER_PRIORITY` when omitted.
+
+    Returns:
+        A dict with "provider" and "raw_candidates" (may be empty).
+    """
+    negative_keywords = negative_keywords or []
+    provider_order = providers or pipeline_config.MEDIA_PROVIDER_PRIORITY
+
+    for provider in provider_order:
+        # Ask for more than needed since the negative-keyword filter
+        # below will drop some results before we get to candidates_per_scene.
+        fetch_count = max(candidates_per_scene * 3, candidates_per_scene)
+        for query in keywords:
+            try:
+                if provider == "pexels":
+                    raw = _search_pexels(query, media_type, fetch_count)
+                elif provider == "pixabay":
+                    raw = _search_pixabay(query, media_type, fetch_count)
+                else:
+                    continue
+
+                if not raw:
+                    continue
+
+                clean_raw = []
+                for item in raw:
+                    hit = _matches_negative_keywords(_raw_candidate_text(item, provider), negative_keywords)
+                    if hit:
+                        logger.info(
+                            "Media Search rejected candidate for query='%s' "
+                            "(matched negative keyword '%s')",
+                            query,
+                            hit,
+                        )
+                        continue
+                    clean_raw.append(item)
+
+                if clean_raw:
+                    return {"provider": provider, "raw_candidates": clean_raw, "query": query}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Media search failed for provider=%s query='%s': %s", provider, query, exc
+                )
+                continue
+
+    return {"provider": "unavailable", "raw_candidates": [], "query": keywords[0] if keywords else ""}
+
+
+def _download_scene_media(
+    scene_id: str,
+    media_type: str,
+    keywords: List[str],
+    candidates_per_scene: int,
+    negative_keywords: Optional[List[str]] = None,
+    providers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch, normalize, and download candidate media for a single scene.
+
+    Args:
+        scene_id: The storyboard scene identifier.
+        media_type: "video" or "image".
+        keywords: Search keywords (primary + alternatives) to try.
+        candidates_per_scene: How many candidates to request/return.
+        providers: Optional provider override (see `_fetch_candidates_for_scene`).
+
+    Returns:
+        A dict with "scene_id", "provider", and "candidates".
+    """
+    search_result = _fetch_candidates_for_scene(
+        keywords, media_type, candidates_per_scene, negative_keywords, providers
+    )
+    provider = search_result["provider"]
+    raw_candidates = search_result["raw_candidates"]
+    query = search_result["query"]
+
+    candidates: List[Dict[str, Any]] = []
+
+    for raw in raw_candidates[:candidates_per_scene]:
+        normalized = (
+            _normalize_pexels_candidate(raw, media_type)
+            if provider == "pexels"
+            else _normalize_pixabay_candidate(raw, media_type)
+        )
+
+        if not normalized["url"]:
+            continue
+
+        local_path = _cache_path(provider, media_type, query, normalized["candidate_id"])
+        cached = os.path.exists(local_path)
+
+        if not cached:
+            try:
+                logger.info(
+                    "Downloading %s candidate %s for scene=%s -> %s",
+                    media_type,
+                    normalized["candidate_id"],
+                    scene_id,
+                    local_path,
+                )
+                _download_file(normalized["url"], local_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to download candidate %s for scene=%s: %s",
+                    normalized["candidate_id"],
+                    scene_id,
+                    exc,
+                )
+                continue
+
+        normalized["local_path"] = local_path
+        normalized["cached"] = cached
+        candidates.append(normalized)
+
+    return {"scene_id": scene_id, "provider": provider, "candidates": candidates}
+
+
+def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Download candidate media for every scene in a media plan.
+
+    Args:
+        input_json: Must contain "run_id", "topic", and a non-empty
+            "media_plan" list. May contain "candidates_per_scene".
+
+    Returns:
+        A standardized JSON response envelope (see module docstring).
+    """
     try:
-        return int(raw) if raw is not None else default
-    except ValueError:
-        return default
+        require_keys(input_json, ["run_id", "topic", "media_plan"])
 
+        run_id = input_json["run_id"]
+        topic = input_json["topic"]
+        media_plan = input_json["media_plan"]
+        candidates_per_scene = int(
+            input_json.get("candidates_per_scene", DEFAULT_CANDIDATES_PER_SCENE)
+        )
 
-def _get_env_float(name: str, default: float) -> float:
-    """Read an environment variable as a float, falling back to `default`."""
-    raw = _get_env(name)
-    try:
-        return float(raw) if raw is not None else default
-    except ValueError:
-        return default
+        if not isinstance(media_plan, list) or not media_plan:
+            raise ContractError("media_plan must be a non-empty list")
 
+        downloads: List[Dict[str, Any]] = []
+        for scene_plan in media_plan:
+            keywords = list(scene_plan.get("search_keywords", [])) + list(
+                scene_plan.get("alternative_keywords", [])
+            )
+            keywords = keywords or [topic]
 
-def _get_env_list(name: str, default: List[str]) -> List[str]:
-    """Read a comma-separated environment variable as a list of strings."""
-    raw = _get_env(name)
-    if not raw:
-        return default
-    return [item.strip() for item in raw.split(",") if item.strip()]
+            # "_forced_provider" is set per-scene by the media engine's
+            # Fallback/re-search loop (core.pipeline_controller) on retry
+            # attempts, so each attempt tries a *specific* provider instead
+            # of always restarting from MEDIA_PROVIDER_PRIORITY[0]. Absent
+            # on a normal (first-attempt) call, so default behavior is
+            # unchanged.
+            forced_provider = scene_plan.get("_forced_provider")
+            providers = [forced_provider] if forced_provider else None
 
+            result = _download_scene_media(
+                scene_id=scene_plan["scene_id"],
+                media_type=scene_plan.get("media_type", "image"),
+                keywords=keywords,
+                candidates_per_scene=candidates_per_scene,
+                negative_keywords=scene_plan.get("negative_keywords", []),
+                providers=providers,
+            )
+            downloads.append(result)
 
-# ---------------------------------------------------------------------------
-# Script Generator / Script Reviewer
-# ---------------------------------------------------------------------------
-SCRIPT_MAX_SCENES: int = _get_env_int("SCRIPT_MAX_SCENES", 8)
-SCRIPT_TARGET_WORD_COUNT: int = _get_env_int("SCRIPT_TARGET_WORD_COUNT", 150)
-SCRIPT_MIN_QUALITY_SCORE: float = _get_env_float("SCRIPT_MIN_QUALITY_SCORE", 0.7)
+        total_candidates = sum(len(d["candidates"]) for d in downloads)
+        logger.info(
+            "Media downloaded for run_id=%s topic='%s' -> %d scenes, %d total candidates",
+            run_id,
+            topic,
+            len(downloads),
+            total_candidates,
+        )
 
-# ---------------------------------------------------------------------------
-# SEO Generator
-# ---------------------------------------------------------------------------
-SEO_MAX_TAGS: int = _get_env_int("SEO_MAX_TAGS", 15)
-SEO_MAX_HASHTAGS: int = _get_env_int("SEO_MAX_HASHTAGS", 5)
-SEO_TITLE_MAX_LENGTH: int = _get_env_int("SEO_TITLE_MAX_LENGTH", 100)
+        data = {
+            "run_id": run_id,
+            "topic": topic,
+            "downloads": downloads,
+        }
 
-# ---------------------------------------------------------------------------
-# Storyboard / Media Planner
-# ---------------------------------------------------------------------------
-STORYBOARD_DEFAULT_SCENE_SECONDS: float = _get_env_float(
-    "STORYBOARD_DEFAULT_SCENE_SECONDS", 3.0
-)
-MEDIA_ALTERNATIVE_KEYWORD_COUNT: int = _get_env_int(
-    "MEDIA_ALTERNATIVE_KEYWORD_COUNT", 3
-)
-CAMERA_MOVEMENTS: List[str] = _get_env_list(
-    "CAMERA_MOVEMENTS", ["zoom_in", "zoom_out", "pan_left", "pan_right", "static"]
-)
+        return build_response(module=MODULE_NAME, status="success", data=data)
 
-# ---------------------------------------------------------------------------
-# Media Downloader
-# ---------------------------------------------------------------------------
-MEDIA_CACHE_DIR: str = _get_env("MEDIA_CACHE_DIR", "./cache/media") or "./cache/media"
-MEDIA_DOWNLOAD_MAX_ATTEMPTS: int = _get_env_int("MEDIA_DOWNLOAD_MAX_ATTEMPTS", 3)
-MEDIA_DOWNLOAD_TIMEOUT_SECONDS: float = _get_env_float(
-    "MEDIA_DOWNLOAD_TIMEOUT_SECONDS", 15.0
-)
-MEDIA_PROVIDER_PRIORITY: List[str] = _get_env_list(
-    "MEDIA_PROVIDER_PRIORITY", ["pexels", "pixabay"]
-)
+    except ContractError as exc:
+        logger.error("Media Downloader contract violation: %s", exc)
+        return build_response(module=MODULE_NAME, status="error", error=str(exc))
 
-# ---------------------------------------------------------------------------
-# Media Quality Filter
-# ---------------------------------------------------------------------------
-MEDIA_MIN_WIDTH: int = _get_env_int("MEDIA_MIN_WIDTH", 1080)
-MEDIA_MIN_HEIGHT: int = _get_env_int("MEDIA_MIN_HEIGHT", 1920)
-MEDIA_REQUIRED_ORIENTATION: str = _get_env("MEDIA_REQUIRED_ORIENTATION", "portrait") or "portrait"
-MEDIA_MIN_DURATION_SECONDS: float = _get_env_float("MEDIA_MIN_DURATION_SECONDS", 2.0)
-MEDIA_BLUR_THRESHOLD: float = _get_env_float("MEDIA_BLUR_THRESHOLD", 100.0)
-MEDIA_BRIGHTNESS_MIN: float = _get_env_float("MEDIA_BRIGHTNESS_MIN", 25.0)
-
-# ---------------------------------------------------------------------------
-# Media Ranker (Semantic Ranking -- Stage 5)
-# ---------------------------------------------------------------------------
-# How many raw candidates media_downloader should fetch per scene per
-# search attempt before quality filtering / ranking narrows them down.
-MEDIA_MAX_CANDIDATES: int = _get_env_int("MEDIA_MAX_CANDIDATES", 15)
-
-# How many of the top-ranked candidates get forwarded to Gemini Vision.
-# Gemini must never see the full candidate pool -- only this slice.
-MEDIA_MAX_VERIFIED_CANDIDATES: int = _get_env_int("MEDIA_MAX_VERIFIED_CANDIDATES", 5)
-
-# Minimum final_rank_score a candidate needs to even be considered for
-# AI verification. Candidates below this are set aside as low-rank.
-#
-# Deliberately low (0.20). Ranking's job is coarse pre-filtering --
-# picking the best MEDIA_MAX_VERIFIED_CANDIDATES to hand to Gemini,
-# not making the final semantic judgment call. Its sub-scores are
-# blind word-overlap against whatever text a stock provider happened
-# to tag a clip with; for abstract or conceptual scenes (quantum
-# physics, historical concepts, psychology) that text frequently
-# shares almost no literal vocabulary with Scene Analyzer's required
-# objects/domain/camera terms even when the clip is visually a great
-# match -- Gemini Vision actually looks at the media and is the real
-# semantic check, gated separately by MEDIA_MIN_VERIFICATION_SCORE.
-# Setting this threshold high starves Gemini of candidates it might
-# have approved; keep it just high enough to drop clear zero-signal
-# noise, and let MEDIA_MAX_VERIFIED_CANDIDATES cap the field size.
-MEDIA_MIN_RANK_SCORE: float = _get_env_float("MEDIA_MIN_RANK_SCORE", 0.20)
-
-# Fallback value used for a ranking sub-score when the signal it would
-# compare against is missing/empty (e.g. no camera_movement configured),
-# so an absent signal never silently drags a candidate's score to zero.
-MEDIA_RANK_NEUTRAL_BASELINE: float = _get_env_float("MEDIA_RANK_NEUTRAL_BASELINE", 0.5)
-
-# Relative weights combined into final_rank_score. They do not need to
-# sum to 1.0 -- media_ranker normalizes by their total automatically,
-# so any weight can be tuned independently.
-MEDIA_RANK_WEIGHT_SEMANTIC_SIMILARITY: float = _get_env_float(
-    "MEDIA_RANK_WEIGHT_SEMANTIC_SIMILARITY", 0.20
-)
-MEDIA_RANK_WEIGHT_SCIENTIFIC_DOMAIN: float = _get_env_float(
-    "MEDIA_RANK_WEIGHT_SCIENTIFIC_DOMAIN", 0.10
-)
-MEDIA_RANK_WEIGHT_REQUIRED_OBJECTS: float = _get_env_float(
-    "MEDIA_RANK_WEIGHT_REQUIRED_OBJECTS", 0.15
-)
-MEDIA_RANK_WEIGHT_REQUIRED_ACTIONS: float = _get_env_float(
-    "MEDIA_RANK_WEIGHT_REQUIRED_ACTIONS", 0.10
-)
-MEDIA_RANK_WEIGHT_ENVIRONMENT: float = _get_env_float("MEDIA_RANK_WEIGHT_ENVIRONMENT", 0.10)
-MEDIA_RANK_WEIGHT_CAMERA_STYLE: float = _get_env_float("MEDIA_RANK_WEIGHT_CAMERA_STYLE", 0.05)
-MEDIA_RANK_WEIGHT_VISUAL_THEME: float = _get_env_float("MEDIA_RANK_WEIGHT_VISUAL_THEME", 0.08)
-MEDIA_RANK_WEIGHT_RESOLUTION: float = _get_env_float("MEDIA_RANK_WEIGHT_RESOLUTION", 0.08)
-MEDIA_RANK_WEIGHT_ORIENTATION: float = _get_env_float("MEDIA_RANK_WEIGHT_ORIENTATION", 0.06)
-MEDIA_RANK_WEIGHT_DURATION: float = _get_env_float("MEDIA_RANK_WEIGHT_DURATION", 0.08)
-MEDIA_RANK_WEIGHT_GENERIC_STOCK_PENALTY: float = _get_env_float(
-    "MEDIA_RANK_WEIGHT_GENERIC_STOCK_PENALTY", 0.10
-)
-# Soft preference for a candidate whose own tags/URL text match the
-# video's locked visual style (see "Visual Style Consistency" section
-# below). This is a soft signal only -- the actual hard block on
-# mismatched styles happens earlier, via the opposing style's terms
-# being merged into the scene's forbidden/negative-keyword lists, so a
-# clearly wrong-style candidate is rejected long before it reaches this
-# weighted score.
-MEDIA_RANK_WEIGHT_STYLE_MATCH: float = _get_env_float("MEDIA_RANK_WEIGHT_STYLE_MATCH", 0.08)
-# Soft preference for candidates whose tags suggest professional/
-# well-shot footage (see MEDIA_CINEMATIC_TERMS). Deliberately low weight
-# -- this is a crude proxy from text tags; the real judgment happens in
-# Gemini Vision's own "cinematic_quality" check downstream.
-MEDIA_RANK_WEIGHT_CINEMATIC_QUALITY: float = _get_env_float(
-    "MEDIA_RANK_WEIGHT_CINEMATIC_QUALITY", 0.04
-)
-
-# Generic (non-topic-specific) indicator phrases that flag a candidate
-# as subject-less stock filler rather than a real match for the scene.
-MEDIA_GENERIC_STOCK_TERMS: List[str] = _get_env_list(
-    "MEDIA_GENERIC_STOCK_TERMS",
-    [
-        "stock footage",
-        "stock video",
-        "template",
-        "abstract background",
-        "placeholder",
-        "sample clip",
-        "loop background",
-        "generic background",
-    ],
-)
-
-# Positive indicator phrases suggesting well-shot, professional footage
-# rather than cheap/amateur filler. Used as a soft "cinematic quality"
-# ranking signal -- purely a proxy from provider tags/URL text, since
-# the real judgment call is made by Gemini Vision (see
-# shared.gemini_client.generate_vision_verification's "cinematic_quality"
-# check).
-MEDIA_CINEMATIC_TERMS: List[str] = _get_env_list(
-    "MEDIA_CINEMATIC_TERMS",
-    [
-        "cinematic",
-        "professional",
-        "4k",
-        "drone",
-        "aerial",
-        "slow motion",
-        "high quality",
-        "epic",
-        "dramatic lighting",
-    ],
-)
-
-# ---------------------------------------------------------------------------
-# Visual Style Consistency (Stage: Style Lock)
-# ---------------------------------------------------------------------------
-# Canonical visual-style categories every scene is classified into. This
-# is the fixed vocabulary that storyboard_generator's free-text
-# "visual_style"/"scene_type" AI output gets canonicalized into, so the
-# whole pipeline can reason about "does this candidate's style match the
-# video's locked style" with a closed set instead of open-ended text.
-MEDIA_STYLE_CATEGORIES: List[str] = _get_env_list(
-    "MEDIA_STYLE_CATEGORIES",
-    ["Real Footage", "CGI", "3D Render", "2D Illustration", "Vector", "Cartoon"],
-)
-
-# Indicator phrases used to (a) canonicalize free-text AI style output
-# into one of MEDIA_STYLE_CATEGORIES above, and (b) recognize a
-# candidate's own style from its provider tags/URL text. Kept as plain
-# data (not code) so new styles/synonyms can be tuned without touching
-# any module's logic.
-MEDIA_STYLE_TERMS: dict = {
-    "Real Footage": [
-        "real footage", "live action", "documentary", "real world", "photo",
-        "photograph", "camera footage", "handheld", "drone footage", "real life",
-    ],
-    "CGI": ["cgi", "computer generated", "vfx", "digital effects", "motion graphics"],
-    "3D Render": ["3d render", "3d animation", "3d model", "render", "blender", "octane"],
-    "2D Illustration": ["2d illustration", "illustration", "flat design", "digital art", "drawing"],
-    "Vector": ["vector", "vector art", "flat icon", "infographic", "clipart"],
-    "Cartoon": ["cartoon", "animated character", "anime", "toon", "caricature"],
-}
-
-# Default style assumed when neither the AI Topic Analyzer nor Scene
-# Analyzer produced a recognizable style -- the large majority of stock
-# nature/science/history footage used by this pipeline is real-world
-# photography/video, so this is the safest silent default.
-MEDIA_STYLE_DEFAULT: str = _get_env("MEDIA_STYLE_DEFAULT", "Real Footage") or "Real Footage"
-
-# ---------------------------------------------------------------------------
-# Domain Templates
-# ---------------------------------------------------------------------------
-# A small library of reusable per-domain guardrails, automatically
-# matched against each video's AI-derived `scientific_domain` /
-# `visual_theme` (see storyboard_generator._match_domain_template) and
-# merged (union, never overwrite) into that video's topic_context. This
-# is a supplement to the AI's own per-video judgment, not a replacement:
-# if a topic doesn't match any template, the pipeline behaves exactly as
-# before (pure AI-derived context, no template applied).
-DOMAIN_TEMPLATES: dict = {
-    "Space": {
-        "allowed_objects": ["stars", "planets", "galaxy", "nebula", "astronaut", "rocket", "black hole", "satellite"],
-        "forbidden_objects": ["office", "podcast", "kitchen", "beach", "coral reef", "city street", "election", "crowd"],
-        "allowed_styles": ["Real Footage", "CGI", "3D Render"],
-        "forbidden_styles": ["Vector", "Cartoon", "2D Illustration"],
-        "allowed_environment": ["outer space", "observatory", "night sky"],
-        "forbidden_environment": ["office", "underwater", "city street"],
-    },
-    "Ocean": {
-        "allowed_objects": ["ocean", "deep sea", "marine life", "coral", "submarine", "waves", "fish", "whale"],
-        "forbidden_objects": ["office", "podcast", "galaxy", "outer space", "city street", "election", "crowd"],
-        "allowed_styles": ["Real Footage", "3D Render"],
-        "forbidden_styles": ["Vector", "Cartoon", "2D Illustration"],
-        "allowed_environment": ["underwater", "deep ocean", "beach", "ocean surface"],
-        "forbidden_environment": ["outer space", "office", "city street"],
-    },
-    "Medicine": {
-        "allowed_objects": ["doctor", "hospital", "laboratory", "microscope", "cells", "organ", "medical equipment"],
-        "forbidden_objects": ["office meeting", "podcast", "outer space", "beach party", "election", "concert"],
-        "allowed_styles": ["Real Footage", "3D Render", "CGI"],
-        "forbidden_styles": ["Vector", "Cartoon"],
-        "allowed_environment": ["hospital", "laboratory", "clinic"],
-        "forbidden_environment": ["outer space", "underwater", "concert"],
-    },
-    "Psychology": {
-        "allowed_objects": ["brain", "person thinking", "therapy session", "human face", "silhouette"],
-        "forbidden_objects": ["outer space", "coral reef", "election rally", "sports stadium", "podcast studio"],
-        "allowed_styles": ["Real Footage", "3D Render", "CGI"],
-        "forbidden_styles": ["Vector", "Cartoon"],
-        "allowed_environment": ["therapy room", "everyday life", "urban life"],
-        "forbidden_environment": ["outer space", "underwater"],
-    },
-    "History": {
-        "allowed_objects": ["historical figures", "old buildings", "artifacts", "battlefield", "archive footage"],
-        "forbidden_objects": ["modern smartphone", "outer space", "coral reef", "modern office", "podcast studio"],
-        "allowed_styles": ["Real Footage", "2D Illustration"],
-        "forbidden_styles": ["Vector", "Cartoon"],
-        "allowed_environment": ["historical setting", "museum", "archive"],
-        "forbidden_environment": ["modern office", "outer space"],
-    },
-    "Technology": {
-        "allowed_objects": ["computer", "circuit board", "robot", "data center", "smartphone", "code"],
-        "forbidden_objects": ["outer space", "coral reef", "election rally", "farm", "forest"],
-        "allowed_styles": ["Real Footage", "CGI", "3D Render", "2D Illustration"],
-        "forbidden_styles": ["Cartoon"],
-        "allowed_environment": ["office", "data center", "lab", "workshop"],
-        "forbidden_environment": ["outer space", "underwater", "beach"],
-    },
-    "Animals": {
-        "allowed_objects": ["wildlife", "animal", "habitat", "forest", "savanna", "predator", "prey"],
-        "forbidden_objects": ["office", "podcast", "outer space", "election rally", "concert"],
-        "allowed_styles": ["Real Footage"],
-        "forbidden_styles": ["Vector", "Cartoon", "2D Illustration", "CGI", "3D Render"],
-        "allowed_environment": ["forest", "savanna", "jungle", "ocean", "desert"],
-        "forbidden_environment": ["office", "outer space", "concert"],
-    },
-    "Finance": {
-        "allowed_objects": ["stock market", "money", "charts", "office", "trading floor", "bank"],
-        "forbidden_objects": ["outer space", "coral reef", "jungle", "concert", "farm animals"],
-        "allowed_styles": ["Real Footage", "2D Illustration", "Vector"],
-        "forbidden_styles": ["Cartoon"],
-        "allowed_environment": ["office", "trading floor", "bank", "city skyline"],
-        "forbidden_environment": ["outer space", "underwater", "forest"],
-    },
-}
-
-# ---------------------------------------------------------------------------
-# Media Engine -- Fallback / Re-search Loop (Stage 8)
-# ---------------------------------------------------------------------------
-# How many times the media engine regenerates search queries and
-# retries PER PROVIDER before moving on to the next provider in
-# MEDIA_PROVIDER_PRIORITY. If every provider is exhausted without a
-# candidate clearing MEDIA_MIN_VERIFICATION_SCORE, the scene is left
-# without media rather than accepting a weak match.
-MEDIA_MAX_SEARCH_ATTEMPTS: int = _get_env_int("MEDIA_MAX_SEARCH_ATTEMPTS", 3)
-
-# ---------------------------------------------------------------------------
-# AI Media Verification
-# ---------------------------------------------------------------------------
-# Minimum overall_score (see shared.gemini_client.generate_vision_verification)
-# a candidate must reach to be used. Anything below this is treated as "no
-# usable media for this scene" rather than settling for a weak match.
-MEDIA_MIN_VERIFICATION_SCORE: float = _get_env_float("MEDIA_MIN_VERIFICATION_SCORE", 0.80)
-
-# ---------------------------------------------------------------------------
-# AI Media Verification
-# ---------------------------------------------------------------------------
-AI_MEDIA_VERIFICATION_MODEL: str = (
-    _get_env("AI_MEDIA_VERIFICATION_MODEL", "gemini-vision") or "gemini-vision"
-)
-AI_MEDIA_VERIFICATION_MIN_SCORE: float = _get_env_float(
-    "AI_MEDIA_VERIFICATION_MIN_SCORE", 0.5
-)
-
-# ---------------------------------------------------------------------------
-# Voice Generator (Edge-TTS)
-# ---------------------------------------------------------------------------
-VOICE_AUDIO_OUTPUT_DIR: str = _get_env("VOICE_AUDIO_OUTPUT_DIR", "./output/audio") or "./output/audio"
-VOICE_CANDIDATES: List[str] = _get_env_list(
-    "VOICE_CANDIDATES",
-    ["en-US-GuyNeural", "en-US-JennyNeural", "en-GB-RyanNeural", "en-GB-SoniaNeural"],
-)
-VOICE_SPEED_RANGE: List[str] = _get_env_list("VOICE_SPEED_RANGE", ["-10%", "+0%", "+10%"])
-VOICE_PITCH_RANGE: List[str] = _get_env_list("VOICE_PITCH_RANGE", ["-2Hz", "+0Hz", "+2Hz"])
-VOICE_NATURAL_PAUSE_MS: int = _get_env_int("VOICE_NATURAL_PAUSE_MS", 250)
-
-# ---------------------------------------------------------------------------
-# Subtitle Generator
-# ---------------------------------------------------------------------------
-SUBTITLE_MAX_WORDS_PER_LINE: int = _get_env_int("SUBTITLE_MAX_WORDS_PER_LINE", 4)
-SUBTITLE_HIGHLIGHT_COLOR: str = _get_env("SUBTITLE_HIGHLIGHT_COLOR", "#FFD700") or "#FFD700"
-
-# ---------------------------------------------------------------------------
-# Video Composer / Renderer
-# ---------------------------------------------------------------------------
-VIDEO_WIDTH: int = _get_env_int("VIDEO_WIDTH", 1080)
-VIDEO_HEIGHT: int = _get_env_int("VIDEO_HEIGHT", 1920)
-VIDEO_FPS: int = _get_env_int("VIDEO_FPS", 30)
-VIDEO_OUTPUT_DIR: str = _get_env("VIDEO_OUTPUT_DIR", "./output/video") or "./output/video"
-VIDEO_TRANSITIONS: List[str] = _get_env_list(
-    "VIDEO_TRANSITIONS", ["fade", "slide", "zoom_blur", "whip_pan"]
-)
-VIDEO_KEN_BURNS_ENABLED: bool = (_get_env("VIDEO_KEN_BURNS_ENABLED", "true") or "true").lower() == "true"
-
-# ---------------------------------------------------------------------------
-# Quality Inspector
-# ---------------------------------------------------------------------------
-QUALITY_MAX_DURATION_DRIFT_SECONDS: float = _get_env_float(
-    "QUALITY_MAX_DURATION_DRIFT_SECONDS", 0.5
-)
-QUALITY_AUDIO_CLIP_THRESHOLD_DB: float = _get_env_float(
-    "QUALITY_AUDIO_CLIP_THRESHOLD_DB", -0.1
-)
-
-# ---------------------------------------------------------------------------
-# Infrastructure and System Configuration
-# ---------------------------------------------------------------------------
-DB_BACKEND: str = _get_env("DB_BACKEND", "json") or "json"
-ANALYTICS_COLLECTION_INTERVAL_HOURS: int = _get_env_int("ANALYTICS_COLLECTION_INTERVAL_HOURS", 24)
-CLEANUP_INTERVAL_HOURS: int = _get_env_int("CLEANUP_INTERVAL_HOURS", 168)
-REPORT_OUTPUT_DIR: str = _get_env("REPORT_OUTPUT_DIR", "./output/reports") or "./output/reports"
-KNOWLEDGE_DB_DIR: str = _get_env("KNOWLEDGE_DB_DIR", "./db/knowledge") or "./db/knowledge"
-SIMILARITY_THRESHOLD: float = _get_env_float("SIMILARITY_THRESHOLD", 0.8)
-MONTHLY_UPLOAD_TARGET: int = _get_env_int("MONTHLY_UPLOAD_TARGET", 30)
-SCHEDULER_TIMEZONE: str = _get_env("SCHEDULER_TIMEZONE", "UTC") or "UTC"
-API_HOST: str = _get_env("API_HOST", "0.0.0.0") or "0.0.0.0"
-API_PORT: int = _get_env_int("API_PORT", 8000)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Media Downloader failed unexpectedly.")
+        return build_response(module=MODULE_NAME, status="error", error=str(exc))
