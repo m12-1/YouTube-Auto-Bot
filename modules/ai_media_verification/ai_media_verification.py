@@ -162,12 +162,15 @@ def _score_candidate_with_ai(
     scientific_domain: str,
     previous_scene: str,
     next_scene: str,
+    required_visual_style: str = "",
+    forbidden_styles: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Score a single candidate using multi-signal Gemini vision scoring:
     semantic fit, scientific-domain lock, visual continuity with the
-    previous/next scene, and a generic-stock-footage check — not just
-    one generic relevance question.
+    previous/next scene, visual-style consistency, cinematic quality,
+    and a generic-stock-footage check — not just one generic relevance
+    question.
 
     Raises:
         GeminiUnavailableError: If no key is configured or the call fails.
@@ -191,6 +194,8 @@ def _score_candidate_with_ai(
         scientific_domain=scientific_domain,
         previous_scene=previous_scene,
         next_scene=next_scene,
+        required_visual_style=required_visual_style,
+        forbidden_styles=forbidden_styles,
     )
 
 
@@ -204,6 +209,8 @@ def _score_candidate(
     scientific_domain: str,
     previous_scene: str,
     next_scene: str,
+    required_visual_style: str = "",
+    forbidden_styles: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """
     Score a candidate: reject instantly (no AI call) if a forbidden
@@ -232,6 +239,8 @@ def _score_candidate(
             scientific_domain,
             previous_scene,
             next_scene,
+            required_visual_style,
+            forbidden_styles,
         )
         return result, "ai"
     except GeminiUnavailableError as exc:
@@ -255,6 +264,8 @@ def _verify_scene(
     scientific_domain: str,
     previous_scene: str,
     next_scene: str,
+    required_visual_style: str = "",
+    forbidden_styles: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Score all accepted candidates for one scene and pick the best one
@@ -274,6 +285,8 @@ def _verify_scene(
         scientific_domain: The video's Global Topic Understanding domain.
         previous_scene: Previous scene's narration (Visual Consistency Engine).
         next_scene: Next scene's narration (Visual Consistency Engine).
+        required_visual_style: This scene's locked canonical visual style.
+        forbidden_styles: Style names that must NOT appear for this video.
 
     Returns:
         A verification result dict for this scene.
@@ -300,6 +313,8 @@ def _verify_scene(
             scientific_domain,
             previous_scene,
             next_scene,
+            required_visual_style,
+            forbidden_styles,
         )
         scored.append((candidate, score_result, source))
 
@@ -378,6 +393,7 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
 
         topic_context = input_json.get("topic_context", {}) or {}
         scientific_domain = topic_context.get("scientific_domain", "")
+        forbidden_styles = topic_context.get("forbidden_styles") or []
 
         ranked = input_json.get("ranked")
         if isinstance(ranked, list) and ranked:
@@ -413,6 +429,8 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
                     scientific_domain,
                     previous_scene,
                     next_scene,
+                    scene.get("visual_style", "") or topic_context.get("visual_style_locked", ""),
+                    forbidden_styles,
                 )
             )
 
