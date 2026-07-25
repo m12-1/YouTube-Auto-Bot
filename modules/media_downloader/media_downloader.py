@@ -176,12 +176,32 @@ def _search_pixabay(query: str, media_type: str, per_page: int) -> List[Dict[str
         raise RuntimeError("PIXABAY_API_KEY not configured.")
 
     url = _PIXABAY_VIDEO_SEARCH_URL if media_type == "video" else _PIXABAY_SEARCH_URL
-    params = {
-        "key": settings.PIXABAY_API_KEY,
-        "q": query,
-        "per_page": max(per_page, 3),
-        "orientation": "vertical",
-    }
+
+    # IMPORTANT: Pixabay's Video API has no "orientation" parameter -- that
+    # option only exists on their Image API. Sending it here does nothing;
+    # Pixabay silently ignores it and returns videos in whatever aspect
+    # ratio matched the query (usually landscape), which then get rejected
+    # almost entirely by media_quality_filter's portrait check downstream.
+    # This was previously the main reason Pixabay attempts returned far
+    # fewer usable candidates than Pexels (which DOES support orientation
+    # on its video endpoint). Since Pixabay can't filter server-side for
+    # video, request a much larger pool so the few portrait videos that do
+    # exist for a query are more likely to be among the results, and let
+    # media_quality_filter's orientation check do the real filtering.
+    if media_type == "video":
+        params = {
+            "key": settings.PIXABAY_API_KEY,
+            "q": query,
+            "per_page": max(per_page * 4, 50),
+        }
+    else:
+        # Image API DOES support orientation -- keep using it there.
+        params = {
+            "key": settings.PIXABAY_API_KEY,
+            "q": query,
+            "per_page": max(per_page, 3),
+            "orientation": "vertical",
+        }
 
     response = requests.get(
         url, params=params, timeout=pipeline_config.MEDIA_DOWNLOAD_TIMEOUT_SECONDS
