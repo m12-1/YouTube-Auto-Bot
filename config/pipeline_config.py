@@ -108,6 +108,14 @@ MEDIA_BRIGHTNESS_MIN: float = _get_env_float("MEDIA_BRIGHTNESS_MIN", 25.0)
 # ---------------------------------------------------------------------------
 # AI Media Verification
 # ---------------------------------------------------------------------------
+# Minimum overall_score (see shared.gemini_client.generate_vision_verification)
+# a candidate must reach to be used. Anything below this is treated as "no
+# usable media for this scene" rather than settling for a weak match.
+MEDIA_MIN_VERIFICATION_SCORE: float = _get_env_float("MEDIA_MIN_VERIFICATION_SCORE", 0.80)
+
+# ---------------------------------------------------------------------------
+# AI Media Verification
+# ---------------------------------------------------------------------------
 AI_MEDIA_VERIFICATION_MODEL: str = (
     _get_env("AI_MEDIA_VERIFICATION_MODEL", "gemini-vision") or "gemini-vision"
 )
