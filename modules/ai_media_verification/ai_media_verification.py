@@ -79,7 +79,6 @@ from config import pipeline_config, settings
 from shared.gemini_client import (
     GeminiUnavailableError,
     generate_vision_verification,
-    pick_api_key,
 )
 from shared.json_contract import ContractError, build_response, require_keys
 from shared.logger import get_logger
@@ -175,28 +174,57 @@ def _score_candidate_with_ai(
     Raises:
         GeminiUnavailableError: If no key is configured or the call fails.
     """
-    api_key = pick_api_key(settings.GEMINI_KEY_IMAGE, settings.GEMINI_KEY_ADVANCED)
-    if not api_key:
+    # Try every configured Gemini key in order (not just one): if a key's
+    # whole model chain is exhausted (e.g. rate-limited), move on to the
+    # next *key* before giving up and falling back to the heuristic.
+    api_keys = [
+        key
+        for key in (
+            settings.GEMINI_KEY_IMAGE,
+            settings.GEMINI_KEY_ADVANCED,
+            settings.GEMINI_KEY_FILTER,
+            settings.GEMINI_KEY_FILTER_2,
+            settings.GEMINI_KEY_LIGHT,
+        )
+        if key
+    ]
+    if not api_keys:
         raise GeminiUnavailableError("No Gemini API key configured for ai_media_verification.")
 
     url = candidate.get("url", "")
     if not url:
         raise GeminiUnavailableError("Candidate has no URL to verify.")
 
-    return generate_vision_verification(
-        narration_sentence=narration,
-        image_url=url,
-        api_key=api_key,
-        required_objects=required_objects,
-        environment=environment,
-        forbidden_objects=forbidden_objects,
-        topic=topic,
-        scientific_domain=scientific_domain,
-        previous_scene=previous_scene,
-        next_scene=next_scene,
-        required_visual_style=required_visual_style,
-        forbidden_styles=forbidden_styles,
-    )
+    last_error: Optional[Exception] = None
+    for api_key in api_keys:
+        try:
+            return generate_vision_verification(
+                narration_sentence=narration,
+                image_url=url,
+                api_key=api_key,
+                required_objects=required_objects,
+                environment=environment,
+                forbidden_objects=forbidden_objects,
+                topic=topic,
+                scientific_domain=scientific_domain,
+                previous_scene=previous_scene,
+                next_scene=next_scene,
+                required_visual_style=required_visual_style,
+                forbidden_styles=forbidden_styles,
+            )
+        except GeminiUnavailableError as exc:
+            last_error = exc
+            logger.warning(
+                "Gemini key ending '...%s' exhausted for ai_media_verification, "
+                "trying next configured key: %s",
+                api_key[-4:] if len(api_key) >= 4 else "****",
+                exc,
+            )
+            continue
+
+    raise GeminiUnavailableError(
+        f"All configured Gemini keys exhausted for ai_media_verification: {last_error}"
+    ) from last_error
 
 
 def _score_candidate(
@@ -331,7 +359,11 @@ def _verify_scene(
         for candidate, score_result, _ in scored[1:]
     ]
 
-    threshold = pipeline_config.MEDIA_MIN_VERIFICATION_SCORE
+    threshold = (
+        pipeline_config.MEDIA_MIN_VERIFICATION_SCORE_HEURISTIC
+        if best_source == "heuristic_fallback"
+        else pipeline_config.MEDIA_MIN_VERIFICATION_SCORE
+    )
     if best_score < threshold:
         # Fallback stage: nothing cleared the bar, so this scene gets no
         # media rather than settling for a weak match. video_composer /
