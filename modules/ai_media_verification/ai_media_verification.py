@@ -29,6 +29,24 @@ input_json (required keys):
         ]
     }
 
+input_json (optional key, takes priority over "filtered" when present):
+    {
+        "ranked": [
+            {
+                "scene_id": str,
+                "ranked_candidates": [ {"candidate_id": str, "url": str, "rank_score": float, ...}, ... ]
+            },
+            ...
+        ]
+    }
+
+    "ranked" is media_ranker's output (Stage 5 -- Semantic Ranking): each
+    scene's candidates already sorted by final_rank_score and capped to
+    MEDIA_MAX_VERIFIED_CANDIDATES, so Gemini Vision only ever scores the
+    top slice instead of every quality-filtered candidate. "filtered" is
+    kept as a fallback so callers that skip ranking (and existing tests)
+    still work unchanged.
+
 output_json:
     {
         "status": "success" | "error",
@@ -361,7 +379,20 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         topic_context = input_json.get("topic_context", {}) or {}
         scientific_domain = topic_context.get("scientific_domain", "")
 
-        filtered_by_scene = {entry["scene_id"]: entry for entry in filtered}
+        ranked = input_json.get("ranked")
+        if isinstance(ranked, list) and ranked:
+            # Semantic Ranking already ran: use its top-slice, pre-sorted
+            # candidates instead of the full quality-filtered list so
+            # Gemini Vision only ever scores the best candidates per scene.
+            filtered_by_scene = {
+                entry["scene_id"]: {
+                    "scene_id": entry["scene_id"],
+                    "accepted_candidates": entry.get("ranked_candidates", []),
+                }
+                for entry in ranked
+            }
+        else:
+            filtered_by_scene = {entry["scene_id"]: entry for entry in filtered}
 
         verifications: List[Dict[str, Any]] = []
         for index, scene in enumerate(storyboard):
