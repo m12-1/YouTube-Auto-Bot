@@ -148,7 +148,20 @@ def _build_media_plan(
 
         primary = scene.get("keywords_primary") or scene.get("keywords", []) or [topic.lower()]
         secondary = scene.get("keywords_secondary") or []
-        negative = scene.get("keywords_negative") or []
+        forbidden_objects = scene.get("forbidden") or []
+        # Merge Scene Analyzer's "forbidden" objects into negative_keywords so
+        # media_downloader (search-time filter) and ai_media_verification
+        # (post-download filter) reject the exact same things. Without this,
+        # a candidate can pass the (shorter) search-time filter and still be
+        # the scene's only candidate, then get killed later by the (longer)
+        # forbidden list at verification time -- leaving the scene with zero
+        # usable media even though better candidates were available.
+        negative_keywords = list(
+            dict.fromkeys(
+                [k.lower() for k in (scene.get("keywords_negative") or [])]
+                + [k.lower() for k in forbidden_objects]
+            )
+        )
 
         # search_keywords stays the ordered list Media Search actually queries
         # with (primary first, then secondary as fallback tiers).
@@ -164,11 +177,11 @@ def _build_media_plan(
                 "alternative_keywords": _build_alternative_keywords(search_keywords, topic),
                 "primary_keywords": primary,
                 "secondary_keywords": secondary,
-                "negative_keywords": negative,
+                "negative_keywords": negative_keywords,
                 "scene_type": scene.get("scene_type", ""),
                 "environment": scene.get("environment", ""),
                 "required_objects": scene.get("objects", []),
-                "forbidden_objects": scene.get("forbidden", []),
+                "forbidden_objects": forbidden_objects,
                 "camera_movement": _pick_camera_movement(index),
             }
         )
