@@ -26,10 +26,9 @@ from shared.retry import retry
 logger = get_logger(__name__)
 
 _MODEL_FALLBACK_CHAIN: List[str] = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
 ]
 _DEFAULT_TEXT_MODEL = _MODEL_FALLBACK_CHAIN[0]
 _DEFAULT_VISION_MODEL = _MODEL_FALLBACK_CHAIN[0]
