@@ -41,6 +41,7 @@ output_json:
                     "priority": "high" | "medium" | "low",
                     "search_keywords": [str, ...],
                     "alternative_keywords": [str, ...],
+                    "visual_style": str,
                     "camera_movement": str
                 },
                 ...
@@ -179,6 +180,7 @@ def _build_media_plan(
                 "secondary_keywords": secondary,
                 "negative_keywords": negative_keywords,
                 "scene_type": scene.get("scene_type", ""),
+                "visual_style": scene.get("visual_style", ""),
                 "environment": scene.get("environment", ""),
                 "required_objects": scene.get("objects", []),
                 "forbidden_objects": forbidden_objects,
