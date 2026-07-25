@@ -401,6 +401,18 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         current_payload, failed_stage = _run_media_engine(current_payload, stage_outputs)
 
     if failed_stage is None:
+        # Defensive safety net: video_renderer requires "seo" (produced by
+        # seo_generator, several stages earlier in _STAGE_SEQUENCE_PRE_MEDIA).
+        # It should already be present in current_payload via the normal
+        # stage-output merging, but re-assert it here from stage_outputs
+        # directly so a missing/overwritten "seo" key can never surface as a
+        # late, confusing "Missing required keys" failure at the very last
+        # rendering stage instead of at seo_generator itself.
+        if current_payload.get("seo") is None:
+            seo_data = stage_outputs.get("seo_generator", {}).get("data", {}).get("seo")
+            if seo_data is not None:
+                current_payload["seo"] = seo_data
+
         current_payload, failed_stage = _run_stage_sequence(
             _STAGE_SEQUENCE_POST_MEDIA, current_payload, stage_outputs
         )
