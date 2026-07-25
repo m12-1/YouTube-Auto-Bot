@@ -86,20 +86,33 @@ _PIXABAY_VIDEO_SEARCH_URL = "https://pixabay.com/api/videos/"
 DEFAULT_CANDIDATES_PER_SCENE = 3
 
 
-def _cache_path(provider: str, media_type: str, query: str) -> str:
+def _cache_path(provider: str, media_type: str, query: str, candidate_id: str) -> str:
     """
-    Build a stable local cache path for a given query, so repeated
-    searches for the same keyword reuse previously downloaded media.
+    Build a stable local cache path for a given candidate, so repeated
+    downloads of the same exact candidate reuse the cached file.
+
+    IMPORTANT: this is keyed by candidate_id (not just provider/media_type/
+    query). Earlier this only hashed provider+media_type+query, so every
+    distinct candidate returned for the same search query collapsed onto
+    the *same* cache file -- the first candidate's bytes got silently
+    reused (or overwritten) for every other candidate "downloaded" for
+    that query, even though each had its own id/url. That meant multiple
+    "different" candidates for a scene could all actually be the same
+    physical file on disk, defeating quality filtering/ranking picking
+    between genuinely different options.
 
     Args:
         provider: "pexels" or "pixabay".
         media_type: "video" or "image".
         query: The search keyword string.
+        candidate_id: The provider's unique id for this specific candidate.
 
     Returns:
         A local filesystem path under `config.pipeline_config.MEDIA_CACHE_DIR`.
     """
-    digest = hashlib.sha256(f"{provider}:{media_type}:{query}".encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(
+        f"{provider}:{media_type}:{query}:{candidate_id}".encode("utf-8")
+    ).hexdigest()[:16]
     extension = "mp4" if media_type == "video" else "jpg"
     safe_provider = sanitize_filename(provider)
     target_path = safe_path(pipeline_config.MEDIA_CACHE_DIR, safe_provider, f"{digest}.{extension}")
@@ -387,7 +400,7 @@ def _download_scene_media(
         if not normalized["url"]:
             continue
 
-        local_path = _cache_path(provider, media_type, query)
+        local_path = _cache_path(provider, media_type, query, normalized["candidate_id"])
         cached = os.path.exists(local_path)
 
         if not cached:
