@@ -119,18 +119,20 @@ MEDIA_MAX_VERIFIED_CANDIDATES: int = _get_env_int("MEDIA_MAX_VERIFIED_CANDIDATES
 # Minimum final_rank_score a candidate needs to even be considered for
 # AI verification. Candidates below this are set aside as low-rank.
 #
-# 0.35, not higher: real provider tag/alt-text data rarely echoes the
-# exact required_objects / scientific_domain / camera_movement wording
-# Scene Analyzer produced (a stock clip tagged "iceberg, arctic, ai
-# generated" is a perfectly good underwater match with zero literal
-# overlap with "ocean surface, sunlight rays"). Those components then
-# legitimately score 0 rather than getting a neutral baseline, since
-# the reference list itself isn't empty -- so a strong, correct
-# candidate typically lands around 0.40-0.55, not 0.60+. Observed
-# production runs with the higher default rejected every candidate on
-# every attempt/provider regardless of topic, which is a calibration
-# problem, not a signal that the candidates were wrong.
-MEDIA_MIN_RANK_SCORE: float = _get_env_float("MEDIA_MIN_RANK_SCORE", 0.35)
+# Deliberately low (0.20). Ranking's job is coarse pre-filtering --
+# picking the best MEDIA_MAX_VERIFIED_CANDIDATES to hand to Gemini,
+# not making the final semantic judgment call. Its sub-scores are
+# blind word-overlap against whatever text a stock provider happened
+# to tag a clip with; for abstract or conceptual scenes (quantum
+# physics, historical concepts, psychology) that text frequently
+# shares almost no literal vocabulary with Scene Analyzer's required
+# objects/domain/camera terms even when the clip is visually a great
+# match -- Gemini Vision actually looks at the media and is the real
+# semantic check, gated separately by MEDIA_MIN_VERIFICATION_SCORE.
+# Setting this threshold high starves Gemini of candidates it might
+# have approved; keep it just high enough to drop clear zero-signal
+# noise, and let MEDIA_MAX_VERIFIED_CANDIDATES cap the field size.
+MEDIA_MIN_RANK_SCORE: float = _get_env_float("MEDIA_MIN_RANK_SCORE", 0.20)
 
 # Fallback value used for a ranking sub-score when the signal it would
 # compare against is missing/empty (e.g. no camera_movement configured),
