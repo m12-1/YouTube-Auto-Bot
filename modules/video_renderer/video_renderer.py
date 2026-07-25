@@ -80,6 +80,7 @@ except ImportError:  # pragma: no cover - Pillow always present as a dependency
 try:
     from moviepy.editor import (
         AudioFileClip,
+        ColorClip,
         CompositeVideoClip,
         ImageClip,
         TextClip,
@@ -191,16 +192,22 @@ def _scene_clip(scene: Dict[str, Any], width: int, height: int):
         height: Target frame height.
 
     Returns:
-        A MoviePy clip sized/positioned for the vertical frame.
-
-    Raises:
-        RenderError: If the scene has no resolvable media file.
+        A MoviePy clip sized/positioned for the vertical frame. Scenes
+        with no resolvable media file get a plain black placeholder
+        clip of the correct duration instead of aborting the whole
+        render -- one scene with no usable stock media shouldn't sink
+        an otherwise-complete video (audio/subtitles stay in sync).
     """
     media_path = scene.get("media_path")
     duration = max(scene["end"] - scene["start"], 0.1)
 
     if not media_path or not os.path.isfile(media_path):
-        raise RenderError(f"Scene {scene['scene_id']} has no local media file to render.")
+        logger.warning(
+            "Scene %s has no local media file; using a placeholder clip instead of "
+            "aborting the render.",
+            scene.get("scene_id"),
+        )
+        return ColorClip(size=(width, height), color=(0, 0, 0)).set_duration(duration)
 
     is_video = media_path.lower().endswith((".mp4", ".mov", ".webm"))
 
@@ -386,7 +393,16 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         rendered = False
         source = "manifest_only"
 
-        can_attempt_render = _MOVIEPY_AVAILABLE and not render_plan.get("missing_media_scene_ids")
+        can_attempt_render = _MOVIEPY_AVAILABLE
+
+        if render_plan.get("missing_media_scene_ids"):
+            logger.warning(
+                "video_renderer: run_id=%s has scenes with missing media (%s); "
+                "rendering with placeholder clip(s) for those scenes instead of "
+                "aborting the whole render.",
+                run_id,
+                render_plan.get("missing_media_scene_ids"),
+            )
 
         if can_attempt_render:
             try:
@@ -401,13 +417,7 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 _write_manifest_only(render_plan, seo, output_paths)
         else:
-            if not _MOVIEPY_AVAILABLE:
-                logger.warning("video_renderer: MoviePy is not installed; writing manifest only.")
-            else:
-                logger.warning(
-                    "video_renderer: run_id=%s has scenes with missing media; writing manifest only.",
-                    run_id,
-                )
+            logger.warning("video_renderer: MoviePy is not installed; writing manifest only.")
             _write_manifest_only(render_plan, seo, output_paths)
 
         _write_sidecar_files(run_id, topic, render_plan, seo, output_paths)
