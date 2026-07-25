@@ -163,7 +163,14 @@ def _generate_with_ai(
     if cleaned.lower().startswith("json"):
         cleaned = cleaned[4:].strip()
 
-    parsed = json.loads(cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise GeminiUnavailableError(f"AI script response was not valid JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise GeminiUnavailableError("AI script response was not a JSON object.")
+
     for key in ("hook", "question", "narration", "cta", "scene_breakdown"):
         if key not in parsed:
             raise GeminiUnavailableError(f"AI script response missing key '{key}'.")
