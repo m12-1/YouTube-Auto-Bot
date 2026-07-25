@@ -163,6 +163,21 @@ MEDIA_RANK_WEIGHT_DURATION: float = _get_env_float("MEDIA_RANK_WEIGHT_DURATION",
 MEDIA_RANK_WEIGHT_GENERIC_STOCK_PENALTY: float = _get_env_float(
     "MEDIA_RANK_WEIGHT_GENERIC_STOCK_PENALTY", 0.10
 )
+# Soft preference for a candidate whose own tags/URL text match the
+# video's locked visual style (see "Visual Style Consistency" section
+# below). This is a soft signal only -- the actual hard block on
+# mismatched styles happens earlier, via the opposing style's terms
+# being merged into the scene's forbidden/negative-keyword lists, so a
+# clearly wrong-style candidate is rejected long before it reaches this
+# weighted score.
+MEDIA_RANK_WEIGHT_STYLE_MATCH: float = _get_env_float("MEDIA_RANK_WEIGHT_STYLE_MATCH", 0.08)
+# Soft preference for candidates whose tags suggest professional/
+# well-shot footage (see MEDIA_CINEMATIC_TERMS). Deliberately low weight
+# -- this is a crude proxy from text tags; the real judgment happens in
+# Gemini Vision's own "cinematic_quality" check downstream.
+MEDIA_RANK_WEIGHT_CINEMATIC_QUALITY: float = _get_env_float(
+    "MEDIA_RANK_WEIGHT_CINEMATIC_QUALITY", 0.04
+)
 
 # Generic (non-topic-specific) indicator phrases that flag a candidate
 # as subject-less stock filler rather than a real match for the scene.
@@ -179,6 +194,140 @@ MEDIA_GENERIC_STOCK_TERMS: List[str] = _get_env_list(
         "generic background",
     ],
 )
+
+# Positive indicator phrases suggesting well-shot, professional footage
+# rather than cheap/amateur filler. Used as a soft "cinematic quality"
+# ranking signal -- purely a proxy from provider tags/URL text, since
+# the real judgment call is made by Gemini Vision (see
+# shared.gemini_client.generate_vision_verification's "cinematic_quality"
+# check).
+MEDIA_CINEMATIC_TERMS: List[str] = _get_env_list(
+    "MEDIA_CINEMATIC_TERMS",
+    [
+        "cinematic",
+        "professional",
+        "4k",
+        "drone",
+        "aerial",
+        "slow motion",
+        "high quality",
+        "epic",
+        "dramatic lighting",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Visual Style Consistency (Stage: Style Lock)
+# ---------------------------------------------------------------------------
+# Canonical visual-style categories every scene is classified into. This
+# is the fixed vocabulary that storyboard_generator's free-text
+# "visual_style"/"scene_type" AI output gets canonicalized into, so the
+# whole pipeline can reason about "does this candidate's style match the
+# video's locked style" with a closed set instead of open-ended text.
+MEDIA_STYLE_CATEGORIES: List[str] = _get_env_list(
+    "MEDIA_STYLE_CATEGORIES",
+    ["Real Footage", "CGI", "3D Render", "2D Illustration", "Vector", "Cartoon"],
+)
+
+# Indicator phrases used to (a) canonicalize free-text AI style output
+# into one of MEDIA_STYLE_CATEGORIES above, and (b) recognize a
+# candidate's own style from its provider tags/URL text. Kept as plain
+# data (not code) so new styles/synonyms can be tuned without touching
+# any module's logic.
+MEDIA_STYLE_TERMS: dict = {
+    "Real Footage": [
+        "real footage", "live action", "documentary", "real world", "photo",
+        "photograph", "camera footage", "handheld", "drone footage", "real life",
+    ],
+    "CGI": ["cgi", "computer generated", "vfx", "digital effects", "motion graphics"],
+    "3D Render": ["3d render", "3d animation", "3d model", "render", "blender", "octane"],
+    "2D Illustration": ["2d illustration", "illustration", "flat design", "digital art", "drawing"],
+    "Vector": ["vector", "vector art", "flat icon", "infographic", "clipart"],
+    "Cartoon": ["cartoon", "animated character", "anime", "toon", "caricature"],
+}
+
+# Default style assumed when neither the AI Topic Analyzer nor Scene
+# Analyzer produced a recognizable style -- the large majority of stock
+# nature/science/history footage used by this pipeline is real-world
+# photography/video, so this is the safest silent default.
+MEDIA_STYLE_DEFAULT: str = _get_env("MEDIA_STYLE_DEFAULT", "Real Footage") or "Real Footage"
+
+# ---------------------------------------------------------------------------
+# Domain Templates
+# ---------------------------------------------------------------------------
+# A small library of reusable per-domain guardrails, automatically
+# matched against each video's AI-derived `scientific_domain` /
+# `visual_theme` (see storyboard_generator._match_domain_template) and
+# merged (union, never overwrite) into that video's topic_context. This
+# is a supplement to the AI's own per-video judgment, not a replacement:
+# if a topic doesn't match any template, the pipeline behaves exactly as
+# before (pure AI-derived context, no template applied).
+DOMAIN_TEMPLATES: dict = {
+    "Space": {
+        "allowed_objects": ["stars", "planets", "galaxy", "nebula", "astronaut", "rocket", "black hole", "satellite"],
+        "forbidden_objects": ["office", "podcast", "kitchen", "beach", "coral reef", "city street", "election", "crowd"],
+        "allowed_styles": ["Real Footage", "CGI", "3D Render"],
+        "forbidden_styles": ["Vector", "Cartoon", "2D Illustration"],
+        "allowed_environment": ["outer space", "observatory", "night sky"],
+        "forbidden_environment": ["office", "underwater", "city street"],
+    },
+    "Ocean": {
+        "allowed_objects": ["ocean", "deep sea", "marine life", "coral", "submarine", "waves", "fish", "whale"],
+        "forbidden_objects": ["office", "podcast", "galaxy", "outer space", "city street", "election", "crowd"],
+        "allowed_styles": ["Real Footage", "3D Render"],
+        "forbidden_styles": ["Vector", "Cartoon", "2D Illustration"],
+        "allowed_environment": ["underwater", "deep ocean", "beach", "ocean surface"],
+        "forbidden_environment": ["outer space", "office", "city street"],
+    },
+    "Medicine": {
+        "allowed_objects": ["doctor", "hospital", "laboratory", "microscope", "cells", "organ", "medical equipment"],
+        "forbidden_objects": ["office meeting", "podcast", "outer space", "beach party", "election", "concert"],
+        "allowed_styles": ["Real Footage", "3D Render", "CGI"],
+        "forbidden_styles": ["Vector", "Cartoon"],
+        "allowed_environment": ["hospital", "laboratory", "clinic"],
+        "forbidden_environment": ["outer space", "underwater", "concert"],
+    },
+    "Psychology": {
+        "allowed_objects": ["brain", "person thinking", "therapy session", "human face", "silhouette"],
+        "forbidden_objects": ["outer space", "coral reef", "election rally", "sports stadium", "podcast studio"],
+        "allowed_styles": ["Real Footage", "3D Render", "CGI"],
+        "forbidden_styles": ["Vector", "Cartoon"],
+        "allowed_environment": ["therapy room", "everyday life", "urban life"],
+        "forbidden_environment": ["outer space", "underwater"],
+    },
+    "History": {
+        "allowed_objects": ["historical figures", "old buildings", "artifacts", "battlefield", "archive footage"],
+        "forbidden_objects": ["modern smartphone", "outer space", "coral reef", "modern office", "podcast studio"],
+        "allowed_styles": ["Real Footage", "2D Illustration"],
+        "forbidden_styles": ["Vector", "Cartoon"],
+        "allowed_environment": ["historical setting", "museum", "archive"],
+        "forbidden_environment": ["modern office", "outer space"],
+    },
+    "Technology": {
+        "allowed_objects": ["computer", "circuit board", "robot", "data center", "smartphone", "code"],
+        "forbidden_objects": ["outer space", "coral reef", "election rally", "farm", "forest"],
+        "allowed_styles": ["Real Footage", "CGI", "3D Render", "2D Illustration"],
+        "forbidden_styles": ["Cartoon"],
+        "allowed_environment": ["office", "data center", "lab", "workshop"],
+        "forbidden_environment": ["outer space", "underwater", "beach"],
+    },
+    "Animals": {
+        "allowed_objects": ["wildlife", "animal", "habitat", "forest", "savanna", "predator", "prey"],
+        "forbidden_objects": ["office", "podcast", "outer space", "election rally", "concert"],
+        "allowed_styles": ["Real Footage"],
+        "forbidden_styles": ["Vector", "Cartoon", "2D Illustration", "CGI", "3D Render"],
+        "allowed_environment": ["forest", "savanna", "jungle", "ocean", "desert"],
+        "forbidden_environment": ["office", "outer space", "concert"],
+    },
+    "Finance": {
+        "allowed_objects": ["stock market", "money", "charts", "office", "trading floor", "bank"],
+        "forbidden_objects": ["outer space", "coral reef", "jungle", "concert", "farm animals"],
+        "allowed_styles": ["Real Footage", "2D Illustration", "Vector"],
+        "forbidden_styles": ["Cartoon"],
+        "allowed_environment": ["office", "trading floor", "bank", "city skyline"],
+        "forbidden_environment": ["outer space", "underwater", "forest"],
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Media Engine -- Fallback / Re-search Loop (Stage 8)
