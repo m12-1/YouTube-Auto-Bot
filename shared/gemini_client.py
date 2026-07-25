@@ -16,7 +16,9 @@ deterministic heuristic — the same pattern already used by
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import base64
+import mimetypes
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -25,6 +27,9 @@ from shared.retry import retry
 
 logger = get_logger(__name__)
 
+# NOTE: These are the SAME three models already used by every text call in
+# this file -- fixing the "fake vision" bug below does not add, remove, or
+# swap any Gemini model. It only changes WHAT gets sent to them.
 _MODEL_FALLBACK_CHAIN: List[str] = [
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
@@ -33,6 +38,12 @@ _MODEL_FALLBACK_CHAIN: List[str] = [
 _DEFAULT_TEXT_MODEL = _MODEL_FALLBACK_CHAIN[0]
 _DEFAULT_VISION_MODEL = _MODEL_FALLBACK_CHAIN[0]
 _API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Gemini's inline_data payload is base64 text embedded in the JSON request
+# body, so a hard cap protects both our own request size and the API's
+# limits. 15 MB is comfortably above any stock-photo/video-thumbnail JPEG.
+_MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024
+_DEFAULT_IMAGE_FETCH_TIMEOUT_SECONDS = 15.0
 
 
 class GeminiUnavailableError(RuntimeError):
@@ -157,6 +168,159 @@ def generate_text(
     ) from last_error
 
 
+@retry(max_attempts=2, exceptions=(requests.RequestException,))
+def _fetch_image_bytes(
+    image_url: str, timeout_seconds: float = _DEFAULT_IMAGE_FETCH_TIMEOUT_SECONDS
+) -> Tuple[bytes, str]:
+    """
+    Download a candidate's image/thumbnail so it can actually be sent to
+    Gemini as visual input.
+
+    THIS IS THE CORE FIX: previously, "vision" verification never
+    downloaded anything -- it just typed the URL as text into a prompt and
+    asked a plain text model to judge it. Gemini's text models cannot fetch
+    arbitrary remote URLs themselves, so every "visual" judgment
+    (main_subject_present, domain_match, style_match, continuity_ok, ...)
+    was pure guesswork based on the URL string, not the actual footage.
+    This function fetches the real bytes so they can be attached as
+    `inline_data` in the request.
+
+    Args:
+        image_url: A direct, publicly reachable URL to a JPEG/PNG image
+            (for video candidates, this must be a thumbnail/frame image,
+            never the .mp4 itself -- Gemini's inline_data image parts
+            cannot decode video containers).
+        timeout_seconds: HTTP request timeout, in seconds.
+
+    Returns:
+        (raw_bytes, mime_type)
+
+    Raises:
+        GeminiUnavailableError: On any network failure, non-2xx response,
+            oversized payload, or a content-type that isn't an image.
+    """
+    if not image_url:
+        raise GeminiUnavailableError("No image URL provided to fetch for vision verification.")
+
+    try:
+        response = requests.get(image_url, timeout=timeout_seconds, stream=True)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise GeminiUnavailableError(f"Failed to download image for vision check: {exc}") from exc
+
+    content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if content_type and not content_type.startswith("image/"):
+        raise GeminiUnavailableError(
+            f"URL did not return an image (Content-Type='{content_type}'); "
+            "cannot use this candidate for real vision verification."
+        )
+
+    data = response.content
+    if not data:
+        raise GeminiUnavailableError("Downloaded image was empty.")
+    if len(data) > _MAX_INLINE_IMAGE_BYTES:
+        raise GeminiUnavailableError(
+            f"Image too large for inline vision verification ({len(data)} bytes)."
+        )
+
+    mime_type = content_type or mimetypes.guess_type(image_url)[0] or "image/jpeg"
+    return data, mime_type
+
+
+def _generate_multimodal_single_model(
+    prompt: str,
+    image_bytes: bytes,
+    mime_type: str,
+    api_key: str,
+    model: str,
+    temperature: float,
+    timeout_seconds: float,
+) -> str:
+    """
+    Call one specific Gemini model with BOTH the image bytes (as
+    inline_data) and the text prompt in the same request -- this is what
+    an actual vision call looks like, as opposed to `_generate_text_single_model`
+    which only ever sends text.
+    """
+    url = f"{_API_BASE_URL}/{model}:generateContent?key={api_key}"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": encoded}},
+                    {"text": prompt},
+                ]
+            }
+        ],
+        "generationConfig": {"temperature": temperature},
+    }
+
+    try:
+        body = _post(url, payload, timeout_seconds)
+        candidates = body.get("candidates", [])
+        if not candidates:
+            raise GeminiUnavailableError(f"Gemini model '{model}' returned no candidates.")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(part.get("text", "") for part in parts)
+        if not text:
+            raise GeminiUnavailableError(f"Gemini model '{model}' returned an empty response.")
+        return text
+    except GeminiUnavailableError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise GeminiUnavailableError(str(exc)) from exc
+
+
+def generate_multimodal(
+    prompt: str,
+    image_bytes: bytes,
+    mime_type: str,
+    api_key: Optional[str],
+    model: Optional[str | List[str]] = None,
+    temperature: float = 0.3,
+    timeout_seconds: float = 20.0,
+) -> str:
+    """
+    Generate text from a Gemini model given BOTH an image and a text
+    prompt, trying the same fallback chain of models used everywhere else
+    in this file (no new/different models introduced).
+
+    Raises:
+        GeminiUnavailableError: If `api_key` is missing, or every model in
+            the chain fails.
+    """
+    if not api_key:
+        raise GeminiUnavailableError("No Gemini API key configured for this call.")
+
+    if model is None:
+        models_to_try = _MODEL_FALLBACK_CHAIN
+    elif isinstance(model, str):
+        models_to_try = [model]
+    else:
+        models_to_try = list(model)
+
+    last_error: Optional[Exception] = None
+    for candidate_model in models_to_try:
+        try:
+            return _generate_multimodal_single_model(
+                prompt, image_bytes, mime_type, api_key, candidate_model, temperature, timeout_seconds
+            )
+        except GeminiUnavailableError as exc:
+            last_error = exc
+            logger.warning(
+                "Gemini model '%s' unavailable for multimodal call, trying next model in chain: %s",
+                candidate_model,
+                exc,
+            )
+            continue
+
+    logger.warning("Gemini multimodal generation failed for all models tried: %s", last_error)
+    raise GeminiUnavailableError(
+        f"All Gemini models exhausted for this key (multimodal): {last_error}"
+    ) from last_error
+
+
 def generate_vision_score(
     narration_sentence: str,
     image_url: str,
@@ -186,15 +350,22 @@ def generate_vision_score(
     if not api_key:
         raise GeminiUnavailableError("No Gemini API key configured for this call.")
 
+    # THE FIX: actually download the candidate's image and attach it as
+    # inline_data, instead of typing the URL into a text-only prompt (which
+    # a text model cannot fetch/see, so this used to always be a guess).
+    image_bytes, mime_type = _fetch_image_bytes(image_url, timeout_seconds=timeout_seconds)
+
     prompt = (
-        "You are scoring how well a stock video/image matches a narration "
-        "sentence for a short-form vertical video. Respond ONLY with JSON: "
+        "You are scoring how well the ATTACHED stock video/image matches a "
+        "narration sentence for a short-form vertical video, based on what "
+        "you actually see in the attached image. Respond ONLY with JSON: "
         '{"score": <0.0-1.0>, "reason": "<short reason>"}.\n'
-        f"Narration sentence: {narration_sentence}\n"
-        f"Media URL: {image_url}"
+        f"Narration sentence: {narration_sentence}"
     )
 
-    text = generate_text(prompt, api_key=api_key, model=model, timeout_seconds=timeout_seconds)
+    text = generate_multimodal(
+        prompt, image_bytes, mime_type, api_key=api_key, model=model, timeout_seconds=timeout_seconds
+    )
 
     import json
 
@@ -266,6 +437,19 @@ def generate_vision_verification(
     if not api_key:
         raise GeminiUnavailableError("No Gemini API key configured for this call.")
 
+    # THE ROOT-CAUSE FIX: this used to hand Gemini the media URL as a plain
+    # text string and call the TEXT-only endpoint (`generate_text`). Gemini
+    # cannot fetch arbitrary remote URLs on its own, so every "visual"
+    # verdict below (main_subject_present, domain_match, style_match,
+    # continuity_ok, looks_generic_stock, cinematic_quality...) was being
+    # answered from the URL's slug/keywords and prompt context alone --
+    # never from the actual footage. That is exactly why narration/subtitle
+    # sync (a deterministic, non-AI stage) scored well while visual match
+    # (entirely dependent on this "fake vision" call) scored poorly and
+    # inconsistently. We now download the real image/thumbnail bytes and
+    # attach them as inline_data so the model actually sees the frame.
+    image_bytes, mime_type = _fetch_image_bytes(image_url, timeout_seconds=timeout_seconds)
+
     required_str = ", ".join(required_objects) if required_objects else "(not specified)"
     environment_str = environment or "(not specified)"
     forbidden_str = ", ".join(forbidden_objects) if forbidden_objects else "(none specified)"
@@ -278,8 +462,9 @@ def generate_vision_verification(
 
     prompt = (
         "You are a strict media-relevance QA reviewer for a short-form vertical "
-        "video. Evaluate the candidate video/image below, considering the WHOLE "
-        "video's context, not just this one sentence in isolation.\n\n"
+        "video. Evaluate the ATTACHED candidate video/image, based on what you "
+        "actually see in it, considering the WHOLE video's context, not just "
+        "this one sentence in isolation.\n\n"
         f"Video topic: {topic_str}\n"
         f"Scientific/subject domain of the whole video: {domain_str}\n"
         f"Required visual style for the WHOLE video (must not be mixed with other "
@@ -290,8 +475,7 @@ def generate_vision_verification(
         f"Next scene's narration: {next_str}\n"
         f"Expected environment/setting: {environment_str}\n"
         f"Expected objects/subjects: {required_str}\n"
-        f"Forbidden objects/subjects (must NOT be visible): {forbidden_str}\n"
-        f"Media URL: {image_url}\n\n"
+        f"Forbidden objects/subjects (must NOT be visible): {forbidden_str}\n\n"
         "Answer these questions (true/false):\n"
         "1. main_subject_present - is the expected main subject/object visible?\n"
         "2. environment_correct - is the setting/environment correct?\n"
@@ -326,7 +510,9 @@ def generate_vision_verification(
         '"reason": "<one short sentence>"}'
     )
 
-    text = generate_text(prompt, api_key=api_key, model=model, timeout_seconds=timeout_seconds)
+    text = generate_multimodal(
+        prompt, image_bytes, mime_type, api_key=api_key, model=model, timeout_seconds=timeout_seconds
+    )
 
     import json
 
