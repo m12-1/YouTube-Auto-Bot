@@ -222,6 +222,8 @@ def generate_vision_verification(
     scientific_domain: Optional[str] = None,
     previous_scene: Optional[str] = None,
     next_scene: Optional[str] = None,
+    required_visual_style: Optional[str] = None,
+    forbidden_styles: Optional[List[str]] = None,
     model: Optional[str | List[str]] = None,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
@@ -229,19 +231,32 @@ def generate_vision_verification(
     Multi-signal verification of a candidate media item — not just "is
     this vaguely related", but whether it matches the sentence, stays
     inside the video's scientific domain, keeps visual continuity with
-    the surrounding scenes, and doesn't look like random generic stock
-    footage. This is what lets a black-hole video that scored 8.5/10
-    become the consistency bar for every other topic, instead of score
-    varying 3.5-8.5 depending on how literally a word got matched.
+    the surrounding scenes, doesn't mix visual styles (e.g. a cartoon or
+    vector clip inside a Real Footage video), doesn't look like random
+    generic stock footage, and is professionally shot. This is what lets
+    a black-hole video that scored 8.5/10 become the consistency bar for
+    every other topic, instead of score varying 3.5-8.5 depending on how
+    literally a word got matched.
+
+    Args:
+        required_visual_style: The video's locked canonical visual style
+            (one of `pipeline_config.MEDIA_STYLE_CATEGORIES`, e.g.
+            "Real Footage"), if known. Optional and backward compatible:
+            omitted, the style_match check is skipped (defaults to true)
+            exactly like the old behavior.
+        forbidden_styles: Style names that must NOT appear (from a
+            matched Domain Template), if any.
 
     Returns:
         {
-            "overall_score": float (0.0-1.0),   # weighted combination, gated by contradictions/domain
+            "overall_score": float (0.0-1.0),   # weighted combination, gated by contradictions/domain/style
             "score": float,                     # alias of overall_score, for older callers
             "semantic_score": float,            # the 6-question relevance sub-score
             "domain_score": float,              # 1.0 if it stayed in scientific_domain, else 0.0
             "continuity_score": float,          # 1.0 if visually consistent with prev/next scene
             "generic_score": float,             # 1.0 if NOT generic/unrelated stock, else 0.0
+            "style_score": float,               # 1.0 if it matches the video's locked visual style, else 0.0
+            "cinematic_score": float,           # 1.0 if it looks professionally shot, else 0.0
             "reason": str,
             "checks": {...}
         }
@@ -259,6 +274,8 @@ def generate_vision_verification(
     topic_str = topic or "(not specified)"
     previous_str = previous_scene or "(this is the first scene)"
     next_str = next_scene or "(this is the last scene)"
+    style_str = required_visual_style or "(not specified -- do not penalize style)"
+    forbidden_styles_str = ", ".join(forbidden_styles) if forbidden_styles else "(none specified)"
 
     prompt = (
         "You are a strict media-relevance QA reviewer for a short-form vertical "
@@ -266,6 +283,9 @@ def generate_vision_verification(
         "video's context, not just this one sentence in isolation.\n\n"
         f"Video topic: {topic_str}\n"
         f"Scientific/subject domain of the whole video: {domain_str}\n"
+        f"Required visual style for the WHOLE video (must not be mixed with other "
+        f"styles unless the script explicitly calls for it): {style_str}\n"
+        f"Forbidden visual styles for this video: {forbidden_styles_str}\n"
         f"Previous scene's narration: {previous_str}\n"
         f"THIS scene's narration: {narration_sentence}\n"
         f"Next scene's narration: {next_str}\n"
@@ -291,12 +311,20 @@ def generate_vision_verification(
         "jarring, unexplained jump, e.g. deep-ocean footage suddenly cutting to a "
         "galaxy with no script reason)?\n"
         "9. looks_generic_stock - is this obviously generic/unrelated stock "
-        "footage that happens to share a keyword but not the meaning?\n\n"
+        "footage that happens to share a keyword but not the meaning?\n"
+        "10. style_match - if a required visual style is specified above, does "
+        "this clip visually belong to THAT SAME style (answer false if the "
+        "required style is real-world footage but this clip is clearly CGI, a 3D "
+        "render, a 2D illustration, a vector graphic, or a cartoon, or vice versa; "
+        "if no style is specified, answer true)?\n"
+        "11. cinematic_quality - does this look like professionally shot, "
+        "well-composed, well-lit footage rather than amateur/low-quality filler?\n\n"
         "Respond ONLY with JSON, no markdown fences, in exactly this shape:\n"
         '{"checks": {"main_subject_present": bool, "environment_correct": bool, '
         '"motion_correct": bool, "matches_sentence": bool, "no_contradiction": bool, '
         '"viewer_would_understand": bool, "domain_match": bool, "continuity_ok": bool, '
-        '"looks_generic_stock": bool}, "reason": "<one short sentence>"}'
+        '"looks_generic_stock": bool, "style_match": bool, "cinematic_quality": bool}, '
+        '"reason": "<one short sentence>"}'
     )
 
     text = generate_text(prompt, api_key=api_key, model=model, timeout_seconds=timeout_seconds)
@@ -316,8 +344,17 @@ def generate_vision_verification(
             "domain_match",
             "continuity_ok",
             "looks_generic_stock",
+            "style_match",
+            "cinematic_quality",
         )
-        checks = {key: bool(parsed.get("checks", {}).get(key, False)) for key in bool_keys}
+        raw_checks = parsed.get("checks", {})
+        checks = {
+            key: bool(raw_checks[key]) if key in raw_checks else (key in ("style_match", "cinematic_quality"))
+            for key in bool_keys
+        }
+        # style_match / cinematic_quality default to True when the model
+        # omits them (e.g. an older cached response shape) so this stays
+        # backward compatible instead of silently zeroing every score.
 
         semantic_keys = (
             "main_subject_present",
@@ -330,17 +367,23 @@ def generate_vision_verification(
         domain_score = 1.0 if checks["domain_match"] else 0.0
         continuity_score = 1.0 if checks["continuity_ok"] else 0.5
         generic_score = 0.0 if checks["looks_generic_stock"] else 1.0
+        style_score = 1.0 if (checks["style_match"] or not required_visual_style) else 0.0
+        cinematic_score = 1.0 if checks["cinematic_quality"] else 0.5
 
-        # Hard gates: a forbidden/contradictory object or a domain break
-        # zeroes the score outright, regardless of how well the rest scores.
-        if not checks["no_contradiction"] or not checks["domain_match"]:
+        # Hard gates: a forbidden/contradictory object, a domain break, or
+        # (when a style is actually specified) a style mismatch zero the
+        # score outright, regardless of how well the rest scores.
+        style_violated = bool(required_visual_style) and not checks["style_match"]
+        if not checks["no_contradiction"] or not checks["domain_match"] or style_violated:
             overall_score = 0.0
         else:
             overall_score = round(
-                0.5 * semantic_score
-                + 0.2 * domain_score
+                0.45 * semantic_score
+                + 0.15 * domain_score
                 + 0.15 * continuity_score
-                + 0.15 * generic_score,
+                + 0.10 * generic_score
+                + 0.10 * style_score
+                + 0.05 * cinematic_score,
                 3,
             )
 
@@ -351,6 +394,8 @@ def generate_vision_verification(
             "domain_score": domain_score,
             "continuity_score": continuity_score,
             "generic_score": generic_score,
+            "style_score": style_score,
+            "cinematic_score": cinematic_score,
             "reason": str(parsed.get("reason", "")),
             "checks": checks,
         }
