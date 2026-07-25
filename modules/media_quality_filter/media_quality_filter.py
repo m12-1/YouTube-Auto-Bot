@@ -171,7 +171,12 @@ def _evaluate_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
     reasons += _check_orientation(candidate)
     reasons += _check_duration(candidate)
 
-    image_reasons, analyzed = _analyze_image_file(candidate.get("local_path", ""))
+    local_path = candidate.get("local_path", "")
+    is_video_file = local_path.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".avi"))
+    if is_video_file:
+        image_reasons, analyzed = [], False
+    else:
+        image_reasons, analyzed = _analyze_image_file(local_path)
     reasons += image_reasons
 
     result = dict(candidate)
