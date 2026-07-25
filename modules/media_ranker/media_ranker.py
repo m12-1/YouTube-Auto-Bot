@@ -196,6 +196,53 @@ def _generic_stock_penalty(candidate_text: str) -> float:
     return round(max(0.0, 1.0 - (hits / len(terms))), 4)
 
 
+def _style_match_score(candidate_text: str, locked_style: str) -> float:
+    """
+    Soft score in [0, 1] for whether a candidate's own tags/URL text
+    read as the video's locked visual style (Real Footage/CGI/3D Render/
+    2D Illustration/Vector/Cartoon). 1.0 if a locked-style term is
+    present, the configured neutral baseline if the candidate's text
+    doesn't clearly signal any style at all (most stock tags don't spell
+    out "real footage" explicitly), 0.0 if it clearly signals a
+    DIFFERENT style. This is a soft preference only -- the hard block on
+    mismatched styles already happened earlier via forbidden/negative
+    keywords (see storyboard_generator's style lock), so this never lets
+    a wrong-style candidate back in on its own.
+    """
+    if not locked_style:
+        return pipeline_config.MEDIA_RANK_NEUTRAL_BASELINE
+
+    own_terms = [t.lower() for t in pipeline_config.MEDIA_STYLE_TERMS.get(locked_style, [])]
+    if any(term in candidate_text for term in own_terms):
+        return 1.0
+
+    for category, terms in pipeline_config.MEDIA_STYLE_TERMS.items():
+        if category == locked_style:
+            continue
+        if any(term.lower() in candidate_text for term in terms):
+            return 0.0
+
+    return pipeline_config.MEDIA_RANK_NEUTRAL_BASELINE
+
+
+def _cinematic_quality_score(candidate_text: str) -> float:
+    """
+    Soft score in [0, 1]: fraction of configured "looks professional"
+    indicator terms found in the candidate's own tags/URL text. This is
+    a crude text-only proxy (weighted low on purpose) -- the real
+    cinematic-quality judgment happens in Gemini Vision's own
+    "cinematic_quality" check downstream, which actually looks at the
+    media.
+    """
+    terms = [t.strip().lower() for t in pipeline_config.MEDIA_CINEMATIC_TERMS if t.strip()]
+    if not terms:
+        return pipeline_config.MEDIA_RANK_NEUTRAL_BASELINE
+    hits = sum(1 for term in terms if term in candidate_text)
+    if hits == 0:
+        return pipeline_config.MEDIA_RANK_NEUTRAL_BASELINE
+    return round(min(1.0, hits / max(2, len(terms) // 3)), 4)
+
+
 def _resolution_score(candidate: Dict[str, Any]) -> float:
     """
     Score in [0, 1]: 0 at the configured minimum resolution, rising to
@@ -256,6 +303,7 @@ def _score_candidate(
     visual_theme_words: set,
     forbidden_objects: List[str],
     target_duration: float,
+    locked_style: str = "",
 ) -> Tuple[float, Dict[str, float]]:
     """
     Compute every independent sub-score for one candidate and combine
@@ -277,6 +325,8 @@ def _score_candidate(
     orientation = _orientation_score(candidate)
     duration = _duration_score(candidate, target_duration)
     generic_stock = _generic_stock_penalty(text)
+    style_match = _style_match_score(text, locked_style)
+    cinematic_quality = _cinematic_quality_score(text)
     forbidden_gate, forbidden_hits = _forbidden_gate(forbidden_objects, text)
 
     weighted_components: List[Tuple[float, float]] = [
@@ -291,6 +341,8 @@ def _score_candidate(
         (pipeline_config.MEDIA_RANK_WEIGHT_ORIENTATION, orientation),
         (pipeline_config.MEDIA_RANK_WEIGHT_DURATION, duration),
         (pipeline_config.MEDIA_RANK_WEIGHT_GENERIC_STOCK_PENALTY, generic_stock),
+        (pipeline_config.MEDIA_RANK_WEIGHT_STYLE_MATCH, style_match),
+        (pipeline_config.MEDIA_RANK_WEIGHT_CINEMATIC_QUALITY, cinematic_quality),
     ]
     total_weight = sum(weight for weight, _ in weighted_components)
     base_score = (
@@ -313,6 +365,8 @@ def _score_candidate(
         "orientation_score": orientation,
         "duration_score": duration,
         "generic_stock_penalty": generic_stock,
+        "style_match_score": style_match,
+        "cinematic_quality_score": cinematic_quality,
         "forbidden_objects_penalty": forbidden_gate,
         "forbidden_matches": forbidden_hits,
     }
@@ -342,6 +396,7 @@ def _rank_scene(
 
     narration = scene_story.get("narration", "")
     visual_description = scene_story.get("visual_description", "")
+    locked_style = scene_plan.get("visual_style") or scene_story.get("visual_style") or ""
 
     # "Required actions" has no dedicated field upstream -- the general,
     # topic-agnostic proxy is whatever descriptive words Scene Analyzer
@@ -370,6 +425,7 @@ def _rank_scene(
             visual_theme_words,
             forbidden_objects,
             target_duration,
+            locked_style,
         )
         scored.append((candidate, score, breakdown))
 
