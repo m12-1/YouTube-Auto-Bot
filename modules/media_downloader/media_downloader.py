@@ -237,7 +237,16 @@ def _download_file(url: str, local_path: str) -> None:
 
 
 def _normalize_pexels_candidate(raw: Dict[str, Any], media_type: str) -> Dict[str, Any]:
-    """Normalize a raw Pexels result into the module's candidate shape."""
+    """
+    Normalize a raw Pexels result into the module's candidate shape.
+
+    IMPORTANT: "thumbnail_url" is always a JPEG/PNG image, never the .mp4
+    itself. ai_media_verification's Gemini vision call needs a real image
+    to attach as inline_data -- it cannot decode a video file, so for video
+    candidates it must use this thumbnail instead of "url" (the video
+    file). Without this field, "vision" verification for every video
+    candidate had nothing valid to actually look at.
+    """
     if media_type == "video":
         video_files = sorted(
             raw.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True
@@ -246,14 +255,21 @@ def _normalize_pexels_candidate(raw: Dict[str, Any], media_type: str) -> Dict[st
         return {
             "candidate_id": str(raw.get("id")),
             "url": best.get("link", ""),
+            # Pexels' Video Search response includes a top-level "image"
+            # field: a JPEG thumbnail frame for the video.
+            "thumbnail_url": raw.get("image", ""),
             "width": best.get("width", 0),
             "height": best.get("height", 0),
             "duration_seconds": raw.get("duration"),
             "source_text": _raw_candidate_text(raw, "pexels"),
         }
+    image_url = raw.get("src", {}).get("original", "")
     return {
         "candidate_id": str(raw.get("id")),
-        "url": raw.get("src", {}).get("original", ""),
+        "url": image_url,
+        # For still images, the full-size image itself doubles as the
+        # thumbnail used for vision verification.
+        "thumbnail_url": raw.get("src", {}).get("medium", "") or image_url,
         "width": raw.get("width", 0),
         "height": raw.get("height", 0),
         "duration_seconds": None,
@@ -262,21 +278,38 @@ def _normalize_pexels_candidate(raw: Dict[str, Any], media_type: str) -> Dict[st
 
 
 def _normalize_pixabay_candidate(raw: Dict[str, Any], media_type: str) -> Dict[str, Any]:
-    """Normalize a raw Pixabay result into the module's candidate shape."""
+    """
+    Normalize a raw Pixabay result into the module's candidate shape.
+
+    IMPORTANT: "thumbnail_url" is always a JPEG/PNG image, never the video
+    file. See the matching note on `_normalize_pexels_candidate` -- this is
+    what ai_media_verification's Gemini vision call actually inspects.
+    """
     if media_type == "video":
         videos = raw.get("videos", {})
         best = videos.get("large") or videos.get("medium") or {}
+        picture_id = raw.get("picture_id", "")
         return {
             "candidate_id": str(raw.get("id")),
             "url": best.get("url", ""),
+            # Pixabay's Video API doesn't return a direct thumbnail URL,
+            # but documents this convention for deriving one from
+            # "picture_id" (the same id used on the Pixabay video page).
+            "thumbnail_url": (
+                f"https://i.vimeocdn.com/video/{picture_id}_640x360.jpg" if picture_id else ""
+            ),
             "width": best.get("width", 0),
             "height": best.get("height", 0),
             "duration_seconds": raw.get("duration"),
             "source_text": _raw_candidate_text(raw, "pixabay"),
         }
+    image_url = raw.get("largeImageURL", "")
     return {
         "candidate_id": str(raw.get("id")),
-        "url": raw.get("largeImageURL", ""),
+        "url": image_url,
+        # webformatURL is a smaller resized version of the same image --
+        # cheaper to fetch for vision verification than the full-size one.
+        "thumbnail_url": raw.get("webformatURL", "") or image_url,
         "width": raw.get("imageWidth", 0),
         "height": raw.get("imageHeight", 0),
         "duration_seconds": None,
