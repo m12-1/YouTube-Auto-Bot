@@ -181,6 +181,68 @@ def _run_output_paths(run_id: str) -> Dict[str, str]:
     }
 
 
+def _fill_missing_media_from_neighbors(video_track: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    For any scene with no resolvable media file, borrow the nearest
+    scene's media (previous scene preferred, otherwise next) instead of
+    leaving it to fall back to a plain black screen.
+
+    A solid black screen kills viewer retention on short-form video far
+    more than reusing an adjacent, thematically-related clip for a few
+    extra seconds -- viewers barely notice a slightly extended shot, but
+    they immediately drop off on a dead screen. This only kicks in for
+    scenes video_composer already flagged as having no verified media;
+    it never overrides a scene that legitimately has its own media.
+
+    Args:
+        video_track: The render plan's list of video track entries.
+
+    Returns:
+        A new list of video track entries with "media_path" backfilled
+        where possible. Only entries that changed get a copy; everything
+        else is passed through unchanged.
+    """
+
+    def _has_media(entry: Dict[str, Any]) -> bool:
+        path = entry.get("media_path")
+        return bool(path) and os.path.isfile(path)
+
+    filled = [dict(entry) for entry in video_track]
+    n = len(filled)
+
+    for i, entry in enumerate(filled):
+        if _has_media(entry):
+            continue
+
+        borrowed_path = None
+        borrowed_from = None
+
+        for j in range(i - 1, -1, -1):
+            if _has_media(filled[j]):
+                borrowed_path = filled[j]["media_path"]
+                borrowed_from = filled[j]["scene_id"]
+                break
+
+        if borrowed_path is None:
+            for j in range(i + 1, n):
+                if _has_media(filled[j]):
+                    borrowed_path = filled[j]["media_path"]
+                    borrowed_from = filled[j]["scene_id"]
+                    break
+
+        if borrowed_path is not None:
+            logger.warning(
+                "Scene %s has no local media file; reusing media from scene %s "
+                "instead of a black placeholder.",
+                entry.get("scene_id"),
+                borrowed_from,
+            )
+            entry["media_path"] = borrowed_path
+            entry["_media_borrowed"] = True
+
+    return filled
+
+
 def _scene_clip(scene: Dict[str, Any], width: int, height: int):
     """
     Build a single MoviePy clip for one scene, applying a Ken Burns
@@ -192,19 +254,20 @@ def _scene_clip(scene: Dict[str, Any], width: int, height: int):
         height: Target frame height.
 
     Returns:
-        A MoviePy clip sized/positioned for the vertical frame. Scenes
-        with no resolvable media file get a plain black placeholder
-        clip of the correct duration instead of aborting the whole
-        render -- one scene with no usable stock media shouldn't sink
-        an otherwise-complete video (audio/subtitles stay in sync).
+        A MoviePy clip sized/positioned for the vertical frame. If the
+        track-level fill (see `_fill_missing_media_from_neighbors`)
+        couldn't find *any* usable media anywhere in the whole video
+        (extremely rare -- every single scene lacking media), this
+        falls back to a plain black clip as an absolute last resort so
+        rendering can still complete.
     """
     media_path = scene.get("media_path")
     duration = max(scene["end"] - scene["start"], 0.1)
 
     if not media_path or not os.path.isfile(media_path):
         logger.warning(
-            "Scene %s has no local media file; using a placeholder clip instead of "
-            "aborting the render.",
+            "Scene %s has no local media file anywhere to borrow from; using a "
+            "black placeholder clip as a last resort.",
             scene.get("scene_id"),
         )
         return ColorClip(size=(width, height), color=(0, 0, 0)).set_duration(duration)
@@ -215,7 +278,14 @@ def _scene_clip(scene: Dict[str, Any], width: int, height: int):
         clip = VideoFileClip(media_path).subclip(0, min(duration, VideoFileClip(media_path).duration))
     else:
         clip = ImageClip(media_path).set_duration(duration)
-        if scene.get("ken_burns"):
+        # A borrowed clip (reused from a neighboring scene) gets its own
+        # zoom-out motion, distinct from a fresh scene's zoom-in, so a
+        # repeated shot reads as an intentional cutaway rather than a
+        # frozen duplicate of the previous frame.
+        if scene.get("_media_borrowed"):
+            zoom_start, zoom_end = 1.08, 1.0
+            clip = clip.resize(lambda t: zoom_start + (zoom_end - zoom_start) * (t / duration))
+        elif scene.get("ken_burns"):
             zoom_start, zoom_end = 1.0, 1.08
             clip = clip.resize(lambda t: zoom_start + (zoom_end - zoom_start) * (t / duration))
 
@@ -275,7 +345,8 @@ def _render_with_moviepy(
     os.makedirs(os.path.dirname(output_paths["final_video_path"]), exist_ok=True)
 
     try:
-        scene_clips = [_scene_clip(scene, width, height) for scene in render_plan["tracks"]["video"]]
+        video_track = _fill_missing_media_from_neighbors(render_plan["tracks"]["video"])
+        scene_clips = [_scene_clip(scene, width, height) for scene in video_track]
         video = concatenate_videoclips(scene_clips, method="compose")
 
         subtitle_clips = _subtitle_clips(render_plan["tracks"]["subtitles"], width, height)
