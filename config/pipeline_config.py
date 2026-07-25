@@ -347,6 +347,16 @@ MEDIA_MAX_SEARCH_ATTEMPTS: int = _get_env_int("MEDIA_MAX_SEARCH_ATTEMPTS", 3)
 # usable media for this scene" rather than settling for a weak match.
 MEDIA_MIN_VERIFICATION_SCORE: float = _get_env_float("MEDIA_MIN_VERIFICATION_SCORE", 0.80)
 
+# Minimum score for a candidate scored by the *heuristic* fallback (used
+# only when Gemini is unavailable, e.g. rate-limited/retired models).
+# The heuristic's keyword-overlap formula (0.4 baseline + 0.15/term) can
+# almost never reach MEDIA_MIN_VERIFICATION_SCORE, so reusing that bar
+# here effectively rejects every scene whenever Gemini is down. This is
+# intentionally lower so a full Gemini outage doesn't fail every scene.
+MEDIA_MIN_VERIFICATION_SCORE_HEURISTIC: float = _get_env_float(
+    "MEDIA_MIN_VERIFICATION_SCORE_HEURISTIC", 0.35
+)
+
 # ---------------------------------------------------------------------------
 # AI Media Verification
 # ---------------------------------------------------------------------------
