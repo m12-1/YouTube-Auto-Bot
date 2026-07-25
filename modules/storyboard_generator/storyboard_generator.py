@@ -72,6 +72,18 @@ MODULE_NAME = "storyboard_generator"
 _STOP_WORDS = {"the", "a", "an", "in", "of", "how", "why", "we", "to", "is", "and", "this", "that"}
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "scene_analyzer_prompt.txt"
+_TOPIC_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "topic_analyzer_prompt.txt"
+
+_DEFAULT_TOPIC_CONTEXT = {
+    "scientific_domain": "",
+    "visual_theme": "",
+    "visual_style": "",
+    "preferred_environment": "",
+    "color_palette": "",
+    "lighting_style": "",
+    "forbidden_domains": [],
+    "forbidden_objects": [],
+}
 
 # Generic, always-plausible forbidden settings used as a floor for the
 # deterministic (non-AI) fallback, so every scene ships with *some*
@@ -125,7 +137,65 @@ def _load_prompt_template() -> str:
 
 
 @retry(max_attempts=2, exceptions=(GeminiUnavailableError,))
-def _analyze_scene_with_ai(topic: str, narration: str, description: str) -> Dict[str, Any]:
+def _analyze_topic_with_ai(topic: str, narration: str) -> Dict[str, Any]:
+    """
+    Global Topic Understanding (Stage 1): analyze the WHOLE script once,
+    before any per-scene analysis, so every scene inherits a consistent
+    domain/environment/palette/forbidden list instead of being judged
+    in isolation. This is what prevents e.g. "pressure" turning into a
+    podcast-microphone shot in an ocean-pressure video.
+
+    Raises:
+        GeminiUnavailableError: If no key is configured or the call/parse fails.
+    """
+    api_key = pick_api_key(
+        settings.GEMINI_KEY_ADVANCED,
+        settings.GEMINI_KEY_FILTER,
+        settings.GEMINI_KEY_FILTER_2,
+        settings.GEMINI_KEY_LIGHT,
+    )
+    if not api_key:
+        raise GeminiUnavailableError("No Gemini API key configured for topic analysis.")
+
+    prompt = _TOPIC_PROMPT_PATH.read_text(encoding="utf-8").format(topic=topic, narration=narration)
+    text = generate_text(prompt, api_key=api_key, temperature=0.3)
+
+    try:
+        cleaned = text.strip().strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+        parsed = json.loads(cleaned)
+        return {
+            "scientific_domain": str(parsed.get("scientific_domain", "")),
+            "visual_theme": str(parsed.get("visual_theme", "")),
+            "visual_style": str(parsed.get("visual_style", "")),
+            "preferred_environment": str(parsed.get("preferred_environment", "")),
+            "color_palette": str(parsed.get("color_palette", "")),
+            "lighting_style": str(parsed.get("lighting_style", "")),
+            "forbidden_domains": [str(d) for d in parsed.get("forbidden_domains", []) if d][:6],
+            "forbidden_objects": [str(o) for o in parsed.get("forbidden_objects", []) if o][:8],
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise GeminiUnavailableError(f"Could not parse Topic Analyzer response: {exc}") from exc
+
+
+def _analyze_topic(topic: str, narration: str) -> Dict[str, Any]:
+    """
+    Run Global Topic Understanding, preferring AI and falling back to a
+    conservative default context (no domain lock, generic forbidden
+    list) on any failure so the pipeline still runs without an API key.
+    """
+    try:
+        return _analyze_topic_with_ai(topic, narration)
+    except GeminiUnavailableError as exc:
+        logger.warning("Topic Analyzer falling back to default context: %s", exc)
+        return dict(_DEFAULT_TOPIC_CONTEXT)
+
+
+@retry(max_attempts=2, exceptions=(GeminiUnavailableError,))
+def _analyze_scene_with_ai(
+    topic: str, narration: str, description: str, topic_context: Dict[str, Any]
+) -> Dict[str, Any]:
     """
     Ask Gemini to classify a scene: scene_type, environment, required
     objects, forbidden objects, and tiered search keywords. This is the
@@ -146,7 +216,13 @@ def _analyze_scene_with_ai(topic: str, narration: str, description: str) -> Dict
         raise GeminiUnavailableError("No Gemini API key configured for scene analysis.")
 
     prompt = _load_prompt_template().format(
-        topic=topic, narration=narration, visual_description=description
+        topic=topic,
+        narration=narration,
+        visual_description=description,
+        domain=topic_context.get("scientific_domain", "") or "(not specified)",
+        visual_theme=topic_context.get("visual_theme", "") or "(not specified)",
+        preferred_environment=topic_context.get("preferred_environment", "") or "(not specified)",
+        topic_forbidden_domains=", ".join(topic_context.get("forbidden_domains", [])) or "(none)",
     )
     text = generate_text(prompt, api_key=api_key, temperature=0.3)
 
@@ -173,13 +249,36 @@ def _analyze_scene_with_ai(topic: str, narration: str, description: str) -> Dict
         raise GeminiUnavailableError(f"Could not parse Scene Analyzer response: {exc}") from exc
 
 
-def _analyze_scene_heuristic(text: str, topic: str) -> Dict[str, Any]:
+def _apply_domain_lock(analysis: Dict[str, Any], topic_context: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Domain Lock (Stage 2), enforced in code so it can't be skipped by a
+    prompt the model ignores: hard-merge the video's topic-level
+    forbidden domains/objects into every scene's forbidden/negative
+    lists, regardless of whether the AI Scene Analyzer remembered to.
+    """
+    topic_forbidden = list(topic_context.get("forbidden_domains", [])) + list(
+        topic_context.get("forbidden_objects", [])
+    )
+    if not topic_forbidden:
+        return analysis
+
+    analysis = dict(analysis)
+    analysis["forbidden"] = list(dict.fromkeys(list(analysis.get("forbidden", [])) + topic_forbidden))
+    analysis["keywords_negative"] = list(
+        dict.fromkeys(
+            list(analysis.get("keywords_negative", [])) + [w.lower() for w in topic_forbidden]
+        )
+    )
+    return analysis
+
+
+def _analyze_scene_heuristic(text: str, topic: str, topic_context: Dict[str, Any]) -> Dict[str, Any]:
     """
     Deterministic fallback Scene Analyzer, used when no AI key is
     configured or the AI call fails. Cannot infer abstract/metaphorical
     meaning, but still guarantees every scene ships with a non-empty
-    forbidden/negative list so downstream filtering always has
-    something to work with.
+    forbidden/negative list, and still applies Domain Lock from the
+    (possibly AI-derived) topic context.
     """
     primary = _extract_scene_keywords(text, max_keywords=2)
     secondary = _extract_scene_keywords(text, max_keywords=5)[len(primary):]
@@ -187,27 +286,32 @@ def _analyze_scene_heuristic(text: str, topic: str) -> Dict[str, Any]:
         topic_words = [w for w in topic.lower().split() if len(w) > 3]
         secondary = [w for w in topic_words if w not in primary][:5]
 
-    return {
+    analysis = {
         "scene_type": "Real World Footage",
-        "environment": "",
+        "environment": topic_context.get("preferred_environment", ""),
         "objects": primary or [topic.lower()],
         "forbidden": list(_DEFAULT_FORBIDDEN),
         "keywords_primary": primary or [topic.lower()],
         "keywords_secondary": secondary,
         "keywords_negative": list(_DEFAULT_FORBIDDEN),
     }
+    return _apply_domain_lock(analysis, topic_context)
 
 
-def _analyze_scene(narration: str, description: str, topic: str) -> Dict[str, Any]:
+def _analyze_scene(
+    narration: str, description: str, topic: str, topic_context: Dict[str, Any]
+) -> Dict[str, Any]:
     """
     Analyze a scene, preferring the AI Scene Analyzer and falling back
-    to the deterministic heuristic on any failure.
+    to the deterministic heuristic on any failure. Domain Lock is
+    applied on both paths.
     """
     try:
-        return _analyze_scene_with_ai(topic, narration, description)
+        analysis = _analyze_scene_with_ai(topic, narration, description, topic_context)
+        return _apply_domain_lock(analysis, topic_context)
     except GeminiUnavailableError as exc:
         logger.warning("Scene Analyzer falling back to heuristic: %s", exc)
-        return _analyze_scene_heuristic(f"{description} {narration}", topic)
+        return _analyze_scene_heuristic(f"{description} {narration}", topic, topic_context)
 
 
 def _pick_animation(scene_number: int) -> str:
@@ -223,7 +327,7 @@ def _pick_transition(scene_number: int) -> str:
 
 
 def _build_storyboard(
-    scene_breakdown: List[Dict[str, Any]], run_id: str, topic: str
+    scene_breakdown: List[Dict[str, Any]], run_id: str, topic: str, topic_context: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
     """
     Build a timed storyboard from a script's scene breakdown.
@@ -248,7 +352,7 @@ def _build_storyboard(
         end_time = round(cursor + duration, 2)
         cursor = end_time
 
-        analysis = _analyze_scene(narration_excerpt, description, topic)
+        analysis = _analyze_scene(narration_excerpt, description, topic, topic_context)
 
         storyboard.append(
             {
@@ -342,14 +446,17 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(scene_breakdown, list) or not scene_breakdown:
             raise ContractError("script.scene_breakdown must be a non-empty list")
 
-        storyboard = _build_storyboard(scene_breakdown, run_id, topic)
+        topic_context = _analyze_topic(topic, script.get("narration", ""))
+
+        storyboard = _build_storyboard(scene_breakdown, run_id, topic, topic_context)
         storyboard = _rescale_to_narration_length(storyboard, script.get("narration", ""))
         total_duration = storyboard[-1]["end_time"] if storyboard else 0.0
 
         logger.info(
-            "Storyboard generated for run_id=%s topic='%s' -> %d scenes, %.2fs total",
+            "Storyboard generated for run_id=%s topic='%s' domain='%s' -> %d scenes, %.2fs total",
             run_id,
             topic,
+            topic_context.get("scientific_domain", ""),
             len(storyboard),
             total_duration,
         )
@@ -359,6 +466,7 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
             "topic": topic,
             "storyboard": storyboard,
             "total_duration_seconds": total_duration,
+            "topic_context": topic_context,
         }
 
         return build_response(module=MODULE_NAME, status="success", data=data)
