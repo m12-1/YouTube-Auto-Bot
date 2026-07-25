@@ -218,25 +218,32 @@ def generate_vision_verification(
     required_objects: Optional[List[str]] = None,
     environment: Optional[str] = None,
     forbidden_objects: Optional[List[str]] = None,
+    topic: Optional[str] = None,
+    scientific_domain: Optional[str] = None,
+    previous_scene: Optional[str] = None,
+    next_scene: Optional[str] = None,
     model: Optional[str | List[str]] = None,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
     """
-    Multi-criteria verification of a candidate media item against a
-    narration sentence and its Scene Analyzer requirements. Unlike
-    `generate_vision_score` (one generic relevance question), this asks
-    several independent yes/no questions and derives a weighted score,
-    so a clip can't pass just because it's "vaguely related".
+    Multi-signal verification of a candidate media item — not just "is
+    this vaguely related", but whether it matches the sentence, stays
+    inside the video's scientific domain, keeps visual continuity with
+    the surrounding scenes, and doesn't look like random generic stock
+    footage. This is what lets a black-hole video that scored 8.5/10
+    become the consistency bar for every other topic, instead of score
+    varying 3.5-8.5 depending on how literally a word got matched.
 
     Returns:
         {
-            "score": float (0.0-1.0),
+            "overall_score": float (0.0-1.0),   # weighted combination, gated by contradictions/domain
+            "score": float,                     # alias of overall_score, for older callers
+            "semantic_score": float,            # the 6-question relevance sub-score
+            "domain_score": float,              # 1.0 if it stayed in scientific_domain, else 0.0
+            "continuity_score": float,          # 1.0 if visually consistent with prev/next scene
+            "generic_score": float,             # 1.0 if NOT generic/unrelated stock, else 0.0
             "reason": str,
-            "checks": {
-                "main_subject_present": bool, "environment_correct": bool,
-                "motion_correct": bool, "matches_sentence": bool,
-                "no_contradiction": bool, "viewer_would_understand": bool
-            }
+            "checks": {...}
         }
 
     Raises:
@@ -248,12 +255,20 @@ def generate_vision_verification(
     required_str = ", ".join(required_objects) if required_objects else "(not specified)"
     environment_str = environment or "(not specified)"
     forbidden_str = ", ".join(forbidden_objects) if forbidden_objects else "(none specified)"
+    domain_str = scientific_domain or "(not specified)"
+    topic_str = topic or "(not specified)"
+    previous_str = previous_scene or "(this is the first scene)"
+    next_str = next_scene or "(this is the last scene)"
 
     prompt = (
         "You are a strict media-relevance QA reviewer for a short-form vertical "
-        "video. Evaluate the candidate video/image against the narration sentence "
-        "below by answering SIX independent yes/no questions.\n\n"
-        f"Narration sentence: {narration_sentence}\n"
+        "video. Evaluate the candidate video/image below, considering the WHOLE "
+        "video's context, not just this one sentence in isolation.\n\n"
+        f"Video topic: {topic_str}\n"
+        f"Scientific/subject domain of the whole video: {domain_str}\n"
+        f"Previous scene's narration: {previous_str}\n"
+        f"THIS scene's narration: {narration_sentence}\n"
+        f"Next scene's narration: {next_str}\n"
         f"Expected environment/setting: {environment_str}\n"
         f"Expected objects/subjects: {required_str}\n"
         f"Forbidden objects/subjects (must NOT be visible): {forbidden_str}\n"
@@ -267,11 +282,21 @@ def generate_vision_verification(
         "5. no_contradiction - is it TRUE that nothing forbidden or contradictory "
         "appears (answer false if a forbidden object appears)?\n"
         "6. viewer_would_understand - would a viewer feel this clip explains the "
-        "sentence?\n\n"
+        "sentence?\n"
+        "7. domain_match - does this footage visually belong to the video's "
+        "scientific/subject domain above (answer false if it's from a completely "
+        "different world, e.g. an office/podcast/city shot in a science video)?\n"
+        "8. continuity_ok - does this footage feel like it's from the same visual "
+        "world as the previous/next scene narrations (answer true if there's no "
+        "jarring, unexplained jump, e.g. deep-ocean footage suddenly cutting to a "
+        "galaxy with no script reason)?\n"
+        "9. looks_generic_stock - is this obviously generic/unrelated stock "
+        "footage that happens to share a keyword but not the meaning?\n\n"
         "Respond ONLY with JSON, no markdown fences, in exactly this shape:\n"
         '{"checks": {"main_subject_present": bool, "environment_correct": bool, '
         '"motion_correct": bool, "matches_sentence": bool, "no_contradiction": bool, '
-        '"viewer_would_understand": bool}, "reason": "<one short sentence>"}'
+        '"viewer_would_understand": bool, "domain_match": bool, "continuity_ok": bool, '
+        '"looks_generic_stock": bool}, "reason": "<one short sentence>"}'
     )
 
     text = generate_text(prompt, api_key=api_key, model=model, timeout_seconds=timeout_seconds)
@@ -281,26 +306,54 @@ def generate_vision_verification(
     try:
         cleaned = text.strip().strip("`").replace("json\n", "").strip()
         parsed = json.loads(cleaned)
-        checks = {
-            key: bool(parsed.get("checks", {}).get(key, False))
-            for key in (
-                "main_subject_present",
-                "environment_correct",
-                "motion_correct",
-                "matches_sentence",
-                "no_contradiction",
-                "viewer_would_understand",
-            )
-        }
-        # no_contradiction is a hard gate: any forbidden/contradictory object
-        # visible caps the score regardless of the other five answers.
-        if not checks["no_contradiction"]:
-            score = 0.0
-        else:
-            passed = sum(1 for value in checks.values() if value)
-            score = round(passed / len(checks), 3)
+        bool_keys = (
+            "main_subject_present",
+            "environment_correct",
+            "motion_correct",
+            "matches_sentence",
+            "no_contradiction",
+            "viewer_would_understand",
+            "domain_match",
+            "continuity_ok",
+            "looks_generic_stock",
+        )
+        checks = {key: bool(parsed.get("checks", {}).get(key, False)) for key in bool_keys}
 
-        return {"score": score, "reason": str(parsed.get("reason", "")), "checks": checks}
+        semantic_keys = (
+            "main_subject_present",
+            "environment_correct",
+            "motion_correct",
+            "matches_sentence",
+            "viewer_would_understand",
+        )
+        semantic_score = round(sum(1 for k in semantic_keys if checks[k]) / len(semantic_keys), 3)
+        domain_score = 1.0 if checks["domain_match"] else 0.0
+        continuity_score = 1.0 if checks["continuity_ok"] else 0.5
+        generic_score = 0.0 if checks["looks_generic_stock"] else 1.0
+
+        # Hard gates: a forbidden/contradictory object or a domain break
+        # zeroes the score outright, regardless of how well the rest scores.
+        if not checks["no_contradiction"] or not checks["domain_match"]:
+            overall_score = 0.0
+        else:
+            overall_score = round(
+                0.5 * semantic_score
+                + 0.2 * domain_score
+                + 0.15 * continuity_score
+                + 0.15 * generic_score,
+                3,
+            )
+
+        return {
+            "overall_score": overall_score,
+            "score": overall_score,
+            "semantic_score": semantic_score,
+            "domain_score": domain_score,
+            "continuity_score": continuity_score,
+            "generic_score": generic_score,
+            "reason": str(parsed.get("reason", "")),
+            "checks": checks,
+        }
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to parse Gemini verification response as JSON: %s", exc)
         raise GeminiUnavailableError("Gemini verification response was not valid JSON.") from exc
