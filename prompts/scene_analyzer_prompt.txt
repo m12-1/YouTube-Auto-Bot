@@ -4,6 +4,13 @@ stock footage/photo would visually match it, so a media-search engine
 can find the right clip and reject the wrong ones.
 
 Video topic: {topic}
+Global topic context (established BEFORE this scene — stay locked to
+this domain/environment unless the scene's own narration explicitly
+moves elsewhere):
+  Scientific domain: {domain}
+  Visual theme: {visual_theme}
+  Preferred environment: {preferred_environment}
+  Domains already forbidden for the whole video: {topic_forbidden_domains}
 Scene narration: "{narration}"
 Scene visual description (from the script): "{visual_description}"
 
@@ -25,6 +32,10 @@ Return ONLY JSON, no markdown fences, in exactly this shape:
 }}
 
 Rules:
+- Domain Lock: unless this scene's own narration clearly moves to a
+  different subject, stay inside the global topic's domain/environment
+  above — do not drift into an unrelated visual world just because a
+  word is ambiguous.
 - "forbidden" must always be non-empty — even a plausible scene has things that would clearly be wrong (e.g. for a nature scene, forbid "office", "city street", "studio").
 - Keep every keyword short (1-3 words), lowercase, stock-footage-search style.
 - Do not explain your reasoning, return JSON only.
