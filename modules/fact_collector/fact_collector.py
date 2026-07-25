@@ -22,6 +22,12 @@ logger = get_logger(__name__)
 
 MODULE_NAME = "fact_collector"
 
+# Wikipedia's API rejects requests with no identifying User-Agent (403 Forbidden).
+# See: https://meta.wikimedia.org/wiki/User-Agent_policy
+WIKIPEDIA_HEADERS = {
+    "User-Agent": "YouTube-Auto-Bot/1.0 (https://github.com/Mohammed-163/YouTube-Auto-Bot; contact: bot-maintainer@example.com) requests/python"
+}
+
 class FactCollectorInput(BaseModuleInput):
     topic: str
     max_facts: int = Field(default=5, ge=1)
@@ -43,7 +49,9 @@ def _collect_raw_facts(topic: str, max_facts: int) -> List[Dict[str, Any]]:
         "utf8": 1,
     }
     
-    response = requests.get(search_url, params=search_params, timeout=10)
+    response = requests.get(
+        search_url, params=search_params, headers=WIKIPEDIA_HEADERS, timeout=10
+    )
     response.raise_for_status()
     search_results = response.json().get("query", {}).get("search", [])
     
@@ -62,7 +70,9 @@ def _collect_raw_facts(topic: str, max_facts: int) -> List[Dict[str, Any]]:
         "explaintext": 1,
     }
     
-    ext_resp = requests.get(search_url, params=extract_params, timeout=10)
+    ext_resp = requests.get(
+        search_url, params=extract_params, headers=WIKIPEDIA_HEADERS, timeout=10
+    )
     ext_resp.raise_for_status()
     pages = ext_resp.json().get("query", {}).get("pages", {})
     
