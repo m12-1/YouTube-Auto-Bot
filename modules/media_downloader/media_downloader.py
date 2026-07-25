@@ -284,6 +284,7 @@ def _fetch_candidates_for_scene(
     media_type: str,
     candidates_per_scene: int,
     negative_keywords: Optional[List[str]] = None,
+    providers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Try each configured provider, in priority order, for the given
@@ -293,13 +294,20 @@ def _fetch_candidates_for_scene(
         keywords: Ordered list of search keywords to try (primary first).
         media_type: "video" or "image".
         candidates_per_scene: How many candidates to request.
+        providers: Optional override of which providers to try, and in
+            what order. Used by the media engine's Fallback/re-search
+            loop (core.pipeline_controller) to force a single, specific
+            provider on a given retry attempt instead of always
+            restarting from `MEDIA_PROVIDER_PRIORITY[0]`. Defaults to
+            `pipeline_config.MEDIA_PROVIDER_PRIORITY` when omitted.
 
     Returns:
         A dict with "provider" and "raw_candidates" (may be empty).
     """
     negative_keywords = negative_keywords or []
+    provider_order = providers or pipeline_config.MEDIA_PROVIDER_PRIORITY
 
-    for provider in pipeline_config.MEDIA_PROVIDER_PRIORITY:
+    for provider in provider_order:
         # Ask for more than needed since the negative-keyword filter
         # below will drop some results before we get to candidates_per_scene.
         fetch_count = max(candidates_per_scene * 3, candidates_per_scene)
@@ -345,6 +353,7 @@ def _download_scene_media(
     keywords: List[str],
     candidates_per_scene: int,
     negative_keywords: Optional[List[str]] = None,
+    providers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Fetch, normalize, and download candidate media for a single scene.
@@ -354,12 +363,13 @@ def _download_scene_media(
         media_type: "video" or "image".
         keywords: Search keywords (primary + alternatives) to try.
         candidates_per_scene: How many candidates to request/return.
+        providers: Optional provider override (see `_fetch_candidates_for_scene`).
 
     Returns:
         A dict with "scene_id", "provider", and "candidates".
     """
     search_result = _fetch_candidates_for_scene(
-        keywords, media_type, candidates_per_scene, negative_keywords
+        keywords, media_type, candidates_per_scene, negative_keywords, providers
     )
     provider = search_result["provider"]
     raw_candidates = search_result["raw_candidates"]
@@ -437,12 +447,22 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
             )
             keywords = keywords or [topic]
 
+            # "_forced_provider" is set per-scene by the media engine's
+            # Fallback/re-search loop (core.pipeline_controller) on retry
+            # attempts, so each attempt tries a *specific* provider instead
+            # of always restarting from MEDIA_PROVIDER_PRIORITY[0]. Absent
+            # on a normal (first-attempt) call, so default behavior is
+            # unchanged.
+            forced_provider = scene_plan.get("_forced_provider")
+            providers = [forced_provider] if forced_provider else None
+
             result = _download_scene_media(
                 scene_id=scene_plan["scene_id"],
                 media_type=scene_plan.get("media_type", "image"),
                 keywords=keywords,
                 candidates_per_scene=candidates_per_scene,
                 negative_keywords=scene_plan.get("negative_keywords", []),
+                providers=providers,
             )
             downloads.append(result)
 
