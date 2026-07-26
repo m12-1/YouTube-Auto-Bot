@@ -73,6 +73,7 @@ output_json:
 from __future__ import annotations
 
 import re
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -175,6 +176,72 @@ def _rotate_keys(api_keys: List[str], track: int) -> List[str]:
     return api_keys[offset:] + api_keys[:offset]
 
 
+def _extract_local_frame_bytes(local_path: str) -> Optional[Tuple[bytes, str]]:
+    """
+    Grab a real JPEG frame straight from the media file that's ALREADY
+    been downloaded to disk by `media_downloader`, instead of trusting a
+    remote "thumbnail_url".
+
+    This exists because remote thumbnail URLs are unreliable in
+    practice -- e.g. Pixabay's video API doesn't return a direct
+    thumbnail field at all, so a URL has to be *guessed* from
+    "picture_id" using an external CDN convention that can 404, redirect,
+    or simply not correspond to that candidate. When that guessed URL
+    fails, the old code silently fell back to the raw candidate "url" --
+    which for a VIDEO candidate is the .mp4 file itself, something
+    Gemini's inline_data image parts can never decode. The net effect
+    (visible in production logs) was ai_media_verification falling back
+    to the much weaker keyword-overlap heuristic for entire batches of
+    otherwise-good candidates, which is exactly what let a visually
+    wrong clip (e.g. a moon shot for an unrelated scene) get selected.
+
+    Pulling a frame locally sidesteps all of that: the file is already
+    on disk, so there's no network round-trip to fail, and it always
+    reflects the ACTUAL candidate rather than a best-effort guess.
+
+    Returns:
+        (jpeg_bytes, "image/jpeg") on success, or None if the file is
+        missing/unreadable/not a supported type -- callers should fall
+        back to the remote thumbnail_url path in that case.
+    """
+    if not local_path or not os.path.isfile(local_path):
+        return None
+
+    is_video = local_path.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".avi"))
+
+    try:
+        if is_video:
+            import cv2  # type: ignore[import-untyped]
+
+            capture = cv2.VideoCapture(local_path)
+            try:
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                # Sample from the middle of the clip rather than frame 0,
+                # which is sometimes a black/fade-in frame.
+                target_frame = frame_count // 2 if frame_count > 1 else 0
+                capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                success, frame = capture.read()
+                if not success or frame is None:
+                    return None
+                ok, encoded = cv2.imencode(".jpg", frame)
+                if not ok:
+                    return None
+                return bytes(encoded.tobytes()), "image/jpeg"
+            finally:
+                capture.release()
+        else:
+            from PIL import Image
+            import io
+
+            with Image.open(local_path) as img:
+                buffer = io.BytesIO()
+                img.convert("RGB").save(buffer, format="JPEG")
+                return buffer.getvalue(), "image/jpeg"
+    except Exception as exc:  # noqa: BLE001 - any failure just means "no local frame"
+        logger.debug("Local frame extraction failed for '%s': %s", local_path, exc)
+        return None
+
+
 @retry(max_attempts=2, exceptions=(GeminiUnavailableError,))
 def _score_candidate_with_ai(
     narration: str,
@@ -226,8 +293,14 @@ def _score_candidate_with_ai(
     # nothing valid to look at, or (before this fix) never actually looked
     # at anything at all. Falls back to "url" only for older cached
     # candidate shapes that predate the thumbnail_url field.
+    # THE FIX: prefer a frame pulled directly from the ALREADY-DOWNLOADED
+    # local file over any remote "thumbnail_url" guess. Local extraction
+    # can't 404/redirect/mismatch the way a derived CDN URL can, and the
+    # file is already on disk by this point in the pipeline anyway.
+    local_frame = _extract_local_frame_bytes(candidate.get("local_path", ""))
+
     image_url = candidate.get("thumbnail_url") or candidate.get("url", "")
-    if not image_url:
+    if not image_url and local_frame is None:
         raise GeminiUnavailableError("Candidate has no image/thumbnail URL to verify.")
 
     return generate_vision_verification(
@@ -243,6 +316,7 @@ def _score_candidate_with_ai(
         next_scene=next_scene,
         required_visual_style=required_visual_style,
         forbidden_styles=forbidden_styles,
+        prefetched_image=local_frame,
     )
 
 
