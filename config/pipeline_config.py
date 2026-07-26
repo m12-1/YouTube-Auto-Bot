@@ -104,6 +104,23 @@ MEDIA_PROVIDER_PRIORITY: List[str] = _get_env_list(
 # site. Set to 1 to restore the old fully-sequential behavior.
 MEDIA_DOWNLOAD_MAX_WORKERS: int = _get_env_int("MEDIA_DOWNLOAD_MAX_WORKERS", 2)
 
+# When a scene's own keywords return ZERO candidates from every configured
+# provider (not "low quality" -- literally nothing), media_downloader makes
+# one last-resort search for a still IMAGE using the video's own topic
+# (optionally combined with the scene's environment) instead of returning
+# empty-handed. This keeps the result on-topic -- it is still a real
+# provider search against the topic, never a random/unrelated query -- and
+# a still image is what a slow Ken Burns zoom is meant for. Candidates
+# found this way are tagged "is_topic_fallback" so ai_media_verification
+# can judge them against MEDIA_MIN_VERIFICATION_SCORE_TOPIC_FALLBACK
+# instead of the stricter default, and video_composer guarantees them a
+# zoom instead of a static/borrowed clip. Set to False to restore the old
+# behavior (scene gets zero candidates and falls through to
+# video_renderer's borrow-from-neighbor / black-placeholder logic).
+MEDIA_TOPIC_FALLBACK_ENABLED: bool = (
+    _get_env("MEDIA_TOPIC_FALLBACK_ENABLED", "true") or "true"
+).lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Media Quality Filter
 # ---------------------------------------------------------------------------
@@ -402,6 +419,20 @@ MEDIA_MIN_VERIFICATION_SCORE_HEURISTIC: float = _get_env_float(
 # of both threads racing for the same key first. Set to 1 to restore the
 # old fully-sequential behavior.
 AI_VERIFICATION_MAX_WORKERS: int = _get_env_int("AI_VERIFICATION_MAX_WORKERS", 2)
+
+# Minimum score for a candidate found via media_downloader's topic-level
+# fallback search (MEDIA_TOPIC_FALLBACK_ENABLED -- see that setting).
+# Deliberately between the strict default (0.80, for candidates matched
+# against the scene's own specific keywords) and the heuristic floor
+# (0.35, only used when Gemini itself is unavailable): a topic-fallback
+# image was never expected to match the scene's exact narration the way
+# scene-specific media would, but it IS a real Gemini-scored, on-topic
+# photo -- clearly better than an empty scene or a clip borrowed from an
+# unrelated neighbor -- so it gets its own, more forgiving bar rather
+# than being held to the same standard as a purpose-matched candidate.
+MEDIA_MIN_VERIFICATION_SCORE_TOPIC_FALLBACK: float = _get_env_float(
+    "MEDIA_MIN_VERIFICATION_SCORE_TOPIC_FALLBACK", 0.45
+)
 
 # ---------------------------------------------------------------------------
 # AI Media Verification
