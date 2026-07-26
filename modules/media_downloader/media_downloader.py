@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -506,8 +507,25 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(media_plan, list) or not media_plan:
             raise ContractError("media_plan must be a non-empty list")
 
-        downloads: List[Dict[str, Any]] = []
-        for scene_plan in media_plan:
+        # Scenes are fetched independently of each other, so instead of
+        # downloading them one at a time (the main reason this stage could
+        # run for many minutes), they're fetched concurrently.
+        # `MEDIA_DOWNLOAD_MAX_WORKERS` (default 2) controls how many scenes
+        # run at once. Each worker's "track" also picks which provider it
+        # tries FIRST: track 0 keeps MEDIA_PROVIDER_PRIORITY's configured
+        # order (e.g. Pexels first, Pixabay fallback), track 1 tries it
+        # reversed (Pixabay first, Pexels fallback) -- so with the default
+        # of 2 workers, two scenes are fetched at the same time and each
+        # one primarily hits a different site, instead of both scenes
+        # queuing up on the same provider. A scene with an explicit
+        # "_forced_provider" (set by the pipeline's retry loop) always
+        # keeps that single provider regardless of track -- unchanged
+        # behavior for retries.
+        max_workers = max(1, pipeline_config.MEDIA_DOWNLOAD_MAX_WORKERS)
+        downloads: List[Optional[Dict[str, Any]]] = [None] * len(media_plan)
+
+        def _download_at(index: int, track: int) -> Dict[str, Any]:
+            scene_plan = media_plan[index]
             keywords = list(scene_plan.get("search_keywords", [])) + list(
                 scene_plan.get("alternative_keywords", [])
             )
@@ -520,9 +538,14 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
             # on a normal (first-attempt) call, so default behavior is
             # unchanged.
             forced_provider = scene_plan.get("_forced_provider")
-            providers = [forced_provider] if forced_provider else None
+            if forced_provider:
+                providers = [forced_provider]
+            elif track % 2 == 1:
+                providers = list(reversed(pipeline_config.MEDIA_PROVIDER_PRIORITY))
+            else:
+                providers = None  # defaults to MEDIA_PROVIDER_PRIORITY as-is
 
-            result = _download_scene_media(
+            return _download_scene_media(
                 scene_id=scene_plan["scene_id"],
                 media_type=scene_plan.get("media_type", "image"),
                 keywords=keywords,
@@ -530,7 +553,19 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
                 negative_keywords=scene_plan.get("negative_keywords", []),
                 providers=providers,
             )
-            downloads.append(result)
+
+        if max_workers == 1 or len(media_plan) <= 1:
+            for index in range(len(media_plan)):
+                downloads[index] = _download_at(index, 0)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_index = {
+                    executor.submit(_download_at, index, index % max_workers): index
+                    for index in range(len(media_plan))
+                }
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    downloads[index] = future.result()
 
         total_candidates = sum(len(d["candidates"]) for d in downloads)
         logger.info(
