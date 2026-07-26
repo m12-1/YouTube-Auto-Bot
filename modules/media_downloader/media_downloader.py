@@ -352,10 +352,15 @@ def _fetch_candidates_for_scene(
     candidates_per_scene: int,
     negative_keywords: Optional[List[str]] = None,
     providers: Optional[List[str]] = None,
+    topic_fallback_queries: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Try each configured provider, in priority order, for the given
-    keywords until candidates are found.
+    keywords until candidates are found. If NOTHING is found for any of
+    the scene's own keywords on any provider, and `topic_fallback_queries`
+    is non-empty, make one more attempt: search for a still IMAGE using
+    those broader, topic-level queries (see `MEDIA_TOPIC_FALLBACK_ENABLED`
+    in `config.pipeline_config`) instead of returning empty-handed.
 
     Args:
         keywords: Ordered list of search keywords to try (primary first).
@@ -367,9 +372,14 @@ def _fetch_candidates_for_scene(
             provider on a given retry attempt instead of always
             restarting from `MEDIA_PROVIDER_PRIORITY[0]`. Defaults to
             `pipeline_config.MEDIA_PROVIDER_PRIORITY` when omitted.
+        topic_fallback_queries: Ordered, broader queries (most specific
+            first) to try as a last resort, forcing media_type="image",
+            when the scene's own keywords return nothing anywhere.
 
     Returns:
-        A dict with "provider" and "raw_candidates" (may be empty).
+        A dict with "provider" and "raw_candidates" (may be empty), plus
+        "media_type_override"/"is_topic_fallback" when the topic-level
+        fallback path is the one that succeeded.
     """
     negative_keywords = negative_keywords or []
     provider_order = providers or pipeline_config.MEDIA_PROVIDER_PRIORITY
@@ -411,7 +421,92 @@ def _fetch_candidates_for_scene(
                 )
                 continue
 
+    # Nothing at all for this scene's own keywords on any provider. Rather
+    # than leaving the scene with zero candidates, fall back to a broader,
+    # still on-topic IMAGE search -- forced to "image" regardless of the
+    # scene's planned media_type, since a still is exactly what the
+    # renderer's Ken Burns zoom is built for.
+    for query in topic_fallback_queries or []:
+        for provider in provider_order:
+            fetch_count = max(candidates_per_scene * 3, candidates_per_scene)
+            try:
+                if provider == "pexels":
+                    raw = _search_pexels(query, "image", fetch_count)
+                elif provider == "pixabay":
+                    raw = _search_pixabay(query, "image", fetch_count)
+                else:
+                    continue
+
+                if not raw:
+                    continue
+
+                clean_raw = []
+                for item in raw:
+                    hit = _matches_negative_keywords(_raw_candidate_text(item, provider), negative_keywords)
+                    if hit:
+                        logger.info(
+                            "Media Search (topic fallback) rejected candidate for "
+                            "query='%s' (matched negative keyword '%s')",
+                            query,
+                            hit,
+                        )
+                        continue
+                    clean_raw.append(item)
+
+                if clean_raw:
+                    logger.warning(
+                        "Media Search found nothing for this scene's own keywords; "
+                        "using topic-level image fallback (query='%s', provider=%s).",
+                        query,
+                        provider,
+                    )
+                    return {
+                        "provider": provider,
+                        "raw_candidates": clean_raw,
+                        "query": query,
+                        "media_type_override": "image",
+                        "is_topic_fallback": True,
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Media Search (topic fallback) failed for provider=%s query='%s': %s",
+                    provider,
+                    query,
+                    exc,
+                )
+                continue
+
     return {"provider": "unavailable", "raw_candidates": [], "query": keywords[0] if keywords else ""}
+
+
+def _topic_fallback_queries(scene_plan: Dict[str, Any], topic: str) -> List[str]:
+    """
+    Build the ordered, broader queries to try if a scene's own keywords
+    return nothing anywhere (see `_fetch_candidates_for_scene`): the
+    scene's environment combined with the topic first (a bit more
+    specific), then the bare topic (guaranteed non-empty as a last
+    resort, since `topic` is always required input).
+
+    Args:
+        scene_plan: One scene's media_plan entry.
+        topic: The overall video topic.
+
+    Returns:
+        A de-duplicated, order-preserving list of query strings.
+    """
+    if not pipeline_config.MEDIA_TOPIC_FALLBACK_ENABLED:
+        return []
+
+    topic = (topic or "").strip()
+    environment = (scene_plan.get("environment") or "").strip()
+
+    queries = []
+    if environment and topic:
+        queries.append(f"{environment} {topic}".strip())
+    if topic:
+        queries.append(topic)
+
+    return list(dict.fromkeys(q for q in queries if q))
 
 
 def _download_scene_media(
@@ -421,6 +516,7 @@ def _download_scene_media(
     candidates_per_scene: int,
     negative_keywords: Optional[List[str]] = None,
     providers: Optional[List[str]] = None,
+    topic_fallback_queries: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Fetch, normalize, and download candidate media for a single scene.
@@ -431,37 +527,47 @@ def _download_scene_media(
         keywords: Search keywords (primary + alternatives) to try.
         candidates_per_scene: How many candidates to request/return.
         providers: Optional provider override (see `_fetch_candidates_for_scene`).
+        topic_fallback_queries: Broader, topic-level queries to try as a
+            last resort if this scene's own keywords return nothing
+            anywhere (see `_fetch_candidates_for_scene`).
 
     Returns:
         A dict with "scene_id", "provider", and "candidates".
     """
     search_result = _fetch_candidates_for_scene(
-        keywords, media_type, candidates_per_scene, negative_keywords, providers
+        keywords, media_type, candidates_per_scene, negative_keywords, providers, topic_fallback_queries
     )
     provider = search_result["provider"]
     raw_candidates = search_result["raw_candidates"]
     query = search_result["query"]
+    is_topic_fallback = bool(search_result.get("is_topic_fallback"))
+    # The topic-level fallback always searches images (see
+    # `_fetch_candidates_for_scene`), regardless of what this scene was
+    # originally planned as ("video" or "image") -- use that for
+    # normalization/caching so the file extension and provider payload
+    # shape match what was actually downloaded.
+    effective_media_type = search_result.get("media_type_override", media_type)
 
     candidates: List[Dict[str, Any]] = []
 
     for raw in raw_candidates[:candidates_per_scene]:
         normalized = (
-            _normalize_pexels_candidate(raw, media_type)
+            _normalize_pexels_candidate(raw, effective_media_type)
             if provider == "pexels"
-            else _normalize_pixabay_candidate(raw, media_type)
+            else _normalize_pixabay_candidate(raw, effective_media_type)
         )
 
         if not normalized["url"]:
             continue
 
-        local_path = _cache_path(provider, media_type, query, normalized["candidate_id"])
+        local_path = _cache_path(provider, effective_media_type, query, normalized["candidate_id"])
         cached = os.path.exists(local_path)
 
         if not cached:
             try:
                 logger.info(
                     "Downloading %s candidate %s for scene=%s -> %s",
-                    media_type,
+                    effective_media_type,
                     normalized["candidate_id"],
                     scene_id,
                     local_path,
@@ -478,6 +584,12 @@ def _download_scene_media(
 
         normalized["local_path"] = local_path
         normalized["cached"] = cached
+        if is_topic_fallback:
+            # Tagged so ai_media_verification can apply its more lenient
+            # MEDIA_MIN_VERIFICATION_SCORE_TOPIC_FALLBACK bar, and
+            # video_composer can guarantee this scene a slow Ken Burns
+            # zoom instead of a static frame or a borrowed clip.
+            normalized["is_topic_fallback"] = True
         candidates.append(normalized)
 
     return {"scene_id": scene_id, "provider": provider, "candidates": candidates}
@@ -552,6 +664,7 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
                 candidates_per_scene=candidates_per_scene,
                 negative_keywords=scene_plan.get("negative_keywords", []),
                 providers=providers,
+                topic_fallback_queries=_topic_fallback_queries(scene_plan, topic),
             )
 
         if max_workers == 1 or len(media_plan) <= 1:
