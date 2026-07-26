@@ -12,6 +12,32 @@ If no API key is configured, or the call fails for any reason, callers
 receive a `GeminiUnavailableError` and are expected to fall back to a
 deterministic heuristic — the same pattern already used by
 `fact_collector` / `fact_verifier` / `competitor_analyzer` in Part 1.
+
+--------------------------------------------------------------------
+TWO-STAGE ROTATION (models first, then keys)
+--------------------------------------------------------------------
+Previously, callers passed a single `api_key: str` and the module only
+rotated across `_MODEL_FALLBACK_CHAIN` for THAT one key. Once every
+model in the chain hit a 429/quota error on that key, the whole call
+failed immediately — even though several other GEMINI_KEY_* secrets
+were configured and sitting idle. That is exactly the pattern in the
+run log: every single request (across many minutes) kept retrying the
+*same* model on the *same* key.
+
+`api_key` now also accepts a LIST of keys (or None, in which case the
+module auto-discovers every configured GEMINI_KEY_* secret via
+`get_gemini_api_keys()`). The rotation order is:
+
+    for each key in the key list (outer loop):
+        for each model in the model fallback chain (inner loop):
+            try the call
+            -> on 429 / quota / any failure: try the next MODEL first
+        -> only after ALL models failed on this key: move to the next KEY,
+           and restart the model chain from the top on the new key
+
+This matches "مداورة بين النماذج أولاً ثم بين المفاتيح": models are
+exhausted before ever switching keys, and each new key gets a full,
+fresh shot at every model.
 """
 
 from __future__ import annotations
@@ -40,6 +66,18 @@ _DEFAULT_TEXT_MODEL = _MODEL_FALLBACK_CHAIN[0]
 _DEFAULT_VISION_MODEL = _MODEL_FALLBACK_CHAIN[0]
 _API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
+# Every Gemini API key secret currently provisioned, in the priority
+# order they should be tried when no explicit key/list is given. Add or
+# reorder names here if more GEMINI_KEY_* secrets are provisioned later
+# -- nothing else in this file needs to change.
+_GEMINI_KEY_SECRET_NAMES: List[str] = [
+    "GEMINI_KEY_ADVANCED",
+    "GEMINI_KEY_FILTER",
+    "GEMINI_KEY_FILTER_2",
+    "GEMINI_KEY_IMAGE",
+    "GEMINI_KEY_LIGHT",
+]
+
 # Gemini's inline_data payload is base64 text embedded in the JSON request
 # body, so a hard cap protects both our own request size and the API's
 # limits. 15 MB is comfortably above any stock-photo/video-thumbnail JPEG.
@@ -60,11 +98,7 @@ def _post(url: str, payload: Dict[str, Any], timeout_seconds: float) -> Dict[str
     "Retry-After" header says (falling back to a fixed short wait if the
     header is absent) BEFORE raising, so the @retry decorator's next
     attempt actually lands after the quota window instead of immediately
-    re-hitting the same wall a second later. Without this, a 429 was
-    retried once after a flat 1s delay and then given up on entirely,
-    which is far shorter than Gemini's typical per-minute quota window --
-    exactly the pattern in the run log (two 429s, ~1s apart, then the
-    scene is abandoned).
+    re-hitting the same wall a second later.
 
     Args:
         url: Full request URL, including the API key query parameter.
@@ -95,6 +129,58 @@ def _post(url: str, payload: Dict[str, Any], timeout_seconds: float) -> Dict[str
     return response.json()
 
 
+def get_gemini_api_keys(*preferred: Optional[str]) -> List[str]:
+    """
+    Build the ordered list of Gemini API keys to rotate across.
+
+    Args:
+        *preferred: Optional explicit keys to try FIRST, in order (e.g. a
+            module may want `GEMINI_KEY_IMAGE` tried before the rest for
+            vision calls). Empty/None values are ignored.
+
+    Returns:
+        A de-duplicated, order-preserving list of all non-empty Gemini API
+        keys: the explicit `preferred` keys first, then every configured
+        `GEMINI_KEY_*` secret from `config.settings` (in the fixed
+        priority defined by `_GEMINI_KEY_SECRET_NAMES`) that wasn't
+        already included.
+    """
+    from config import settings  # local import to avoid any import cycle
+
+    ordered: List[str] = []
+    seen = set()
+
+    def _add(value: Optional[str]) -> None:
+        if value and value not in seen:
+            ordered.append(value)
+            seen.add(value)
+
+    for value in preferred:
+        _add(value)
+
+    for secret_name in _GEMINI_KEY_SECRET_NAMES:
+        _add(getattr(settings, secret_name, None))
+
+    return ordered
+
+
+def _normalize_api_keys(api_key: Optional[str | List[str]]) -> List[str]:
+    """
+    Normalize the `api_key` argument accepted by `generate_text` /
+    `generate_multimodal` into an ordered list of keys to rotate across.
+
+    - `None` -> auto-discover every configured GEMINI_KEY_* secret.
+    - a single string -> a one-key list (old call sites keep working
+      unchanged; they just won't have a fallback key to rotate to).
+    - a list -> used as-is, minus empty entries.
+    """
+    if api_key is None:
+        return get_gemini_api_keys()
+    if isinstance(api_key, str):
+        return [api_key] if api_key else []
+    return [key for key in api_key if key]
+
+
 def _generate_text_single_model(
     prompt: str,
     api_key: str,
@@ -103,10 +189,11 @@ def _generate_text_single_model(
     timeout_seconds: float,
 ) -> str:
     """
-    Call one specific Gemini model. Raises GeminiUnavailableError on any
-    failure (network, HTTP error, empty/malformed response) so the caller
-    in `generate_text` can decide whether to fall back to the next model
-    in the chain.
+    Call one specific Gemini model with one specific key. Raises
+    GeminiUnavailableError on any failure (network, HTTP error,
+    empty/malformed response) so the caller can decide whether to fall
+    back to the next model in the chain (and, once that chain is
+    exhausted, the next key).
     """
     url = f"{_API_BASE_URL}/{model}:generateContent?key={api_key}"
     payload = {
@@ -132,22 +219,29 @@ def _generate_text_single_model(
 
 def generate_text(
     prompt: str,
-    api_key: Optional[str],
+    api_key: Optional[str | List[str]],
     model: Optional[str | List[str]] = None,
     temperature: float = 0.7,
     timeout_seconds: float = 20.0,
 ) -> str:
     """
-    Generate text from a Gemini text model, trying a fallback chain of
-    lightweight/free-tier models for this same API key if one model is
-    unavailable (e.g. rate-limited with 429, retired with 404, or any
-    other transient error). Only once every model in the chain has
-    failed does this raise `GeminiUnavailableError`, at which point the
-    caller falls back to its own deterministic heuristic/template.
+    Generate text from a Gemini text model, with TWO-STAGE rotation:
+
+    1. Models first: try every model in `model` / `_MODEL_FALLBACK_CHAIN`
+       in order, on the current key.
+    2. Keys second: only once every model has failed on the current key
+       does this move on to the next key in `api_key` and restart the
+       model chain from the top.
+
+    Only once every model has failed on every key does this raise
+    `GeminiUnavailableError`, at which point the caller falls back to
+    its own deterministic heuristic/template.
 
     Args:
         prompt: The fully-rendered prompt text to send.
-        api_key: A Gemini API key from `config.settings`.
+        api_key: A single Gemini API key, a list of keys to rotate
+            across (tried in order), or None to auto-discover every
+            configured `GEMINI_KEY_*` secret via `get_gemini_api_keys()`.
         model: A single model name, a list of model names to try in
             order, or None to use the default fallback chain
             (`_MODEL_FALLBACK_CHAIN`).
@@ -158,10 +252,11 @@ def generate_text(
         The generated text.
 
     Raises:
-        GeminiUnavailableError: If `api_key` is missing, or every model
-            in the chain fails.
+        GeminiUnavailableError: If no API key is configured/given, or
+            every model fails on every key.
     """
-    if not api_key:
+    keys_to_try = _normalize_api_keys(api_key)
+    if not keys_to_try:
         raise GeminiUnavailableError("No Gemini API key configured for this call.")
 
     if model is None:
@@ -172,23 +267,38 @@ def generate_text(
         models_to_try = list(model)
 
     last_error: Optional[Exception] = None
-    for candidate_model in models_to_try:
-        try:
-            return _generate_text_single_model(
-                prompt, api_key, candidate_model, temperature, timeout_seconds
-            )
-        except GeminiUnavailableError as exc:
-            last_error = exc
-            logger.warning(
-                "Gemini model '%s' unavailable, trying next model in chain: %s",
-                candidate_model,
-                exc,
-            )
-            continue
+    for key_index, candidate_key in enumerate(keys_to_try):
+        for candidate_model in models_to_try:
+            try:
+                return _generate_text_single_model(
+                    prompt, candidate_key, candidate_model, temperature, timeout_seconds
+                )
+            except GeminiUnavailableError as exc:
+                last_error = exc
+                logger.warning(
+                    "Gemini model '%s' unavailable on key #%d, trying next model in chain: %s",
+                    candidate_model,
+                    key_index + 1,
+                    exc,
+                )
+                continue
 
-    logger.warning("Gemini text generation failed for all models tried: %s", last_error)
+        # Every model in the chain failed on this key -> rotate to the
+        # next key and retry the FULL model chain again from the top.
+        if key_index + 1 < len(keys_to_try):
+            logger.warning(
+                "All models exhausted on Gemini key #%d, rotating to key #%d.",
+                key_index + 1,
+                key_index + 2,
+            )
+
+    logger.warning(
+        "Gemini text generation failed for all models on all %d key(s): %s",
+        len(keys_to_try),
+        last_error,
+    )
     raise GeminiUnavailableError(
-        f"All Gemini models exhausted for this key: {last_error}"
+        f"All Gemini models exhausted on all configured keys: {last_error}"
     ) from last_error
 
 
@@ -199,15 +309,6 @@ def _fetch_image_bytes(
     """
     Download a candidate's image/thumbnail so it can actually be sent to
     Gemini as visual input.
-
-    THIS IS THE CORE FIX: previously, "vision" verification never
-    downloaded anything -- it just typed the URL as text into a prompt and
-    asked a plain text model to judge it. Gemini's text models cannot fetch
-    arbitrary remote URLs themselves, so every "visual" judgment
-    (main_subject_present, domain_match, style_match, continuity_ok, ...)
-    was pure guesswork based on the URL string, not the actual footage.
-    This function fetches the real bytes so they can be attached as
-    `inline_data` in the request.
 
     Args:
         image_url: A direct, publicly reachable URL to a JPEG/PNG image
@@ -262,9 +363,8 @@ def _generate_multimodal_single_model(
 ) -> str:
     """
     Call one specific Gemini model with BOTH the image bytes (as
-    inline_data) and the text prompt in the same request -- this is what
-    an actual vision call looks like, as opposed to `_generate_text_single_model`
-    which only ever sends text.
+    inline_data) and the text prompt in the same request, using one
+    specific key.
     """
     url = f"{_API_BASE_URL}/{model}:generateContent?key={api_key}"
     encoded = base64.b64encode(image_bytes).decode("ascii")
@@ -300,21 +400,27 @@ def generate_multimodal(
     prompt: str,
     image_bytes: bytes,
     mime_type: str,
-    api_key: Optional[str],
+    api_key: Optional[str | List[str]],
     model: Optional[str | List[str]] = None,
     temperature: float = 0.3,
     timeout_seconds: float = 20.0,
 ) -> str:
     """
     Generate text from a Gemini model given BOTH an image and a text
-    prompt, trying the same fallback chain of models used everywhere else
-    in this file (no new/different models introduced).
+    prompt, with the SAME two-stage rotation as `generate_text`: every
+    model is tried on the current key before moving on to the next key.
+
+    Args:
+        api_key: A single Gemini API key, a list of keys to rotate
+            across, or None to auto-discover every configured
+            `GEMINI_KEY_*` secret.
 
     Raises:
-        GeminiUnavailableError: If `api_key` is missing, or every model in
-            the chain fails.
+        GeminiUnavailableError: If no API key is configured/given, or
+            every model fails on every key.
     """
-    if not api_key:
+    keys_to_try = _normalize_api_keys(api_key)
+    if not keys_to_try:
         raise GeminiUnavailableError("No Gemini API key configured for this call.")
 
     if model is None:
@@ -325,30 +431,45 @@ def generate_multimodal(
         models_to_try = list(model)
 
     last_error: Optional[Exception] = None
-    for candidate_model in models_to_try:
-        try:
-            return _generate_multimodal_single_model(
-                prompt, image_bytes, mime_type, api_key, candidate_model, temperature, timeout_seconds
-            )
-        except GeminiUnavailableError as exc:
-            last_error = exc
-            logger.warning(
-                "Gemini model '%s' unavailable for multimodal call, trying next model in chain: %s",
-                candidate_model,
-                exc,
-            )
-            continue
+    for key_index, candidate_key in enumerate(keys_to_try):
+        for candidate_model in models_to_try:
+            try:
+                return _generate_multimodal_single_model(
+                    prompt, image_bytes, mime_type, candidate_key, candidate_model,
+                    temperature, timeout_seconds,
+                )
+            except GeminiUnavailableError as exc:
+                last_error = exc
+                logger.warning(
+                    "Gemini model '%s' unavailable for multimodal call on key #%d, "
+                    "trying next model in chain: %s",
+                    candidate_model,
+                    key_index + 1,
+                    exc,
+                )
+                continue
 
-    logger.warning("Gemini multimodal generation failed for all models tried: %s", last_error)
+        if key_index + 1 < len(keys_to_try):
+            logger.warning(
+                "All models exhausted (multimodal) on Gemini key #%d, rotating to key #%d.",
+                key_index + 1,
+                key_index + 2,
+            )
+
+    logger.warning(
+        "Gemini multimodal generation failed for all models on all %d key(s): %s",
+        len(keys_to_try),
+        last_error,
+    )
     raise GeminiUnavailableError(
-        f"All Gemini models exhausted for this key (multimodal): {last_error}"
+        f"All Gemini models exhausted on all configured keys (multimodal): {last_error}"
     ) from last_error
 
 
 def generate_vision_score(
     narration_sentence: str,
     image_url: str,
-    api_key: Optional[str],
+    api_key: Optional[str | List[str]],
     model: Optional[str | List[str]] = None,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
@@ -361,7 +482,8 @@ def generate_vision_score(
             illustrate.
         image_url: Publicly reachable URL (or thumbnail URL) of the
             candidate media.
-        api_key: A Gemini API key from `config.settings`.
+        api_key: A single key, a list of keys to rotate across, or None
+            to auto-discover every configured `GEMINI_KEY_*` secret.
         model: Gemini vision-capable model name.
         timeout_seconds: Request timeout, in seconds.
 
@@ -369,14 +491,12 @@ def generate_vision_score(
         A dict with "score" (0.0-1.0) and "reason" (str).
 
     Raises:
-        GeminiUnavailableError: If `api_key` is missing or the call fails.
+        GeminiUnavailableError: If no API key is configured/given, or the
+            call fails on every model/key combination.
     """
-    if not api_key:
+    if not _normalize_api_keys(api_key):
         raise GeminiUnavailableError("No Gemini API key configured for this call.")
 
-    # THE FIX: actually download the candidate's image and attach it as
-    # inline_data, instead of typing the URL into a text-only prompt (which
-    # a text model cannot fetch/see, so this used to always be a guess).
     image_bytes, mime_type = _fetch_image_bytes(image_url, timeout_seconds=timeout_seconds)
 
     prompt = (
@@ -408,7 +528,7 @@ def generate_vision_score(
 def generate_vision_verification(
     narration_sentence: str,
     image_url: str,
-    api_key: Optional[str],
+    api_key: Optional[str | List[str]],
     required_objects: Optional[List[str]] = None,
     environment: Optional[str] = None,
     forbidden_objects: Optional[List[str]] = None,
@@ -427,12 +547,11 @@ def generate_vision_verification(
     inside the video's scientific domain, keeps visual continuity with
     the surrounding scenes, doesn't mix visual styles (e.g. a cartoon or
     vector clip inside a Real Footage video), doesn't look like random
-    generic stock footage, and is professionally shot. This is what lets
-    a black-hole video that scored 8.5/10 become the consistency bar for
-    every other topic, instead of score varying 3.5-8.5 depending on how
-    literally a word got matched.
+    generic stock footage, and is professionally shot.
 
     Args:
+        api_key: A single key, a list of keys to rotate across, or None
+            to auto-discover every configured `GEMINI_KEY_*` secret.
         required_visual_style: The video's locked canonical visual style
             (one of `pipeline_config.MEDIA_STYLE_CATEGORIES`, e.g.
             "Real Footage"), if known. Optional and backward compatible:
@@ -456,22 +575,12 @@ def generate_vision_verification(
         }
 
     Raises:
-        GeminiUnavailableError: If `api_key` is missing or the call fails.
+        GeminiUnavailableError: If no API key is configured/given, or the
+            call fails on every model/key combination.
     """
-    if not api_key:
+    if not _normalize_api_keys(api_key):
         raise GeminiUnavailableError("No Gemini API key configured for this call.")
 
-    # THE ROOT-CAUSE FIX: this used to hand Gemini the media URL as a plain
-    # text string and call the TEXT-only endpoint (`generate_text`). Gemini
-    # cannot fetch arbitrary remote URLs on its own, so every "visual"
-    # verdict below (main_subject_present, domain_match, style_match,
-    # continuity_ok, looks_generic_stock, cinematic_quality...) was being
-    # answered from the URL's slug/keywords and prompt context alone --
-    # never from the actual footage. That is exactly why narration/subtitle
-    # sync (a deterministic, non-AI stage) scored well while visual match
-    # (entirely dependent on this "fake vision" call) scored poorly and
-    # inconsistently. We now download the real image/thumbnail bytes and
-    # attach them as inline_data so the model actually sees the frame.
     image_bytes, mime_type = _fetch_image_bytes(image_url, timeout_seconds=timeout_seconds)
 
     required_str = ", ".join(required_objects) if required_objects else "(not specified)"
@@ -616,8 +725,14 @@ def generate_vision_verification(
 def pick_api_key(*candidates: Optional[str]) -> Optional[str]:
     """
     Pick the first non-empty API key from a prioritized list of
-    candidates. Lets callers implement key rotation / fallback across
-    e.g. GEMINI_KEY_ADVANCED, GEMINI_KEY_FILTER, GEMINI_KEY_FILTER_2.
+    candidates.
+
+    NOTE: kept for backward compatibility with call sites that only want
+    a single key up front (e.g. to decide whether a feature is enabled
+    at all). For actual rotation across multiple keys during a call,
+    pass a LIST to `api_key` in `generate_text` / `generate_multimodal`
+    (or `None` to auto-discover all configured keys via
+    `get_gemini_api_keys()`) instead of calling this function.
 
     Args:
         *candidates: API key values in priority order.
