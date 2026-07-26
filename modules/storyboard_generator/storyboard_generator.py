@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from config import pipeline_config, settings
-from shared.gemini_client import GeminiUnavailableError, generate_text, pick_api_key
+from shared.gemini_client import GeminiUnavailableError, generate_text, get_gemini_api_keys
 from shared.json_contract import ContractError, build_response, require_keys
 from shared.logger import get_logger
 from shared.retry import retry
@@ -294,17 +294,17 @@ def _analyze_topic_with_ai(topic: str, narration: str) -> Dict[str, Any]:
     Raises:
         GeminiUnavailableError: If no key is configured or the call/parse fails.
     """
-    api_key = pick_api_key(
+    api_keys = get_gemini_api_keys(
         settings.GEMINI_KEY_ADVANCED,
         settings.GEMINI_KEY_FILTER,
         settings.GEMINI_KEY_FILTER_2,
         settings.GEMINI_KEY_LIGHT,
     )
-    if not api_key:
+    if not api_keys:
         raise GeminiUnavailableError("No Gemini API key configured for topic analysis.")
 
     prompt = _TOPIC_PROMPT_PATH.read_text(encoding="utf-8").format(topic=topic, narration=narration)
-    text = generate_text(prompt, api_key=api_key, temperature=0.3)
+    text = generate_text(prompt, api_key=api_keys, temperature=0.3)
 
     try:
         cleaned = text.strip().strip("`")
@@ -358,13 +358,13 @@ def _analyze_scene_with_ai(
     Raises:
         GeminiUnavailableError: If no key is configured or the call/parse fails.
     """
-    api_key = pick_api_key(
+    api_keys = get_gemini_api_keys(
         settings.GEMINI_KEY_LIGHT,
         settings.GEMINI_KEY_FILTER,
         settings.GEMINI_KEY_FILTER_2,
         settings.GEMINI_KEY_ADVANCED,
     )
-    if not api_key:
+    if not api_keys:
         raise GeminiUnavailableError("No Gemini API key configured for scene analysis.")
 
     prompt = _load_prompt_template().format(
@@ -376,7 +376,7 @@ def _analyze_scene_with_ai(
         preferred_environment=topic_context.get("preferred_environment", "") or "(not specified)",
         topic_forbidden_domains=", ".join(topic_context.get("forbidden_domains", [])) or "(none)",
     )
-    text = generate_text(prompt, api_key=api_key, temperature=0.3)
+    text = generate_text(prompt, api_key=api_keys, temperature=0.3)
 
     try:
         cleaned = text.strip().strip("`")
