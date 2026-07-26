@@ -127,6 +127,12 @@ MEDIA_TOPIC_FALLBACK_ENABLED: bool = (
 MEDIA_MIN_WIDTH: int = _get_env_int("MEDIA_MIN_WIDTH", 1080)
 MEDIA_MIN_HEIGHT: int = _get_env_int("MEDIA_MIN_HEIGHT", 1920)
 MEDIA_REQUIRED_ORIENTATION: str = _get_env("MEDIA_REQUIRED_ORIENTATION", "portrait") or "portrait"
+# Max allowed upscale factor when fitting a source clip's native height
+# to the render canvas height (canvas_height / source_height). Above
+# this the footage would visibly soften once stretched to fill the
+# 1080x1920 canvas, so it's rejected even if width/height nominally
+# clear MEDIA_MIN_WIDTH/HEIGHT.
+MEDIA_MAX_UPSCALE_FACTOR: float = _get_env_float("MEDIA_MAX_UPSCALE_FACTOR", 1.8)
 MEDIA_MIN_DURATION_SECONDS: float = _get_env_float("MEDIA_MIN_DURATION_SECONDS", 2.0)
 MEDIA_BLUR_THRESHOLD: float = _get_env_float("MEDIA_BLUR_THRESHOLD", 100.0)
 MEDIA_BRIGHTNESS_MIN: float = _get_env_float("MEDIA_BRIGHTNESS_MIN", 25.0)
