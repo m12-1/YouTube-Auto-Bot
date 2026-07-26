@@ -65,7 +65,11 @@ jobs:
     # PEXELS_API_KEY, PIXABAY_API_KEY
     # YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET
     # YOUTUBE_OAUTH_REFRESH_TOKEN
-    # All are optional — modules fall back gracefully when a key is missing.
+    # All are optional — modules fall back gracefully when a key is missing,
+    # EXCEPT the 5 Gemini keys should all be set to DISTINCT values for
+    # shared/gemini_client.py's key-rotation to actually have keys to
+    # rotate to (see the "Check secrets" step below, which fails the run
+    # early if any Gemini key is missing or duplicated).
 
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +105,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # ── verify secrets before burning CI minutes on the pipeline ────
+      # Fails fast (and prints a safe SET/MISSING/duplicate report — never
+      # the actual values) instead of letting the pipeline run for 40+
+      # minutes hitting 429s with a key that has nothing to rotate to.
+      - name: Check secrets
+        env:
+          # Gemini
+          GEMINI_KEY_ADVANCED: ${{ secrets.GEMINI_KEY_ADVANCED }}
+          GEMINI_KEY_FILTER:   ${{ secrets.GEMINI_KEY_FILTER }}
+          GEMINI_KEY_FILTER_2: ${{ secrets.GEMINI_KEY_FILTER_2 }}
+          GEMINI_KEY_IMAGE:    ${{ secrets.GEMINI_KEY_IMAGE }}
+          GEMINI_KEY_LIGHT:    ${{ secrets.GEMINI_KEY_LIGHT }}
+          # Media providers
+          PEXELS_API_KEY:   ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY:  ${{ secrets.PIXABAY_API_KEY }}
+          # YouTube OAuth
+          YOUTUBE_OAUTH_CLIENT_ID:      ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
+          YOUTUBE_OAUTH_CLIENT_SECRET:  ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
+          YOUTUBE_OAUTH_REFRESH_TOKEN:  ${{ secrets.YOUTUBE_OAUTH_REFRESH_TOKEN }}
+        run: python check_secrets.py
 
       # ── resolve inputs (workflow_dispatch vs schedule) ──────────────
       - name: Resolve run parameters
