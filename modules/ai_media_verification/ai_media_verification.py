@@ -388,6 +388,8 @@ def _verify_scene(
     threshold = (
         pipeline_config.MEDIA_MIN_VERIFICATION_SCORE_HEURISTIC
         if best_source == "heuristic_fallback"
+        else pipeline_config.MEDIA_MIN_VERIFICATION_SCORE_TOPIC_FALLBACK
+        if best_candidate.get("is_topic_fallback")
         else pipeline_config.MEDIA_MIN_VERIFICATION_SCORE
     )
     if best_score < threshold:
