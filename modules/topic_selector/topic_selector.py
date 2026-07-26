@@ -22,7 +22,7 @@ from config import settings
 from shared.json_contract import BaseModuleInput, BaseModuleOutput, module_contract
 from shared.logger import get_logger
 from shared.path_utils import safe_path, PROJECT_ROOT
-from shared.gemini_client import generate_text, GeminiUnavailableError, pick_api_key
+from shared.gemini_client import generate_text, GeminiUnavailableError, get_gemini_api_keys
 
 logger = get_logger(__name__)
 
@@ -76,8 +76,8 @@ def _generate_base_topic(category: str, past_topics: List[str]) -> str:
 
 def _refine_topic_with_gemini(base_topic: str, category: str) -> str:
     """Use Gemini to refine a basic idea into a highly engaging YouTube Short topic."""
-    api_key = pick_api_key(settings.GEMINI_KEY_ADVANCED, settings.GEMINI_KEY_FILTER)
-    if not api_key:
+    api_keys = get_gemini_api_keys(settings.GEMINI_KEY_ADVANCED, settings.GEMINI_KEY_FILTER)
+    if not api_keys:
         return f"{base_topic.title()} - Explained in 60 Seconds"
 
     prompt = (
@@ -90,7 +90,7 @@ def _refine_topic_with_gemini(base_topic: str, category: str) -> str:
     )
 
     try:
-        response_text = generate_text(prompt, api_key=api_key, timeout_seconds=15)
+        response_text = generate_text(prompt, api_key=api_keys, timeout_seconds=15)
         return response_text.strip().strip('"\'')
     except GeminiUnavailableError as e:
         logger.warning(f"AI topic refinement failed: {e}")
