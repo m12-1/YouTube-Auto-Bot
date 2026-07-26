@@ -95,6 +95,15 @@ MEDIA_PROVIDER_PRIORITY: List[str] = _get_env_list(
     "MEDIA_PROVIDER_PRIORITY", ["pexels", "pixabay"]
 )
 
+# How many scenes media_downloader fetches concurrently (worker threads).
+# Each worker is assigned a "track": track 0 tries MEDIA_PROVIDER_PRIORITY
+# in its configured order (e.g. Pexels first), track 1 tries it reversed
+# (e.g. Pixabay first), and so on -- so with the default of 2 workers, two
+# scenes are fetched at the same time, each primarily hitting a different
+# provider, instead of one scene at a time always starting with the same
+# site. Set to 1 to restore the old fully-sequential behavior.
+MEDIA_DOWNLOAD_MAX_WORKERS: int = _get_env_int("MEDIA_DOWNLOAD_MAX_WORKERS", 2)
+
 # ---------------------------------------------------------------------------
 # Media Quality Filter
 # ---------------------------------------------------------------------------
@@ -380,6 +389,19 @@ MEDIA_MIN_VERIFICATION_SCORE: float = _get_env_float("MEDIA_MIN_VERIFICATION_SCO
 MEDIA_MIN_VERIFICATION_SCORE_HEURISTIC: float = _get_env_float(
     "MEDIA_MIN_VERIFICATION_SCORE_HEURISTIC", 0.35
 )
+
+# How many scenes ai_media_verification verifies concurrently (worker
+# threads). This does NOT add, remove, or change any Gemini model --
+# `shared.gemini_client` already rotates across every configured
+# GEMINI_KEY_* secret and the same fixed model chain on every call; this
+# only runs that existing per-scene call from more than one thread at
+# once. Each worker is assigned a "track" that rotates its starting point
+# in the Gemini key list (track 0 starts at key #1, track 1 starts at key
+# #2, etc.), so with the default of 2 workers, two scenes are verified at
+# the same time and each one primarily lands on a different key instead
+# of both threads racing for the same key first. Set to 1 to restore the
+# old fully-sequential behavior.
+AI_VERIFICATION_MAX_WORKERS: int = _get_env_int("AI_VERIFICATION_MAX_WORKERS", 2)
 
 # ---------------------------------------------------------------------------
 # AI Media Verification
