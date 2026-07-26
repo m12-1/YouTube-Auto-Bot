@@ -14,6 +14,16 @@ Write a YouTube Shorts / TikTok script with:
    description of what is shown and which part of the narration it
    covers.
 
+TOPIC LOCK (critical): every sentence in "narration" must be directly
+about "{topic}". The "Verified facts" above may include a fact that
+came from the wrong source page and is NOT actually about this topic
+(e.g. a musician, a TV show, an unrelated event) -- if a fact does not
+clearly and directly support "{topic}", DO NOT use it and do not
+mention the person/subject/entity it refers to at all, even in
+passing. Never introduce a real named person, band, show, or unrelated
+event that isn't already part of "{topic}" itself. When in doubt, leave
+a fact out rather than force it into the script.
+
 Respond ONLY with JSON in this exact shape:
 {{
   "hook": "...",
