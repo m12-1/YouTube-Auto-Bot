@@ -19,7 +19,7 @@ from pydantic import Field
 from config import settings
 from shared.json_contract import BaseModuleInput, BaseModuleOutput, module_contract
 from shared.logger import get_logger
-from shared.gemini_client import generate_text, GeminiUnavailableError, pick_api_key
+from shared.gemini_client import generate_text, GeminiUnavailableError, get_gemini_api_keys
 
 logger = get_logger(__name__)
 
@@ -44,8 +44,8 @@ def _verify_fact_with_ai(fact: Dict[str, Any], topic: str) -> float:
     """
     Verify a single fact using Gemini.
     """
-    api_key = pick_api_key(settings.GEMINI_KEY_ADVANCED, settings.GEMINI_KEY_FILTER)
-    if not api_key:
+    api_keys = get_gemini_api_keys(settings.GEMINI_KEY_ADVANCED, settings.GEMINI_KEY_FILTER)
+    if not api_keys:
         logger.warning("No Gemini API key available for fact verification. Falling back to confidence 0.5")
         return 0.5
 
@@ -59,7 +59,7 @@ def _verify_fact_with_ai(fact: Dict[str, Any], topic: str) -> float:
     )
 
     try:
-        response_text = generate_text(prompt, api_key=api_key)
+        response_text = generate_text(prompt, api_key=api_keys)
         cleaned = response_text.strip().strip("`").replace("json\n", "").strip()
         parsed = json.loads(cleaned)
         confidence = float(parsed.get("confidence", 0.5))
