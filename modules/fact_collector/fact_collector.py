@@ -35,6 +35,39 @@ class FactCollectorInput(BaseModuleInput):
 class FactCollectorOutput(BaseModuleOutput):
     data: Dict[str, Any]
 
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "of", "in", "on", "at",
+    "to", "for", "and", "or", "but", "why", "how", "what", "when", "where",
+    "does", "do", "did", "you", "your", "it", "its", "this", "that", "with",
+    "until", "look", "exist", "reality", "not", "no", "yes", "can", "will",
+}
+
+
+def _topic_keywords(topic: str) -> set:
+    """Significant (non-stopword, length>=4) words from the topic string."""
+    words = [w.strip(".,!?'\"").lower() for w in topic.split()]
+    return {w for w in words if len(w) >= 4 and w not in _STOPWORDS}
+
+
+def _is_relevant_title(title: str, topic_keywords: set) -> bool:
+    """
+    True if a Wikipedia page title shares at least one significant word
+    with the topic. This exists specifically to catch cases like topic
+    "Why Reality Doesn't Exist Until You Look" (a quantum-physics/
+    observer-effect topic) where Wikipedia's full-text search engine can
+    rank an unrelated page -- e.g. a "reality" TV show or celebrity
+    biography -- as the #1 hit purely because it contains the word
+    "reality", even though it has nothing to do with the actual topic.
+    Blindly using search_results[0] without this check is what let an
+    entirely off-topic page (and its facts) flow straight into the
+    script, causing the LLM to write about it as if it were relevant.
+    """
+    if not topic_keywords:
+        return True
+    title_words = {w.strip(".,!?'\"").lower() for w in title.split()}
+    return bool(title_words & topic_keywords)
+
+
 @retry(max_attempts=3, exceptions=(requests.RequestException,))
 def _collect_raw_facts(topic: str, max_facts: int) -> List[Dict[str, Any]]:
     """
@@ -46,6 +79,7 @@ def _collect_raw_facts(topic: str, max_facts: int) -> List[Dict[str, Any]]:
         "format": "json",
         "list": "search",
         "srsearch": topic,
+        "srlimit": 5,
         "utf8": 1,
     }
     
@@ -58,8 +92,27 @@ def _collect_raw_facts(topic: str, max_facts: int) -> List[Dict[str, Any]]:
     if not search_results:
         return []
 
-    # Get the title of the top result
-    top_title = search_results[0]["title"]
+    # Walk the top results (not just [0]) and pick the FIRST one whose
+    # title is actually relevant to the topic. If none of them are
+    # relevant, bail out to the deterministic fallback rather than risk
+    # feeding an off-topic Wikipedia page into the script.
+    topic_keywords = _topic_keywords(topic)
+    top_title = None
+    for result in search_results:
+        candidate_title = result.get("title", "")
+        if _is_relevant_title(candidate_title, topic_keywords):
+            top_title = candidate_title
+            break
+
+    if top_title is None:
+        logger.warning(
+            "No Wikipedia search result for topic='%s' looked topically relevant "
+            "(top candidates: %s); skipping Wikipedia and using fallback facts "
+            "instead of risking an off-topic page.",
+            topic,
+            [r.get("title") for r in search_results],
+        )
+        return []
     
     extract_params = {
         "action": "query",
