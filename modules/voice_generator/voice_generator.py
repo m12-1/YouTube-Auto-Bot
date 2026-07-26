@@ -344,6 +344,44 @@ def _derive_sentence_timings(
     return sentence_timings
 
 
+def _sanitize_word_timings_text(narration: str, word_timings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Replace each word_timing's spelled-out "word" with the corresponding
+    word from the ORIGINAL narration text, keeping Edge-TTS's timestamps
+    untouched.
+
+    Edge-TTS's WordBoundary events are reliable for WHEN a word is
+    spoken (offset/duration), but its "text" field for WHAT the word is
+    can come back corrupted on some rate/pitch SSML combinations --
+    typically the tail of one word bleeding/duplicating into the next
+    (e.g. "reality" + "show" arriving as "realtyshowow", "exist"
+    arriving as "existt"). Since the actual word spelling is already
+    fully known from the narration script itself, there's no reason to
+    trust Edge-TTS's echoed text for spelling at all -- only its timing.
+
+    When the word COUNT matches exactly (the common case), this is a
+    simple 1:1 substitution. When it doesn't (Edge-TTS occasionally
+    splits/merges a token differently than a plain whitespace split),
+    the original Edge-TTS text is left as-is for the mismatched range
+    rather than guessing, since a naive re-slice could introduce a
+    different kind of misalignment.
+    """
+    narration_words = narration.split()
+    if len(narration_words) != len(word_timings):
+        logger.warning(
+            "Word count mismatch between narration (%d words) and Edge-TTS "
+            "word_timings (%d words); skipping text sanitization for this run "
+            "(timestamps are still used as-is).",
+            len(narration_words),
+            len(word_timings),
+        )
+        return word_timings
+
+    for timing, narration_word in zip(word_timings, narration_words):
+        timing["word"] = narration_word
+    return word_timings
+
+
 def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     Generate narration audio and word/sentence timings for a script.
@@ -380,6 +418,7 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         source = "edge_tts"
         try:
             word_timings = _generate_with_edge_tts(narration, voice, rate, pitch, output_path)
+            word_timings = _sanitize_word_timings_text(narration, word_timings)
             sentence_timings = _derive_sentence_timings(narration, word_timings)
             if pipeline_config.VOICE_LOUDNESS_NORMALIZATION_ENABLED:
                 _normalize_loudness(output_path, pipeline_config.VOICE_TARGET_LUFS)
