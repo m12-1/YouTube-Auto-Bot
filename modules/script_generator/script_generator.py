@@ -57,7 +57,7 @@ import os
 from typing import Any, Dict, List
 
 from config import pipeline_config, settings
-from shared.gemini_client import GeminiUnavailableError, generate_text, pick_api_key
+from shared.gemini_client import GeminiUnavailableError, generate_text, get_gemini_api_keys
 from shared.json_contract import ContractError, build_response, require_keys
 from shared.logger import get_logger
 from shared.retry import retry
@@ -145,8 +145,8 @@ def _generate_with_ai(
     Raises:
         GeminiUnavailableError: If no key is configured or the call fails.
     """
-    api_key = pick_api_key(settings.GEMINI_KEY_ADVANCED, settings.GEMINI_KEY_LIGHT)
-    if not api_key:
+    api_keys = get_gemini_api_keys(settings.GEMINI_KEY_ADVANCED, settings.GEMINI_KEY_LIGHT)
+    if not api_keys:
         raise GeminiUnavailableError("No Gemini API key configured for script_generator.")
 
     template = _load_prompt_template()
@@ -158,7 +158,7 @@ def _generate_with_ai(
         target_word_count=pipeline_config.SCRIPT_TARGET_WORD_COUNT,
     )
 
-    raw_text = generate_text(prompt, api_key=api_key)
+    raw_text = generate_text(prompt, api_key=api_keys)
     cleaned = raw_text.strip().strip("`")
     if cleaned.lower().startswith("json"):
         cleaned = cleaned[4:].strip()
