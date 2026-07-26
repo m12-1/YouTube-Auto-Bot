@@ -6,6 +6,12 @@ Review the script below for:
 - Viewer retention (does every sentence earn the next?)
 - Simplicity (no jargon, no run-on sentences)
 - No duplicated ideas
+- Topic drift: every sentence must be directly about the script's own
+  topic/subject. If you find any sentence that introduces an unrelated
+  named person, band, TV show, or event that has nothing to do with the
+  rest of the script (a sign a stray, irrelevant "fact" was fed in),
+  DELETE that sentence entirely and smoothly reconnect the surrounding
+  narration -- do not just soften the wording, remove it.
 
 Original script (JSON):
 {script_json}
