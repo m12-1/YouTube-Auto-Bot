@@ -73,6 +73,7 @@ output_json:
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import pipeline_config, settings
@@ -151,6 +152,29 @@ def _keyword_overlap_score(
     return round(score, 3), reason
 
 
+def _rotate_keys(api_keys: List[str], track: int) -> List[str]:
+    """
+    Rotate the ordered key list so a given worker "track" starts from a
+    different key than the others, instead of every concurrent scene
+    racing for the same first key. This is a pure re-ordering of the
+    SAME keys/models already configured -- no key is added, removed, or
+    swapped, and the full fallback chain is still tried if the rotated
+    starting key is unavailable/rate-limited.
+
+    Args:
+        api_keys: The full ordered list of configured Gemini keys.
+        track: Worker track index (0, 1, 2, ...), typically
+            `scene_index % AI_VERIFICATION_MAX_WORKERS`.
+
+    Returns:
+        The same keys, rotated so index `track % len(api_keys)` comes first.
+    """
+    if not api_keys or track <= 0:
+        return api_keys
+    offset = track % len(api_keys)
+    return api_keys[offset:] + api_keys[:offset]
+
+
 @retry(max_attempts=2, exceptions=(GeminiUnavailableError,))
 def _score_candidate_with_ai(
     narration: str,
@@ -164,6 +188,7 @@ def _score_candidate_with_ai(
     next_scene: str,
     required_visual_style: str = "",
     forbidden_styles: Optional[List[str]] = None,
+    key_track: int = 0,
 ) -> Dict[str, Any]:
     """
     Score a single candidate using multi-signal Gemini vision scoring:
@@ -190,6 +215,8 @@ def _score_candidate_with_ai(
     )
     if not api_keys:
         raise GeminiUnavailableError("No Gemini API key configured for ai_media_verification.")
+
+    api_keys = _rotate_keys(api_keys, key_track)
 
     # THE FIX: prefer "thumbnail_url" (always a real JPEG/PNG image, set by
     # media_downloader for both video and image candidates) over "url",
@@ -231,6 +258,7 @@ def _score_candidate(
     next_scene: str,
     required_visual_style: str = "",
     forbidden_styles: Optional[List[str]] = None,
+    key_track: int = 0,
 ) -> Tuple[Dict[str, Any], str]:
     """
     Score a candidate: reject instantly (no AI call) if a forbidden
@@ -261,6 +289,7 @@ def _score_candidate(
             next_scene,
             required_visual_style,
             forbidden_styles,
+            key_track,
         )
         return result, "ai"
     except GeminiUnavailableError as exc:
@@ -286,6 +315,7 @@ def _verify_scene(
     next_scene: str,
     required_visual_style: str = "",
     forbidden_styles: Optional[List[str]] = None,
+    key_track: int = 0,
 ) -> Dict[str, Any]:
     """
     Score all accepted candidates for one scene and pick the best one
@@ -307,6 +337,9 @@ def _verify_scene(
         next_scene: Next scene's narration (Visual Consistency Engine).
         required_visual_style: This scene's locked canonical visual style.
         forbidden_styles: Style names that must NOT appear for this video.
+        key_track: Worker track index used to rotate which Gemini key this
+            scene's calls start from, so concurrent scenes spread across
+            keys instead of racing for the same one (see `_rotate_keys`).
 
     Returns:
         A verification result dict for this scene.
@@ -335,6 +368,7 @@ def _verify_scene(
             next_scene,
             required_visual_style,
             forbidden_styles,
+            key_track,
         )
         scored.append((candidate, score_result, source))
 
@@ -434,29 +468,54 @@ def run(input_json: Dict[str, Any]) -> Dict[str, Any]:
         else:
             filtered_by_scene = {entry["scene_id"]: entry for entry in filtered}
 
-        verifications: List[Dict[str, Any]] = []
-        for index, scene in enumerate(storyboard):
+        # Scenes are independent of each other (each only looks at its own
+        # candidates plus the neighboring scenes' narration text, which is
+        # read-only), so they're verified concurrently instead of one at a
+        # time. This is the main reason a run could take 20-30+ minutes:
+        # every candidate of every scene was a separate, sequential Gemini
+        # call. `AI_VERIFICATION_MAX_WORKERS` (default 2) controls how many
+        # scenes run at once; each worker's calls start from a different
+        # Gemini key via `key_track` (see `_rotate_keys`) so two scenes
+        # verifying at the same time don't both race for the same key
+        # first. No model, key, or scoring logic changes -- only the
+        # scheduling of the exact same per-scene work.
+        max_workers = max(1, pipeline_config.AI_VERIFICATION_MAX_WORKERS)
+        verifications: List[Optional[Dict[str, Any]]] = [None] * len(storyboard)
+
+        def _verify_at(index: int) -> Dict[str, Any]:
+            scene = storyboard[index]
             scene_id = scene["scene_id"]
             scene_filtered = filtered_by_scene.get(scene_id, {})
             accepted_candidates = scene_filtered.get("accepted_candidates", [])
             previous_scene = storyboard[index - 1].get("narration", "") if index > 0 else ""
             next_scene = storyboard[index + 1].get("narration", "") if index + 1 < len(storyboard) else ""
-            verifications.append(
-                _verify_scene(
-                    scene_id,
-                    scene.get("narration", ""),
-                    accepted_candidates,
-                    scene.get("objects", []),
-                    scene.get("environment", ""),
-                    scene.get("forbidden", []),
-                    topic,
-                    scientific_domain,
-                    previous_scene,
-                    next_scene,
-                    scene.get("visual_style", "") or topic_context.get("visual_style_locked", ""),
-                    forbidden_styles,
-                )
+            return _verify_scene(
+                scene_id,
+                scene.get("narration", ""),
+                accepted_candidates,
+                scene.get("objects", []),
+                scene.get("environment", ""),
+                scene.get("forbidden", []),
+                topic,
+                scientific_domain,
+                previous_scene,
+                next_scene,
+                scene.get("visual_style", "") or topic_context.get("visual_style_locked", ""),
+                forbidden_styles,
+                index % max_workers,
             )
+
+        if max_workers == 1 or len(storyboard) <= 1:
+            for index in range(len(storyboard)):
+                verifications[index] = _verify_at(index)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_index = {
+                    executor.submit(_verify_at, index): index for index in range(len(storyboard))
+                }
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    verifications[index] = future.result()
 
         scenes_without_media = sum(1 for v in verifications if v["best_media"] is None)
         logger.info(
