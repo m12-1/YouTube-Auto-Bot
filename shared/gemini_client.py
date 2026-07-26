@@ -38,13 +38,19 @@ module auto-discovers every configured GEMINI_KEY_* secret via
 This matches "مداورة بين النماذج أولاً ثم بين المفاتيح": models are
 exhausted before ever switching keys, and each new key gets a full,
 fresh shot at every model.
+
+Each model gets exactly ONE attempt (see `_post`): a 429/quota error
+(or any other HTTP error) is not retried or slept on -- it immediately
+moves to the next model. Only a genuine network hiccup (timeout /
+connection error) gets a single quick retry, since that's transient
+and unrelated to quota. This avoids wasting ~20s per model re-hitting
+an already-exhausted quota before falling back.
 """
 
 from __future__ import annotations
 
 import base64
 import mimetypes
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -89,16 +95,26 @@ class GeminiUnavailableError(RuntimeError):
     """Raised when the Gemini API cannot be reached or returns an error."""
 
 
-@retry(max_attempts=3, base_delay_seconds=2.0, exceptions=(requests.RequestException,))
+@retry(
+    max_attempts=2,
+    base_delay_seconds=1.0,
+    exceptions=(requests.ConnectionError, requests.Timeout),
+)
 def _post(url: str, payload: Dict[str, Any], timeout_seconds: float) -> Dict[str, Any]:
     """
-    Perform the raw HTTP POST to the Gemini API.
+    Perform the raw HTTP POST to the Gemini API. ONE attempt per model:
 
-    On a 429 (rate limit / quota), sleeps for whatever the API's own
-    "Retry-After" header says (falling back to a fixed short wait if the
-    header is absent) BEFORE raising, so the @retry decorator's next
-    attempt actually lands after the quota window instead of immediately
-    re-hitting the same wall a second later.
+    - A 429 (rate limit / quota) or any other HTTP error status is NOT
+      retried and NOT slept on here -- it's logged and raised straight
+      away, so the model-rotation loop in `generate_text` /
+      `generate_multimodal` can move on to the NEXT MODEL immediately
+      instead of burning ~20s per model re-hitting the same exhausted
+      quota. Waiting for a quota to free up only makes sense once every
+      model on every key has already been tried and failed -- doing it
+      per-attempt here was the main source of wasted time.
+    - Only genuine network hiccups (`ConnectionError` / `Timeout`) get a
+      single quick retry via `@retry`, since those are transient and
+      unrelated to quota.
 
     Args:
         url: Full request URL, including the API key query parameter.
@@ -109,22 +125,12 @@ def _post(url: str, payload: Dict[str, Any], timeout_seconds: float) -> Dict[str
         The parsed JSON response body.
 
     Raises:
-        requests.RequestException: On network-level failures (retried).
+        requests.RequestException: On any HTTP error status (429, 5xx, ...)
+            or network failure that survives the single retry above.
     """
     response = requests.post(url, json=payload, timeout=timeout_seconds)
     if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After")
-        try:
-            wait_seconds = float(retry_after) if retry_after else 5.0
-        except ValueError:
-            wait_seconds = 5.0
-        logger.warning(
-            "Gemini rate-limited (429). Waiting %.1fs before the next attempt "
-            "(Retry-After header: %s).",
-            wait_seconds,
-            retry_after or "not provided",
-        )
-        time.sleep(wait_seconds)
+        logger.warning("Gemini rate-limited (429) -- moving to the next model immediately.")
     response.raise_for_status()
     return response.json()
 
