@@ -68,7 +68,13 @@ MODULE_NAME = "quality_inspector"
 #   PASS_WITH_WARNINGS: ratio ≤ _WARN_MAX_RATIO  (a few placeholders, still usable)
 #   FAIL:               ratio >  _WARN_MAX_RATIO  (too degraded to publish)
 _PASS_MAX_RATIO = 0.05   # ≤ 5% missing → clean PASS
-_WARN_MAX_RATIO = 0.15   # 5-15% missing → PASS_WITH_WARNINGS; > 15% → FAIL
+_WARN_MAX_RATIO = 0.20   # 5-20% missing → PASS_WITH_WARNINGS; > 20% → FAIL
+# Raised from 0.15 to 0.20: with the typical 5-scene storyboard, exactly one
+# missing scene is 20% -- one hard-to-source scene (an abstract concept like
+# "spacetime bending" with no natural vertical-video match) shouldn't fail
+# an otherwise-complete video, especially since video_renderer already
+# covers that gap with a borrowed/placeholder clip rather than leaving it
+# blank.
 
 
 def _check_no_missing_scenes(render_plan: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, Any]]:
