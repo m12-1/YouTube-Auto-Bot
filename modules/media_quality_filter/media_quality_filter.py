@@ -93,30 +93,60 @@ except ImportError:  # pragma: no cover
 
 
 def _check_resolution(candidate: Dict[str, Any]) -> List[str]:
-    """Reject candidates below the configured minimum resolution."""
-    reasons = []
+    """
+    Reject candidates whose EFFECTIVE resolution, once fit into the final
+    1080x1920 portrait canvas the way `video_renderer` actually does it
+    (scale to canvas height, then center-crop the width), would fall
+    below 1080p -- and reject anything that would need to be upscaled so
+    far it goes soft/blurry.
+
+    A landscape 1920x1080 stock clip is NOT unusable: scaled up to the
+    canvas height it becomes plenty wide enough. Rejecting every
+    landscape candidate outright (the old orientation check) was the
+    direct cause of scenes coming back with 0 usable candidates even
+    though valid 1080p+ candidates were downloaded.
+    """
+    reasons: List[str] = []
     width = candidate.get("width", 0) or 0
     height = candidate.get("height", 0) or 0
-    if width < pipeline_config.MEDIA_MIN_WIDTH or height < pipeline_config.MEDIA_MIN_HEIGHT:
+
+    if not width or not height:
+        reasons.append("missing_dimensions")
+        return reasons
+
+    canvas_width = pipeline_config.MEDIA_MIN_WIDTH  # 1080
+    canvas_height = pipeline_config.MEDIA_MIN_HEIGHT  # 1920
+
+    scale = canvas_height / height
+    effective_width = width * scale
+    effective_height = height * scale
+
+    if effective_width < canvas_width or effective_height < canvas_height:
         reasons.append(
-            f"low_resolution ({width}x{height} < "
-            f"{pipeline_config.MEDIA_MIN_WIDTH}x{pipeline_config.MEDIA_MIN_HEIGHT})"
+            f"low_resolution_after_fit ({width}x{height} scaled -> "
+            f"{effective_width:.0f}x{effective_height:.0f} < {canvas_width}x{canvas_height})"
+        )
+        return reasons
+
+    if scale > pipeline_config.MEDIA_MAX_UPSCALE_FACTOR:
+        reasons.append(
+            f"excessive_upscale ({width}x{height} needs {scale:.2f}x to fill the canvas, "
+            f"max allowed is {pipeline_config.MEDIA_MAX_UPSCALE_FACTOR:.2f}x)"
         )
     return reasons
 
 
 def _check_orientation(candidate: Dict[str, Any]) -> List[str]:
-    """Reject candidates that aren't in the required (portrait) orientation."""
-    reasons = []
-    width = candidate.get("width", 0) or 0
-    height = candidate.get("height", 0) or 0
-    if width and height:
-        is_portrait = height >= width
-        if pipeline_config.MEDIA_REQUIRED_ORIENTATION == "portrait" and not is_portrait:
-            reasons.append("wrong_orientation (expected portrait)")
-        elif pipeline_config.MEDIA_REQUIRED_ORIENTATION == "landscape" and is_portrait:
-            reasons.append("wrong_orientation (expected landscape)")
-    return reasons
+    """
+    No longer a hard rejection gate. `video_renderer` fits every clip
+    (portrait OR landscape) into the 1080x1920 canvas by scaling to the
+    canvas height and center-cropping the width, so orientation alone is
+    never a valid reason to throw a candidate away. Real quality/fit
+    enforcement now lives in `_check_resolution` above. Kept as a no-op
+    function (rather than deleted) so `_evaluate_candidate` and any
+    external callers/tests referencing it keep working unchanged.
+    """
+    return []
 
 
 def _check_duration(candidate: Dict[str, Any]) -> List[str]:
