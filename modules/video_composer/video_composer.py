@@ -88,6 +88,13 @@ def _build_video_track(
         verification = verifications_by_scene.get(scene_id, {})
         best_media = verification.get("best_media")
 
+        # A scene whose media came from media_downloader's topic-level
+        # fallback (see MEDIA_TOPIC_FALLBACK_ENABLED) is always a still
+        # image chosen specifically to carry a slow Ken Burns zoom instead
+        # of sitting static or the scene going empty -- so it gets the
+        # zoom regardless of the global VIDEO_KEN_BURNS_ENABLED toggle.
+        is_topic_fallback = bool((best_media or {}).get("is_topic_fallback"))
+
         # Collect fallback paths from rejected candidates that still have
         # a downloaded file on disk — these are "not the best" but better
         # than a black placeholder or a borrowed clip from another scene.
@@ -108,7 +115,7 @@ def _build_video_track(
                 "media_path": (best_media or {}).get("local_path"),
                 "animation": scene.get("animation", "fade_in"),
                 "transition": scene.get("transition", "fade"),
-                "ken_burns": pipeline_config.VIDEO_KEN_BURNS_ENABLED,
+                "ken_burns": True if is_topic_fallback else pipeline_config.VIDEO_KEN_BURNS_ENABLED,
                 "fallback_media_paths": fallback_paths,
             }
         )
