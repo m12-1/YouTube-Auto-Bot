@@ -20,6 +20,19 @@ narration sentences are abstract, scientific, or metaphorical (e.g.
 forces, NOT about food or a kitchen). Infer the real visual scene, not
 the literal words.
 
+This also applies when the narration names something that is itself
+real-world, but only as a REFERENCE inside a different subject. E.g. a
+scene about video games that says "...like scoring a goal in a football
+game" is about a PERSON PLAYING A VIDEO GAME (controller, screen,
+console/PC) -- it must NOT return real-world football/soccer match
+footage just because the word "football" appears. Always ask: what is
+this scene actually ABOUT (the subject of the video/story), versus what
+words does it merely MENTION in passing? "objects", "keywords_primary",
+and "keywords_negative" must reflect the actual subject, and the literal
+mentioned-but-not-the-subject term (e.g. "football", "soccer", "stadium")
+should usually go in "forbidden"/"keywords_negative" instead of
+"keywords_primary" when it would visually mislead a stock search.
+
 Return ONLY JSON, no markdown fences, in exactly this shape:
 {{
   "scene_type": "<one of: Scientific Simulation, Real World Footage, Historical Footage, Abstract/Conceptual, Interview/Talking Head, News/Documentary, Nature, Animation>",
