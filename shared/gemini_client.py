@@ -546,6 +546,7 @@ def generate_vision_verification(
     forbidden_styles: Optional[List[str]] = None,
     model: Optional[str | List[str]] = None,
     timeout_seconds: float = 20.0,
+    prefetched_image: Optional[Tuple[bytes, str]] = None,
 ) -> Dict[str, Any]:
     """
     Multi-signal verification of a candidate media item — not just "is
@@ -565,6 +566,19 @@ def generate_vision_verification(
             exactly like the old behavior.
         forbidden_styles: Style names that must NOT appear (from a
             matched Domain Template), if any.
+        prefetched_image: Optional (image_bytes, mime_type) tuple. When
+            given, this is used DIRECTLY instead of downloading
+            `image_url` over HTTP. This exists because remote
+            "thumbnail_url" values (especially the derived/guessed ones
+            for providers like Pixabay) are unreliable -- they can 404,
+            redirect, or resolve to something that isn't actually an
+            image, which previously caused vision verification to fail
+            for entire batches of otherwise-good candidates and silently
+            fall back to the much weaker keyword-overlap heuristic.
+            Callers that already have the media file downloaded locally
+            (which is always true by the time this module runs) should
+            extract a real frame locally and pass it here instead of
+            relying on the network thumbnail at all.
 
     Returns:
         {
@@ -587,7 +601,10 @@ def generate_vision_verification(
     if not _normalize_api_keys(api_key):
         raise GeminiUnavailableError("No Gemini API key configured for this call.")
 
-    image_bytes, mime_type = _fetch_image_bytes(image_url, timeout_seconds=timeout_seconds)
+    if prefetched_image is not None:
+        image_bytes, mime_type = prefetched_image
+    else:
+        image_bytes, mime_type = _fetch_image_bytes(image_url, timeout_seconds=timeout_seconds)
 
     required_str = ", ".join(required_objects) if required_objects else "(not specified)"
     environment_str = environment or "(not specified)"
