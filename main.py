@@ -117,7 +117,14 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
     logger.info("=== المرحلة 6: المونتاج والتصدير ===")
     _flush_logs()
     final_video_path = os.path.join(run_dir, "final_video.mp4")
-    video_composer.compose_video(scene_results, audio_path, subtitle_segments, final_video_path)
+    # مجلد كاش مقاطع المشاهد: يخزَّن كل مشهد كملف مُصيَّر مسبقًا، بحيث تُعاد
+    # مشاهد الجولات اللاحقة من هذا الكاش بدل إعادة معالجتها من مصدرها الخام
+    # في كل مرة يُستبدل فيها مشهد واحد فقط بعد فشل التدقيق (المرحلة 7).
+    scene_cache_dir = os.path.join(run_dir, "scene_clips_cache")
+    video_composer.compose_video(
+        scene_results, audio_path, subtitle_segments, final_video_path,
+        scene_cache_dir=scene_cache_dir,
+    )
 
     # 7) التدقيق النهائي لكل مشهد (حلقة إعادة بناء المشاهد المرفوضة)
     #
@@ -164,10 +171,14 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
         # رندر واحد فقط بعد تجميع كل استبدالات هذه الجولة، وليس رندرًا
         # منفصلًا لكل مشهد مرفوض.
         if any_replaced:
-            logger.info("إعادة رندر الفيديو مرة واحدة بعد استبدال %d مشهد/مشاهد في هذه الجولة.",
+            logger.info("إعادة رندر الفيديو مرة واحدة بعد استبدال %d مشهد/مشاهد في هذه الجولة "
+                        "(المشاهد غير المتغيّرة تُقرأ من الكاش، فقط المُستبدَلة تُعاد معالجتها).",
                         sum(1 for _ in failed))
             _flush_logs()
-            video_composer.compose_video(scene_results, audio_path, subtitle_segments, final_video_path)
+            video_composer.compose_video(
+                scene_results, audio_path, subtitle_segments, final_video_path,
+                scene_cache_dir=scene_cache_dir,
+            )
         else:
             logger.warning("لم يُستبدل أي مشهد فعليًا في هذه الجولة، تخطي إعادة الرندر.")
     else:
