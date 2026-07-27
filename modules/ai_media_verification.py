@@ -10,6 +10,9 @@
 
 import asyncio
 import logging
+import os
+import subprocess
+import uuid
 
 from shared.gemini_client import call_gemini_with_rotation, parse_json_response
 from shared.state import RunState
@@ -23,6 +26,13 @@ from config import (
 logger = logging.getLogger("modules.ai_media_verification")
 
 STAGE = "ai_media_verification"
+
+# نضغط كل مرشح لمعاينة صغيرة قبل إرساله لـ Gemini، لأن الملفات الأصلية
+# (خصوصًا من Pixabay) غالبًا ما تتجاوز حد الـ inline data لدى Gemini (~18MB).
+# المسار الأصلي كامل الجودة يبقى محفوظًا ويُستخدم لاحقًا في المونتاج النهائي.
+_PREVIEW_MAX_SECONDS = 12
+_PREVIEW_SCALE_HEIGHT = 360
+_PREVIEW_VIDEO_BITRATE = "250k"
 
 _VERIFY_PROMPT = """
 لدي {n} مقاطع فيديو مرشحة لهذا الجزء من سكربت فيديو قصير:
@@ -83,6 +93,39 @@ def _interleave_candidates(candidates: list[dict]) -> list[dict]:
     return result
 
 
+def _make_verification_preview(source_path: str, media_dir: str) -> str | None:
+    """
+    يولّد نسخة معاينة صغيرة (مدة أقصر + دقة/بترييت أقل + بدون صوت) من الفيديو
+    الأصلي عبر ffmpeg، لإرسالها لـ Gemini كـ inline data ضمن حد الحجم المسموح،
+    مع الإبقاء على المسار الأصلي كامل الجودة لاستخدامه في المونتاج النهائي.
+    يعيد None إن فشل الضغط لأي سبب (ffmpeg غير متاح، ملف تالف، ...).
+    """
+    preview_dir = os.path.join(media_dir, "previews")
+    os.makedirs(preview_dir, exist_ok=True)
+    out_path = os.path.join(preview_dir, f"{uuid.uuid4().hex}.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", source_path,
+        "-t", str(_PREVIEW_MAX_SECONDS),
+        "-vf", f"scale=-2:{_PREVIEW_SCALE_HEIGHT}",
+        "-b:v", _PREVIEW_VIDEO_BITRATE,
+        "-an", "-movflags", "+faststart",
+        out_path,
+    ]
+    try:
+        subprocess.run(
+            cmd, check=True, timeout=60,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("فشل توليد معاينة مضغوطة لـ %s: %s", source_path, e)
+        return None
+
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        logger.warning("معاينة فارغة/غير موجودة لـ %s.", source_path)
+        return None
+    return out_path
+
+
 def verify_scene_media(scene: dict, run_state: RunState, media_dir: str) -> dict | None:
     """
     يشغّل حلقة كاملة للمشهد: بحث -> تحميل أول 3 -> تحقق دفعة واحدة -> قبول/رفض ->
@@ -124,8 +167,26 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str) -> dict
 
         local_paths = asyncio.run(_download_all(top3))
 
+        # نصفّي المرشحين الذين فشل تحميلهم فعليًا قبل التحقق (بدل إرسال مسارات
+        # مفقودة لـ Gemini)، مع إعادة بناء top3/local_paths بشكل متطابق الفهارس.
+        valid_pairs = [(c, p) for c, p in zip(top3, local_paths) if p is not None]
+        if not valid_pairs:
+            logger.warning("[%s] فشل تحميل كل مرشحي هذه الجولة.", scene_id)
+            for kw in {c["keyword"] for c in top3}:
+                run_state.mark_keyword_used(scene_id, kw)
+            continue
+        top3 = [c for c, _ in valid_pairs]
+        local_paths = [p for _, p in valid_pairs]
+
+        # نولّد معاينة مضغوطة من كل فيديو لإرسالها لـ Gemini (بدل الملف الأصلي
+        # الذي غالبًا يتجاوز حد الـ inline data)، مع الإبقاء على local_paths
+        # الأصلية كاملة الجودة لاستخدامها لاحقًا في المونتاج النهائي.
+        preview_paths = [
+            _make_verification_preview(p, media_dir) or p for p in local_paths
+        ]
+
         try:
-            results = _verify_batch(narration_excerpt, top3, local_paths)
+            results = _verify_batch(narration_excerpt, top3, preview_paths)
         except Exception as e:  # noqa: BLE001
             logger.error("[%s] فشل التحقق من الدفعة: %s", scene_id, e)
             results = []
