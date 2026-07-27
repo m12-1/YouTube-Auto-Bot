@@ -13,6 +13,13 @@ import logging
 import arabic_reshaper
 from bidi.algorithm import get_display
 
+# توافقية Pillow>=10 مع moviepy 1.0.3: الإصدارات الحديثة من Pillow أزالت
+# PIL.Image.ANTIALIAS (كان يشير إلى LANCZOS)، بينما moviepy القديمة ما زالت
+# تستخدمه داخليًا في fx/resize.py، فيفشل بـ AttributeError دون هذا الترقيع.
+from PIL import Image as _PILImage
+if not hasattr(_PILImage, "ANTIALIAS"):
+    _PILImage.ANTIALIAS = _PILImage.Resampling.LANCZOS
+
 from moviepy.editor import (
     VideoFileClip, CompositeVideoClip, concatenate_videoclips,
     AudioFileClip, TextClip, CompositeAudioClip, vfx,
