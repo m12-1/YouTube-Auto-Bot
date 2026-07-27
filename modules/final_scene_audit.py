@@ -11,7 +11,7 @@
 
 import logging
 
-from shared.gemini_client import call_gemini_with_rotation, parse_json_response, upload_media_file
+from shared.gemini_client import call_gemini_with_rotation, parse_json_response
 from config import SCENE_AUDIT_ACCEPT_THRESHOLD, MAX_SCENE_AUDIT_RETRIES
 
 logger = logging.getLogger("modules.final_scene_audit")
@@ -40,8 +40,9 @@ _AUDIT_PROMPT = """
 def audit_video(final_video_path: str, narration: str, scenes: list[dict]) -> list[dict]:
     scene_list_str = "\n".join(f"- {s['id']}: {s['text']}" for s in scenes)
     prompt = _AUDIT_PROMPT.format(narration=narration, scene_list=scene_list_str)
-    uploaded_video = upload_media_file(final_video_path)
-    raw = call_gemini_with_rotation(STAGE, [prompt, uploaded_video], response_mime_type="application/json")
+    raw = call_gemini_with_rotation(
+        STAGE, [prompt], media_paths=[final_video_path], response_mime_type="application/json"
+    )
     return parse_json_response(raw).get("scenes", [])
 
 
