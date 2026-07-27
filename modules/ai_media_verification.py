@@ -11,7 +11,7 @@
 import asyncio
 import logging
 
-from shared.gemini_client import call_gemini_with_rotation, parse_json_response, upload_media_file
+from shared.gemini_client import call_gemini_with_rotation, parse_json_response
 from shared.state import RunState
 from modules.media_downloader import search_scene_media_sync, download_candidate
 from config import (
@@ -51,10 +51,10 @@ _ALT_KEYWORD_PROMPT = """
 
 
 def _verify_batch(narration_excerpt: str, candidates: list[dict], local_paths: list[str]) -> list[dict]:
-    uploaded = [upload_media_file(p) for p in local_paths]
     prompt = _VERIFY_PROMPT.format(n=len(candidates), narration_excerpt=narration_excerpt)
-    parts = [prompt] + uploaded
-    raw = call_gemini_with_rotation(STAGE, parts, response_mime_type="application/json")
+    raw = call_gemini_with_rotation(
+        STAGE, [prompt], media_paths=local_paths, response_mime_type="application/json"
+    )
     return parse_json_response(raw).get("results", [])
 
 
