@@ -96,6 +96,8 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
     video_composer.compose_video(scene_results, audio_path, subtitle_segments, final_video_path)
 
     # 7) التدقيق النهائي لكل مشهد (حلقة إعادة بناء المشاهد المرفوضة)
+    # ⚠️ تحسين مهم: تجميع جميع الاستبدالات أولاً ثم رندر واحد فقط في النهاية،
+    # بدل الرندر المتكرر لكل مشهد فاشل على حدة (كان يسبب هدر موارد ووقت).
     logger.info("=== المرحلة 7: التدقيق النهائي ===")
     for attempt in range(MAX_SCENE_AUDIT_RETRIES):
         audit_results = final_scene_audit.audit_video(final_video_path, plan["narration"], plan["scenes"])
@@ -105,6 +107,9 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
             break
 
         logger.warning("مشاهد مرفوضة (%d): %s", len(failed), [f["scene_id"] for f in failed])
+        
+        # 🔄 نجمّع جميع التغييرات هنا قبل أي رندر
+        any_scene_replaced = False
         for f in failed:
             scene_index = next((i for i, s in enumerate(plan["scenes"]) if s["id"] == f["scene_id"]), None)
             if scene_index is None:
@@ -124,9 +129,13 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
                 start_t, end_t = timing
                 new_result["audio_duration"] = max(end_t - start_t, 0.1)
             scene_results[scene_index] = new_result
-            video_composer.replace_scene_and_rerender(
-                scene_results, scene_index, new_result, audio_path, subtitle_segments, final_video_path
-            )
+            any_scene_replaced = True
+            logger.info("✅ تم استبدال المشهد %s بالبديل الجديد (سيُرندر مرة واحدة بعد جمع كل التغييرات).", f["scene_id"])
+        
+        # 🎬 رندر واحد فقط بعد معالجة كل المشاهد الفاشلة في هذه المحاولة
+        if any_scene_replaced:
+            logger.info("🎬 بدء رندر موحد لجميع المشاهد المستبدلة (%d مشاهد)...", len(failed))
+            video_composer.compose_video(scene_results, audio_path, subtitle_segments, final_video_path)
     else:
         logger.warning("تم الوصول للحد الأقصى من محاولات التدقيق (%d) مع بقاء مشاهد دون المستوى.",
                         MAX_SCENE_AUDIT_RETRIES)
