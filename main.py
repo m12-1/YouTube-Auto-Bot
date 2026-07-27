@@ -35,7 +35,8 @@ from modules import (
 from config import MAX_SCENE_AUDIT_RETRIES
 
 
-def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = False):
+def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = False,
+                  privacy_status: str = "public"):
     run_dir = run_dir or os.path.join("runs", time.strftime("%Y%m%d_%H%M%S"))
     media_dir = os.path.join(run_dir, "media")
     os.makedirs(run_dir, exist_ok=True)
@@ -124,6 +125,7 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
         title=seo["optimized_title"],
         description=seo["optimized_description"],
         tags=seo["tags"],
+        privacy_status=privacy_status,
     )
     return {"video_path": final_video_path, "video_id": video_id, "seo": seo}
 
@@ -132,7 +134,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="خط أنابيب توليد ونشر فيديوهات يوتيوب شورتس")
     parser.add_argument("--category", required=True, help="الفئة العامة لاختيار الموضوع")
     parser.add_argument("--dry-run", action="store_true", help="تنفيذ كل المراحل عدا النشر الفعلي")
+    parser.add_argument(
+        "--privacy", choices=["public", "unlisted", "private"], default=None,
+        help="حالة الخصوصية عند النشر. إن لم تُحدد، سيُسأل عنها تفاعليًا قبل البدء.",
+    )
     args = parser.parse_args()
 
-    result = run_pipeline(args.category, dry_run_publish=args.dry_run)
+    privacy_status = args.privacy
+    if privacy_status is None and not args.dry_run:
+        choice = input("انشر الفيديو كـ (1) عام public  (2) غير مدرج unlisted  (3) خاص private؟ [1/2/3]: ").strip()
+        privacy_status = {"1": "public", "2": "unlisted", "3": "private"}.get(choice, "public")
+        logger.info("تم اختيار حالة الخصوصية: %s", privacy_status)
+    elif privacy_status is None:
+        privacy_status = "public"
+
+    result = run_pipeline(args.category, dry_run_publish=args.dry_run, privacy_status=privacy_status)
     logger.info("النتيجة النهائية: %s", result)
