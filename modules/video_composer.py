@@ -35,15 +35,23 @@ from config import EXPORT_RESOLUTION, FADE_DURATION
 logger = logging.getLogger("modules.video_composer")
 
 
-_SUBTITLE_FONT_NAME = "Amiri-Bold"
+_SUBTITLE_FONT_NAME = "DejaVu-Sans-Bold"
 _SUBTITLE_FONT_SIZE = 60
 _SUBTITLE_MAX_WIDTH_PX = int(EXPORT_RESOLUTION[0] * 0.9)
 
 
 def _shape_arabic(text: str) -> str:
     """يهيّئ النص العربي (ربط الحروف وترتيب RTL) قبل تمريره لـ TextClip،
-    لأن ImageMagick/PIL لا يقومان بذلك تلقائيًا."""
+    لأن ImageMagick/PIL لا يقومان بذلك تلقائيًا. لا تأثير لهذه الدالة على
+    نص إنجليزي بحت (يُعاد كما هو) — الفحص يتم عبر _contains_arabic حتى لا
+    تُهدَر معالجة غير ضرورية على محتوى غير عربي."""
+    if not _contains_arabic(text):
+        return text
     return get_display(arabic_reshaper.reshape(text))
+
+
+def _contains_arabic(text: str) -> bool:
+    return any("\u0600" <= ch <= "\u06FF" for ch in text)
 
 
 def _resolve_font_path(font_name: str = _SUBTITLE_FONT_NAME) -> str | None:
