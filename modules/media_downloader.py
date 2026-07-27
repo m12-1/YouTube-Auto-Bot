@@ -29,12 +29,19 @@ async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page:
             results = []
             for video in data.get("videos", []):
                 files = sorted(video.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True)
+                # نفس معيار الحد الأدنى المطبَّق على Pixabay: لا نقبل ملفًا
+                # بدقة أقل من 720p (height < 720) حتى لو كان الأعلى المتاح
+                # لهذا الفيديو تحديدًا، لأن التكبير الرقمي لاحقًا لن يعوّض
+                # نقص الدقة الحقيقية في الفيديو النهائي.
+                files = [f for f in files if (f.get("height") or 0) >= 720]
                 if files:
                     results.append({
                         "source": "pexels",
                         "keyword": keyword,
                         "id": str(video["id"]),
                         "url": files[0]["link"],
+                        "width": files[0].get("width"),
+                        "height": files[0].get("height"),
                         "duration": video.get("duration"),
                     })
             return results
@@ -57,13 +64,21 @@ async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page
             results = []
             for hit in data.get("hits", []):
                 videos = hit.get("videos", {})
-                best = videos.get("large") or videos.get("medium") or videos.get("small")
+                # نرفض طبقة "small" (360x640 فعليًا) صراحة: قبولها كان يسمح
+                # بمرور مقاطع 360p بصمت كلما لم تتوفر جودة أعلى لكلمة البحث،
+                # فيُكبَّر رقميًا (upscale) لاحقًا دون أي زيادة حقيقية في
+                # الدقة، وهذا بالضبط سبب ظهور فيديوهات نهائية ضبابية رغم أن
+                # أبعاد الملف النهائي 1080x1920. نطلب medium (~720p) كحد
+                # أدنى؛ إن لم يتوفر لا نعيد هذا المرشح إطلاقًا بدل قبوله.
+                best = videos.get("large") or videos.get("medium")
                 if best:
                     results.append({
                         "source": "pixabay",
                         "keyword": keyword,
                         "id": str(hit["id"]),
                         "url": best["url"],
+                        "width": best.get("width"),
+                        "height": best.get("height"),
                         "duration": hit.get("duration"),
                     })
             return results
