@@ -1,0 +1,54 @@
+name: YouTube Auto Bot Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "الفئة العامة لاختيار الموضوع"
+        required: true
+        default: "علوم وحقائق مذهلة"
+  schedule:
+    - cron: "0 12 * * *"  # يوميًا الساعة 12:00 UTC — عدّل حسب الحاجة
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: تثبيت متطلبات النظام (ffmpeg وغيرها)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg imagemagick
+
+      - name: تثبيت متطلبات Python
+        run: pip install -r requirements.txt
+
+      - name: تشغيل خط الأنابيب
+        env:
+          GEMINI_KEY_ADVANCED: ${{ secrets.GEMINI_KEY_ADVANCED }}
+          GEMINI_KEY_FILTER: ${{ secrets.GEMINI_KEY_FILTER }}
+          GEMINI_KEY_FILTER_2: ${{ secrets.GEMINI_KEY_FILTER_2 }}
+          GEMINI_KEY_IMAGE: ${{ secrets.GEMINI_KEY_IMAGE }}
+          GEMINI_KEY_LIGHT: ${{ secrets.GEMINI_KEY_LIGHT }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          YOUTUBE_SEARCH_API_KEY: ${{ secrets.YOUTUBE_SEARCH_API_KEY }}
+          YOUTUBE_OAUTH_CLIENT_ID: ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
+          YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
+          YOUTUBE_OAUTH_REFRESH_TOKEN: ${{ secrets.YOUTUBE_OAUTH_REFRESH_TOKEN }}
+        run: |
+          python main.py --category "${{ github.event.inputs.category || 'علوم وحقائق مذهلة' }}"
+
+      - name: رفع مخرجات التشغيل عند الفشل (للمراجعة)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs-and-media
+          path: runs/
+          retention-days: 5
