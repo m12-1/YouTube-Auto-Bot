@@ -86,12 +86,29 @@ def _looks_like_transient(exc: Exception) -> bool:
     return any(code in msg for code in ["500", "502", "503", "504", "timeout", "deadline"])
 
 
-def call_gemini_with_rotation(stage_name: str, prompt_parts: list, response_mime_type: str = None,
+def _upload_and_wait_active(path: str, timeout_seconds: int = 60):
+    """يرفع ملفًا وينتظر وصوله لحالة ACTIVE (ملفات الفيديو تحتاج معالجة قبل الاستخدام)."""
+    uploaded = genai.upload_file(path)
+    waited = 0
+    while uploaded.state.name == "PROCESSING" and waited < timeout_seconds:
+        time.sleep(2)
+        waited += 2
+        uploaded = genai.get_file(uploaded.name)
+    if uploaded.state.name != "ACTIVE":
+        raise TransientError(f"ملف {path} لم يصل لحالة ACTIVE (الحالة: {uploaded.state.name})")
+    return uploaded
+
+
+def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: list | None = None,
+                               response_mime_type: str = None,
                                max_output_tokens: int = 2048, temperature: float = 0.7):
     """
     يستدعي Gemini مع تدوير تلقائي بين المفاتيح والنماذج عند 429.
 
-    prompt_parts: قائمة أجزاء المحتوى (نص و/أو ملفات مرفوعة عبر genai.upload_file)
+    text_parts: قائمة أجزاء نصية (prompts)
+    media_paths: مسارات ملفات وسائط محلية (فيديو/صورة) يتم رفعها من جديد في كل محاولة
+                 باستخدام المفتاح الحالي نفسه — لأن ملفات Gemini Files API مرتبطة بالمفتاح/المشروع
+                 الذي رفعها، واستخدام مفتاح مختلف لاحقًا يفشل بخطأ "API key not valid".
     response_mime_type: مثلاً "application/json" لإجبار خرج JSON منظم
     يعيد: نص الاستجابة (str)
     """
@@ -116,6 +133,10 @@ def call_gemini_with_rotation(stage_name: str, prompt_parts: list, response_mime
             )
             genai.configure(api_key=key_val)
 
+            # يرفع ملفات الوسائط من جديد بنفس المفتاح الحالي (وليس مرة واحدة قبل التدوير)
+            uploaded_media = [_upload_and_wait_active(p) for p in (media_paths or [])]
+            prompt_parts = list(text_parts) + uploaded_media
+
             generation_config = {
                 "temperature": temperature,
                 "max_output_tokens": max_output_tokens,
@@ -133,10 +154,10 @@ def call_gemini_with_rotation(stage_name: str, prompt_parts: list, response_mime
 
         except Exception as e:  # noqa: BLE001 - نحتاج التقاط أي استثناء من SDK لتصنيفه
             last_error = e
-            if _looks_like_rate_limit(e):
+            if _looks_like_rate_limit(e) or "api key not valid" in str(e).lower():
                 logger.warning(
-                    "[%s] 429 على %s/%s — الانتقال للتالي.",
-                    stage_name, rotator.current_key_name, model_name,
+                    "[%s] فشل مصادقة/حصة على %s/%s — الانتقال للتالي. (%s)",
+                    stage_name, rotator.current_key_name, model_name, e,
                 )
                 if not rotator.advance():
                     break
