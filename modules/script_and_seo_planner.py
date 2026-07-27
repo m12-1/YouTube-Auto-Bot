@@ -15,23 +15,29 @@ logger = logging.getLogger("modules.script_and_seo_planner")
 STAGE = "script_and_seo_planner"
 
 _PROMPT_TEMPLATE = """
-أنت كاتب سكربتات لفيديوهات يوتيوب شورتس تعليمية قصيرة.
+You are a scriptwriter for short, punchy educational YouTube Shorts aimed at an English-speaking audience.
 
-الموضوع: {topic}
-الحقائق الخام (من Wikipedia):
+Topic: {topic}
+Raw facts (from Wikipedia):
 \"\"\"{facts}\"\"\"
 
-اكتب:
-1. narration: نص الشرح الذي سيُروى صوتيًا في الفيديو، بحيث تكون مدته عند القراءة
-   بين {min_s} و {max_s} ثانية (بمعدل ~2.3 كلمة/ثانية تقريبًا). لغة عربية فصحى بسيطة وواضحة.
-2. scenes: قسّم narration إلى مشاهد متتالية، ولكل مشهد:
-   - text: جزء النص المقابل لهذا المشهد
-   - visual_keywords: 2-4 كلمات/جمل بحث بصري دقيقة (بالإنجليزية، مناسبة للبحث في Pexels/Pixabay)
-   - duration_estimate: تقدير مدة هذا المشهد بالثواني (رقم عشري)
-3. video_title: عنوان جذاب للفيديو (عربي)
-4. youtube_keywords: قائمة كلمات مفتاحية مرتبة حسب تسلسل الشرح للبحث عنها في يوتيوب (عربي/إنجليزي مختلط حسب الأنسب)
+Write:
+1. narration: the voice-over script, timed to read in {min_s}-{max_s} seconds
+   (~2.3 words/second). Written in clear, natural, conversational English.
+   CRITICAL: the very first sentence (first 2-3 seconds when read aloud) MUST be
+   a strong hook — a provocative question, a shocking claim, or a "wait, what?"
+   statement that stops someone mid-scroll. Do NOT start with generic phrases
+   like "Did you know that..." or a flat description of the topic. The hook
+   must create curiosity or tension that only gets resolved later in the script.
+2. scenes: split narration into consecutive scenes, each with:
+   - text: the portion of narration text for this scene
+   - visual_keywords: 2-4 precise visual search terms (in English, suitable
+     for searching Pexels/Pixabay stock footage)
+   - duration_estimate: estimated duration of this scene in seconds (decimal)
+3. video_title: a catchy English video title
+4. youtube_keywords: SEO keywords in English, ordered to match the narration flow
 
-أعد **فقط** كائن JSON بهذا الشكل بدون أي نص إضافي أو أسوار Markdown:
+Return **only** a JSON object in this exact shape, no extra text or Markdown fences:
 {{
   "narration": "...",
   "scenes": [
