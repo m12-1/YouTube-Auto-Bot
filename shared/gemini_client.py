@@ -14,6 +14,7 @@ import json
 import re
 import time
 import logging
+import mimetypes
 
 import google.generativeai as genai
 
@@ -21,6 +22,10 @@ from config import MODEL_CHAIN, STAGE_KEY_MAP, ALL_KEYS_ORDER
 
 logger = logging.getLogger("shared.gemini_client")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# الحد الأقصى التقريبي لحجم بيانات الوسائط inline في طلب واحد لـ Gemini
+# (يتجاوز هذا الحد يتطلب Files API، لكنها معطّلة تمامًا في هذه الحزمة المتوقفة).
+_MAX_INLINE_MEDIA_BYTES = 18 * 1024 * 1024
 
 
 class RateLimitError(Exception):
@@ -87,17 +92,26 @@ def _looks_like_transient(exc: Exception) -> bool:
     return any(code in msg for code in ["500", "502", "503", "504", "timeout", "deadline"])
 
 
-def _upload_and_wait_active(path: str, timeout_seconds: int = 60):
-    """يرفع ملفًا وينتظر وصوله لحالة ACTIVE (ملفات الفيديو تحتاج معالجة قبل الاستخدام)."""
-    uploaded = genai.upload_file(path)
-    waited = 0
-    while uploaded.state.name == "PROCESSING" and waited < timeout_seconds:
-        time.sleep(2)
-        waited += 2
-        uploaded = genai.get_file(uploaded.name)
-    if uploaded.state.name != "ACTIVE":
-        raise TransientError(f"ملف {path} لم يصل لحالة ACTIVE (الحالة: {uploaded.state.name})")
-    return uploaded
+def _load_inline_media_part(path: str) -> dict:
+    """
+    يقرأ ملف الوسائط ويعيده كجزء inline_data (bytes + mime_type) يُرسَل مباشرة
+    ضمن طلب generate_content، دون المرور عبر Files API (genai.upload_file).
+
+    السبب: حزمة google.generativeai أوقفت جوجل دعمها بالكامل، ومسار Files API
+    فيها بات يفشل بخطأ "API key not valid" مع كل مفتاح دون استثناء (بينما
+    generate_content النصي/متعدد الوسائط عبر inline_data ما زال يعمل). لذلك
+    نتجنب upload_file/get_file كليًا ونمرر بيانات الفيديو مباشرة كـ inline.
+    """
+    size = os.path.getsize(path)
+    if size > _MAX_INLINE_MEDIA_BYTES:
+        raise TransientError(
+            f"ملف {path} كبير جدًا ({size} بايت) لإرساله كـ inline data "
+            f"(الحد التقريبي {_MAX_INLINE_MEDIA_BYTES} بايت)."
+        )
+    mime_type = mimetypes.guess_type(path)[0] or "video/mp4"
+    with open(path, "rb") as f:
+        data = f.read()
+    return {"mime_type": mime_type, "data": data}
 
 
 def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: list | None = None,
@@ -107,9 +121,8 @@ def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: li
     يستدعي Gemini مع تدوير تلقائي بين المفاتيح والنماذج عند 429.
 
     text_parts: قائمة أجزاء نصية (prompts)
-    media_paths: مسارات ملفات وسائط محلية (فيديو/صورة) يتم رفعها من جديد في كل محاولة
-                 باستخدام المفتاح الحالي نفسه — لأن ملفات Gemini Files API مرتبطة بالمفتاح/المشروع
-                 الذي رفعها، واستخدام مفتاح مختلف لاحقًا يفشل بخطأ "API key not valid".
+    media_paths: مسارات ملفات وسائط محلية (فيديو/صورة) تُرسَل كـ inline data مباشرة
+                 ضمن كل طلب (بدل Files API المعطّلة في هذه الحزمة المتوقفة).
     response_mime_type: مثلاً "application/json" لإجبار خرج JSON منظم
     يعيد: نص الاستجابة (str)
     """
@@ -134,9 +147,9 @@ def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: li
             )
             genai.configure(api_key=key_val)
 
-            # يرفع ملفات الوسائط من جديد بنفس المفتاح الحالي (وليس مرة واحدة قبل التدوير)
-            uploaded_media = [_upload_and_wait_active(p) for p in (media_paths or [])]
-            prompt_parts = list(text_parts) + uploaded_media
+            # يمرر ملفات الوسائط كـ inline data (بدل رفعها عبر Files API المعطّلة)
+            inline_media = [_load_inline_media_part(p) for p in (media_paths or [])]
+            prompt_parts = list(text_parts) + inline_media
 
             generation_config = {
                 "temperature": temperature,
@@ -180,9 +193,10 @@ def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: li
     )
 
 
-def upload_media_file(path: str):
-    """يرفع ملف وسائط (فيديو/صورة) إلى Gemini Files API لاستخدامه في التحقق البصري."""
-    return genai.upload_file(path)
+def upload_media_file(path: str) -> dict:
+    """يعيد ملف الوسائط كجزء inline data جاهز للاستخدام المباشر في generate_content
+    (Files API غير مستخدمة بعد الآن لأنها معطّلة في هذه الحزمة المتوقفة)."""
+    return _load_inline_media_part(path)
 
 
 def parse_json_response(raw_text: str) -> dict:
