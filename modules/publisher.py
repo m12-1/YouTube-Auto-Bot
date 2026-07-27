@@ -23,13 +23,19 @@ def get_youtube_client():
     if missing:
         raise EnvironmentError(f"أسرار يوتيوب ناقصة: {', '.join(missing)}")
 
+    # لا نمرّر scopes هنا عمدًا: عملية تجديد access_token عبر refresh_token
+    # لا تحتاج لإرسال scope أصلًا، وإرساله قد يسبب invalid_scope من طرف
+    # Google إن لم يطابق حرفيًا (ترتيبًا وصياغةً) النطاق الذي صدر به
+    # refresh_token أصلًا وقت الموافقة الأولى. تمرير None هنا آمن تمامًا
+    # لأن creds.refresh() يعتمد فقط على refresh_token/client_id/client_secret،
+    # ولا يُستخدم SCOPES إلا في تدفق الموافقة الأولية (خارج هذا الملف).
     creds = Credentials(
         token=None,
         refresh_token=os.environ["YOUTUBE_OAUTH_REFRESH_TOKEN"],
         client_id=os.environ["YOUTUBE_OAUTH_CLIENT_ID"],
         client_secret=os.environ["YOUTUBE_OAUTH_CLIENT_SECRET"],
         token_uri="https://oauth2.googleapis.com/token",
-        scopes=SCOPES,
+        scopes=None,
     )
 
     # يجبر التجديد الفعلي عبر refresh_token في كل مرة (بدل الاعتماد على creds.valid فقط)
