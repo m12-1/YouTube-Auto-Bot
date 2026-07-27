@@ -7,6 +7,15 @@ on:
         description: "الفئة العامة لاختيار الموضوع"
         required: true
         default: "علوم وحقائق مذهلة"
+      privacy:
+        description: "حالة نشر الفيديو"
+        required: true
+        type: choice
+        default: "public"
+        options:
+          - public
+          - unlisted
+          - private
   schedule:
     - cron: "0 12 * * *"  # يوميًا الساعة 12:00 UTC — عدّل حسب الحاجة
 
@@ -43,7 +52,7 @@ jobs:
           YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
           YOUTUBE_OAUTH_REFRESH_TOKEN: ${{ secrets.YOUTUBE_OAUTH_REFRESH_TOKEN }}
         run: |
-          python main.py --category "${{ github.event.inputs.category || 'علوم وحقائق مذهلة' }}"
+          python main.py --category "${{ github.event.inputs.category || 'علوم وحقائق مذهلة' }}" --privacy "${{ github.event.inputs.privacy || 'public' }}"
 
       - name: رفع مخرجات التشغيل عند الفشل (للمراجعة)
         if: failure()
