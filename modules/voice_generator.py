@@ -11,7 +11,7 @@ import edge_tts
 
 logger = logging.getLogger("modules.voice_generator")
 
-DEFAULT_VOICE = "ar-SA-HamedNeural"  # صوت عربي واضح؛ يمكن تبديله حسب التفضيل
+DEFAULT_VOICE = "en-US-ChristopherNeural"  # صوت إنجليزي واضح وحيوي؛ يمكن تبديله حسب التفضيل
 
 
 async def _generate(text: str, out_path: str, voice: str):
