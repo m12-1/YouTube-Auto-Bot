@@ -29,11 +29,10 @@ async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page:
             results = []
             for video in data.get("videos", []):
                 files = sorted(video.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True)
-                # نفس معيار الحد الأدنى المطبَّق على Pixabay: لا نقبل ملفًا
-                # بدقة أقل من 720p (height < 720) حتى لو كان الأعلى المتاح
-                # لهذا الفيديو تحديدًا، لأن التكبير الرقمي لاحقًا لن يعوّض
-                # نقص الدقة الحقيقية في الفيديو النهائي.
-                files = [f for f in files if (f.get("height") or 0) >= 720]
+                # الحد الأدنى المطلوب أصبح 1080p (بدل 720p سابقًا) بناءً على
+                # طلب صريح: لا يجوز أن تقل دقة أي مصدر مقبول عن 1080، حتى لو
+                # كان الأعلى المتاح لهذا الفيديو تحديدًا 720p فقط.
+                files = [f for f in files if (f.get("height") or 0) >= 1080]
                 if files:
                     results.append({
                         "source": "pexels",
@@ -64,13 +63,16 @@ async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page
             results = []
             for hit in data.get("hits", []):
                 videos = hit.get("videos", {})
-                # نرفض طبقة "small" (360x640 فعليًا) صراحة: قبولها كان يسمح
-                # بمرور مقاطع 360p بصمت كلما لم تتوفر جودة أعلى لكلمة البحث،
-                # فيُكبَّر رقميًا (upscale) لاحقًا دون أي زيادة حقيقية في
-                # الدقة، وهذا بالضبط سبب ظهور فيديوهات نهائية ضبابية رغم أن
-                # أبعاد الملف النهائي 1080x1920. نطلب medium (~720p) كحد
-                # أدنى؛ إن لم يتوفر لا نعيد هذا المرشح إطلاقًا بدل قبوله.
-                best = videos.get("large") or videos.get("medium")
+                # الحد الأدنى أصبح 1080p: نقبل طبقة "large" فقط (عادة
+                # ~1920x1080 في Pixabay)، ونرفض "medium" (~720p) أيضًا الآن
+                # بعد أن كان مقبولاً سابقًا. إن لم تتوفر "large" لهذه
+                # الكلمة، لا نعيد هذا المرشح إطلاقًا بدل التنازل عن الدقة.
+                best = videos.get("large")
+                # بعض فيديوهات Pixabay تصنَّف "large" لكنها أقل فعليًا من
+                # 1080p (نادر لكن يحدث)، لذا نتحقق من height الفعلي أيضًا
+                # لا الاسم فقط.
+                if best and (best.get("height") or 0) < 1080:
+                    best = None
                 if best:
                     results.append({
                         "source": "pixabay",
