@@ -32,6 +32,10 @@ def fetch_competitor_videos(youtube_keywords: list[str], max_results: int = TOP_
     search_params = {
         "key": api_key, "q": query, "part": "snippet", "type": "video",
         "order": "date", "maxResults": max_results * 2,  # نجلب أكثر ثم نرتب بالمشاهدات
+        # نفرض لغة إنجليزية على نتائج المنافسين حتى لا تُجلب فيديوهات
+        # بلغة مختلفة (عربية مثلاً) تُضلّل Gemini لاحقًا عن لغة العنوان/الوصف
+        # المطلوبة فعليًا لجمهورنا الإنجليزي.
+        "relevanceLanguage": "en",
     }
     resp = requests.get(YOUTUBE_SEARCH_URL, params=search_params, timeout=20)
     resp.raise_for_status()
@@ -61,21 +65,24 @@ def fetch_competitor_videos(youtube_keywords: list[str], max_results: int = TOP_
 
 def optimize_seo(our_title: str, our_narration: str, competitor_videos: list[dict]) -> dict:
     competitors_str = "\n".join(
-        f"- {c['title']} (مشاهدات: {c['views']})\n  وصف: {c['description']}"
+        f"- {c['title']} (views: {c['views']})\n  description: {c['description']}"
         for c in competitor_videos
-    ) or "لا توجد بيانات منافسين متاحة."
+    ) or "No competitor data available."
 
     prompt = f"""
-عنوان فيديونا الحالي: "{our_title}"
-نص الشرح: "{our_narration}"
+Our current video title: "{our_title}"
+Narration script: "{our_narration}"
 
-فيديوهات منافسة على نفس الموضوع (عناوين وأوصاف):
+Competing videos on the same topic (titles and descriptions):
 {competitors_str}
 
-بناءً على ما سبق، ولّد عنوانًا ووصفًا وعلامات (tags) محسّنة لمحرك بحث يوتيوب (SEO)،
-بحيث يظهر العنوان بشكل جذاب في المقدمة ولا يكرر عناوين المنافسين حرفيًا.
+Based on the above, generate an SEO-optimized title, description, and tags for YouTube search,
+with a catchy title upfront that does not copy competitor titles verbatim.
 
-أعد فقط JSON:
+CRITICAL: the output MUST be in English, regardless of the language of any competitor
+titles/descriptions shown above. Never output Arabic or any other language.
+
+Return only JSON:
 {{
   "optimized_title": "...",
   "optimized_description": "...",
