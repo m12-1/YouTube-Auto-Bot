@@ -135,6 +135,10 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str) -> dict
     narration_excerpt = scene["text"]
     keywords_pool = list(scene.get("visual_keywords", []))
 
+    # أفضل مرشح رُصد عبر كل الجولات (حتى لو لم يبلغ عتبة القبول)، يُستخدم كخطة
+    # احتياطية بدل إفشال المشهد/الفيديو بالكامل إن لم يصل أي مرشح للعتبة.
+    fallback_best = None  # (score, clip_path, start, end)
+
     for retry in range(MAX_KEYWORD_RETRY_PER_SCENE):
         remaining_keywords = [
             kw for kw in keywords_pool if not run_state.keyword_already_tried(scene_id, kw)
@@ -195,6 +199,25 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str) -> dict
         for kw in {c["keyword"] for c in top3}:
             run_state.mark_keyword_used(scene_id, kw)
 
+        # نحدّث أفضل مرشح احتياطي عبر كل النتائج (وليس فقط المقبولين)، للاستخدام
+        # لاحقًا إن فشلت كل الجولات في بلوغ العتبة المطلوبة.
+        for r in sorted(results, key=lambda r: r.get("score", 0), reverse=True):
+            r_segment = r.get("best_segment")
+            if (
+                r.get("candidate_index") is None
+                or not (0 <= r["candidate_index"] < len(top3))
+                or local_paths[r["candidate_index"]] is None
+                or not r_segment
+            ):
+                continue
+            r_score = r.get("score", 0)
+            if fallback_best is None or r_score > fallback_best[0]:
+                fallback_best = (
+                    r_score, local_paths[r["candidate_index"]],
+                    r_segment["start"], r_segment["end"],
+                )
+            break
+
         # نرتّب المقبولين تنازليًا حسب score ونختار أول مرشح صالح فعليًا
         # (تحقق من صحة candidate_index وتوفر segment وأن التحميل لم يفشل)
         accepted_sorted = sorted(accepted, key=lambda r: r.get("score", 0), reverse=True)
@@ -230,6 +253,17 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str) -> dict
 
         logger.info("[%s] رُفضت كل المرشحين في هذه الجولة (محاولة %d/%d).",
                     scene_id, retry + 1, MAX_KEYWORD_RETRY_PER_SCENE)
+
+    if fallback_best is not None:
+        score, clip_path, start, end = fallback_best
+        result = {"clip_path": clip_path, "start": start, "end": end, "score": score}
+        run_state.set_scene_result(scene_id, **result)
+        logger.warning(
+            "[%s] لم يصل أي مرشح لعتبة القبول (%.1f) بعد %d محاولات؛ استُخدم أفضل مرشح "
+            "متاح كخطة احتياطية (score=%.1f) بدل إفشال الفيديو بالكامل.",
+            scene_id, MEDIA_RELEVANCE_ACCEPT_THRESHOLD, MAX_KEYWORD_RETRY_PER_SCENE, score,
+        )
+        return result
 
     logger.error("[%s] فشل نهائي بعد %d محاولات.", scene_id, MAX_KEYWORD_RETRY_PER_SCENE)
     return None
