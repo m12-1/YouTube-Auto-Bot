@@ -21,8 +21,9 @@ def select_topic(category: str, recent_topics: list[str] | None = None) -> str:
 {avoid_clause}
 أعد فقط اسم الموضوع كسطر نصي واحد بدون أي شرح إضافي أو علامات ترقيم زائدة.
 """
-    result = call_gemini_with_rotation(STAGE, [prompt], max_output_tokens=100, temperature=0.9)
-    return result.strip().strip('"').strip()
+    result = call_gemini_with_rotation(STAGE, [prompt], max_output_tokens=300, temperature=0.9)
+    first_line = next((line for line in result.strip().splitlines() if line.strip()), result)
+    return first_line.strip().strip('"').strip("*").strip()
 
 
 if __name__ == "__main__":
