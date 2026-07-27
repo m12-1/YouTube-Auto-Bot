@@ -8,6 +8,7 @@
 """
 
 import os
+import sys
 import argparse
 import logging
 import time
@@ -17,8 +18,30 @@ from moviepy.editor import AudioFileClip
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ملاحظة مهمة عن التسجيل:
+# logging.basicConfig() الافتراضي يفتح StreamHandler على sys.stderr، بينما
+# moviepy (write_videofile) يطبع شريط التقدّم على sys.stdout. لو التُقط
+# الناتج عبر تيار واحد فقط (مثلاً `python main.py > log.txt` يلتقط stdout
+# فقط)، تختفي رسائل logger.warning/info من الملف تمامًا رغم أنها نُفّذت
+# فعليًا، فيبدو الأمر وكأن الرندر بدأ دون أي سبب مسجَّل قبله. لتفادي هذا
+# نجبر كل السجلات على الذهاب لنفس تيار stdout الذي يستخدمه moviepy، مع
+# flush فوري لكل سطر حتى يبقى الترتيب الزمني صحيحًا حتى عند التقاط الناتج
+# بأدوات لا تفصل بين stdout/stderr بشكل موثوق.
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.flush = sys.stdout.flush  # تأكيد الـ flush الفوري
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[_stdout_handler],
+    force=True,
+)
 logger = logging.getLogger("main")
+
+
+def _flush_logs():
+    for h in logging.getLogger().handlers:
+        h.flush()
+
 
 from shared.state import RunState
 from modules import (
@@ -90,16 +113,23 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
             start_t, end_t = timing
             result["audio_duration"] = max(end_t - start_t, 0.1)
 
-    # 6) المونتاج والتصدير
+    # 6) المونتاج والتصدير (الرندر الأول والوحيد لحد الآن)
     logger.info("=== المرحلة 6: المونتاج والتصدير ===")
+    _flush_logs()
     final_video_path = os.path.join(run_dir, "final_video.mp4")
     video_composer.compose_video(scene_results, audio_path, subtitle_segments, final_video_path)
 
     # 7) التدقيق النهائي لكل مشهد (حلقة إعادة بناء المشاهد المرفوضة)
-    # ⚠️ تحسين مهم: تجميع جميع الاستبدالات أولاً ثم رندر واحد فقط في النهاية،
-    # بدل الرندر المتكرر لكل مشهد فاشل على حدة (كان يسبب هدر موارد ووقت).
+    #
+    # تصحيح مهم: سابقًا كان الكود يستدعي رندر الفيديو الكامل مرة واحدة لكل
+    # مشهد مرفوض على حدة (داخل حلقة for f in failed)، فإن رفض التدقيق 3
+    # مشاهد في نفس الجولة كانت النتيجة 3 عمليات رندر كاملة متتالية. الآن:
+    # نجمع كل استبدالات المشاهد المرفوضة أولاً (بلا أي رندر)، ثم نعيد الرندر
+    # مرة واحدة فقط في نهاية الجولة، وفقط إن استُبدل مشهد واحد على الأقل
+    # فعليًا. إن فشلت كل محاولات الاستبدال في هذه الجولة، لا يحدث أي رندر.
     logger.info("=== المرحلة 7: التدقيق النهائي ===")
     for attempt in range(MAX_SCENE_AUDIT_RETRIES):
+        _flush_logs()
         audit_results = final_scene_audit.audit_video(final_video_path, plan["narration"], plan["scenes"])
         failed = final_scene_audit.get_failed_scenes(audit_results)
         if not failed:
@@ -107,9 +137,9 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
             break
 
         logger.warning("مشاهد مرفوضة (%d): %s", len(failed), [f["scene_id"] for f in failed])
-        
-        # 🔄 نجمّع جميع التغييرات هنا قبل أي رندر
-        any_scene_replaced = False
+        _flush_logs()
+
+        any_replaced = False
         for f in failed:
             scene_index = next((i for i, s in enumerate(plan["scenes"]) if s["id"] == f["scene_id"]), None)
             if scene_index is None:
@@ -129,13 +159,17 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
                 start_t, end_t = timing
                 new_result["audio_duration"] = max(end_t - start_t, 0.1)
             scene_results[scene_index] = new_result
-            any_scene_replaced = True
-            logger.info("✅ تم استبدال المشهد %s بالبديل الجديد (سيُرندر مرة واحدة بعد جمع كل التغييرات).", f["scene_id"])
-        
-        # 🎬 رندر واحد فقط بعد معالجة كل المشاهد الفاشلة في هذه المحاولة
-        if any_scene_replaced:
-            logger.info("🎬 بدء رندر موحد لجميع المشاهد المستبدلة (%d مشاهد)...", len(failed))
+            any_replaced = True
+
+        # رندر واحد فقط بعد تجميع كل استبدالات هذه الجولة، وليس رندرًا
+        # منفصلًا لكل مشهد مرفوض.
+        if any_replaced:
+            logger.info("إعادة رندر الفيديو مرة واحدة بعد استبدال %d مشهد/مشاهد في هذه الجولة.",
+                        sum(1 for _ in failed))
+            _flush_logs()
             video_composer.compose_video(scene_results, audio_path, subtitle_segments, final_video_path)
+        else:
+            logger.warning("لم يُستبدل أي مشهد فعليًا في هذه الجولة، تخطي إعادة الرندر.")
     else:
         logger.warning("تم الوصول للحد الأقصى من محاولات التدقيق (%d) مع بقاء مشاهد دون المستوى.",
                         MAX_SCENE_AUDIT_RETRIES)
