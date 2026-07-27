@@ -8,7 +8,10 @@
 يدعم أيضًا استبدال مشهد واحد فقط وإعادة الرندر الجزئي (مطلوب في المرحلة 7).
 """
 
+import hashlib
+import json
 import logging
+import os
 import subprocess
 
 import arabic_reshaper
@@ -140,9 +143,74 @@ def _prepare_clip(scene_result: dict, target_size: tuple[int, int]):
     return clip.fadein(FADE_DURATION).fadeout(FADE_DURATION)
 
 
+def _scene_cache_key(scene_result: dict, size: tuple[int, int]) -> str:
+    """مفتاح يحدد بشكل فريد كل العوامل المؤثرة في شكل مقطع المشهد النهائي
+    (المصدر، القص، مدة الصوت المطلوبة، الدقة). أي تغيّر في أي منها يُبطل
+    الكاش لذلك المشهد فقط."""
+    payload = {
+        "clip_path": scene_result["clip_path"],
+        "start": scene_result["start"],
+        "end": scene_result["end"],
+        "audio_duration": scene_result.get("audio_duration"),
+        "size": size,
+        "fade": FADE_DURATION,
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_or_render_scene_clip(scene_id: str, scene_result: dict, size: tuple[int, int], cache_dir: str):
+    """يعيد مقطع الفيديو الجاهز (مع fade) لهذا المشهد: من الكاش إن كان
+    موجودًا ومطابقًا (لا حاجة لإعادة قراءة/قص/تحجيم المصدر الخام)، أو
+    يصيّره من جديد فقط إن تغيّر المصدر أو لم يكن مخزّنًا بعد.
+    هذا هو ما يمنع إعادة معالجة كل المشاهد غير المرفوضة عند كل جولة تدقيق."""
+    os.makedirs(cache_dir, exist_ok=True)
+    key = _scene_cache_key(scene_result, size)
+    cached_path = os.path.join(cache_dir, f"{scene_id}.mp4")
+    meta_path = os.path.join(cache_dir, f"{scene_id}.key")
+
+    if os.path.exists(cached_path) and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                cached_key = f.read().strip()
+        except Exception:
+            cached_key = None
+        if cached_key == key:
+            logger.info("[%s] استخدام مقطع مُخزَّن مسبقًا (لم يتغيّر)، تخطي إعادة المعالجة.", scene_id)
+            return VideoFileClip(cached_path)
+
+    logger.info("[%s] تصيير مقطع جديد (مشهد جديد/مُستبدَل).", scene_id)
+    fresh_clip = _prepare_clip(scene_result, size)
+    fresh_clip.write_videofile(
+        cached_path, fps=30, codec="libx264", audio=False,
+        preset="medium", threads=4, logger=None,
+    )
+    fresh_clip.close()
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write(key)
+    return VideoFileClip(cached_path)
+
+
 def compose_video(scene_results: list[dict], narration_audio_path: str, subtitle_segments: list[dict],
-                   out_path: str, size: tuple[int, int] = EXPORT_RESOLUTION):
-    clips = [_prepare_clip(sr, size) for sr in scene_results]
+                   out_path: str, size: tuple[int, int] = EXPORT_RESOLUTION, scene_cache_dir: str | None = None):
+    """يبني الفيديو النهائي. إن مُرِّر scene_cache_dir، تُعاد مقاطع المشاهد
+    غير المتغيّرة من الكاش بدل إعادة معالجتها من مصدرها الخام في كل مرة —
+    فقط المشاهد المُستبدَلة فعليًا (بعد فشل التدقيق) يُعاد تصييرها. تجميع
+    المقاطع + الصوت + الترجمة في ملف واحد يبقى خطوة نهائية لا مفر منها
+    (moviepy لا يدعم دمج صوت/ترجمة جزئيًا)، لكنها الآن خفيفة نسبيًا لأنها
+    قراءة/دمج ملفات جاهزة الترميز بدل إعادة بناء كل مشهد من الصفر.
+    """
+    if scene_cache_dir:
+        # ملاحظة: fade مطبّق بالفعل داخل _prepare_clip قبل الكتابة إلى ملف
+        # الكاش، فلا يُعاد تطبيقه هنا (تجنّبًا لمضاعفة تأثير fade عند
+        # القراءة من الكاش في المرات اللاحقة).
+        clips = [
+            _get_or_render_scene_clip(sr.get("scene_id") or sr.get("id") or f"scene_{i}",
+                                       sr, size, scene_cache_dir)
+            for i, sr in enumerate(scene_results)
+        ]
+    else:
+        clips = [_prepare_clip(sr, size) for sr in scene_results]
     video = concatenate_videoclips(clips, method="compose", padding=-FADE_DURATION)
 
     narration = AudioFileClip(narration_audio_path)
