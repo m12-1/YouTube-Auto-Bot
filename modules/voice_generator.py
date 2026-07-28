@@ -15,7 +15,11 @@ DEFAULT_VOICE = "en-US-ChristopherNeural"  # صوت إنجليزي واضح وح
 
 
 async def _generate(text: str, out_path: str, voice: str):
-    communicate = edge_tts.Communicate(text, voice)
+    # ملاحظة: بدءًا من الإصدارات الحديثة لمكتبة edge-tts (>=7.2.3)، تغيّر
+    # الافتراضي من "WordBoundary" إلى "SentenceBoundary"، لذا يجب تمرير
+    # boundary="WordBoundary" صراحة، وإلا لن تصل أي WordBoundary إطلاقًا
+    # (تصل SentenceBoundary فقط ولا تُطابق الشرط أدناه).
+    communicate = edge_tts.Communicate(text, voice, boundary="WordBoundary")
     word_boundaries = []
     with open(out_path, "wb") as audio_file:
         async for chunk in communicate.stream():
