@@ -1,0 +1,43 @@
+name: Produce & Publish Video From Plan
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # فحص كل 15 دقيقة عن أي صف مستحق النشر الآن
+  workflow_dispatch: {}
+
+concurrency:
+  group: video-production
+  cancel-in-progress: false   # لا نلغي رندرًا قيد التنفيذ عند بدء تشغيل جديد
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies (ffmpeg + imagemagick لـ moviepy)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg imagemagick
+
+      - run: pip install -r requirements.txt
+
+      - name: Run production for next due plan item
+        env:
+          GEMINI_KEY_ADVANCED: ${{ secrets.GEMINI_KEY_ADVANCED }}
+          GEMINI_KEY_FILTER: ${{ secrets.GEMINI_KEY_FILTER }}
+          GEMINI_KEY_FILTER_2: ${{ secrets.GEMINI_KEY_FILTER_2 }}
+          GEMINI_KEY_IMAGE: ${{ secrets.GEMINI_KEY_IMAGE }}
+          GEMINI_KEY_LIGHT: ${{ secrets.GEMINI_KEY_LIGHT }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          YOUTUBE_SEARCH_API_KEY: ${{ secrets.YOUTUBE_SEARCH_API_KEY }}
+          YOUTUBE_OAUTH_CLIENT_ID: ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
+          YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
+          YOUTUBE_OAUTH_REFRESH_TOKEN: ${{ secrets.YOUTUBE_OAUTH_REFRESH_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: python run_from_plan.py
