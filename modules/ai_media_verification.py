@@ -50,13 +50,19 @@ _VERIFY_PROMPT = """
 """
 
 _ALT_KEYWORD_PROMPT = """
-الكلمات المفتاحية التالية لم تُعطِ نتائج بصرية مناسبة لهذا النص: "{narration_excerpt}"
+موضوع الفيديو العام: "{video_topic}"
+
+الكلمات المفتاحية التالية لم تُعطِ نتائج بصرية مناسبة لهذا الجزء من السكربت: "{narration_excerpt}"
 الكلمات التي جُرِّبت وفشلت: {tried_keywords}
 
-اقترح 3 كلمات/جمل بحث بصري إنجليزية جديدة ومختلفة تمامًا عن السابقة، مناسبة للبحث
-في مكتبات فيديو مجانية (Pexels/Pixabay) وتعبّر عن نفس المعنى.
+اقترح 5 كلمات/جمل بحث بصري إنجليزية جديدة، مرادفة أو قريبة المعنى من الكلمات
+الفاشلة (وليس مواضيع مختلفة تمامًا)، بحيث تبقى مرتبطة بنفس فكرة هذا الجزء من
+النص وبموضوع الفيديو العام أعلاه، لكنها أوسع/أعم بصريًا (مرادف أعم، أو مشهد
+رمزي/توضيحي مرتبط بنفس المعنى) لزيادة فرصة إيجاد نتائج في مكتبات فيديو مجانية
+(Pexels/Pixabay). تجنّب تمامًا أي كلمة تكرر حرفيًا أو شبه حرفيًا إحدى الكلمات
+الفاشلة المذكورة أعلاه.
 
-أعد فقط كائن JSON: {{"alternative_keywords": ["...", "...", "..."]}}
+أعد فقط كائن JSON: {{"alternative_keywords": ["...", "...", "...", "...", "..."]}}
 """
 
 
@@ -68,9 +74,13 @@ def _verify_batch(narration_excerpt: str, candidates: list[dict], local_paths: l
     return parse_json_response(raw).get("results", [])
 
 
-def _request_alternative_keywords(narration_excerpt: str, tried_keywords: list[str]) -> list[str]:
+def _request_alternative_keywords(
+    narration_excerpt: str, tried_keywords: list[str], video_topic: str = ""
+) -> list[str]:
     prompt = _ALT_KEYWORD_PROMPT.format(
-        narration_excerpt=narration_excerpt, tried_keywords="، ".join(tried_keywords)
+        video_topic=video_topic or "غير محدد",
+        narration_excerpt=narration_excerpt,
+        tried_keywords="، ".join(tried_keywords),
     )
     raw = call_gemini_with_rotation(STAGE, [prompt], response_mime_type="application/json")
     return parse_json_response(raw).get("alternative_keywords", [])
@@ -146,7 +156,8 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str) -> dict
         if not remaining_keywords:
             logger.warning("[%s] لا كلمات مفتاحية متبقية، طلب بدائل من Gemini.", scene_id)
             tried = run_state.data["used_keywords"].get(scene_id, [])
-            remaining_keywords = _request_alternative_keywords(narration_excerpt, tried)
+            video_topic = run_state.data.get("video_title", "")
+            remaining_keywords = _request_alternative_keywords(narration_excerpt, tried, video_topic)
             keywords_pool.extend(remaining_keywords)
 
         candidates = search_scene_media_sync(remaining_keywords)
