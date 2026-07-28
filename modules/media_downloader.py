@@ -24,6 +24,16 @@ IA_METADATA_URL = "https://archive.org/metadata/{identifier}"
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 NASA_SEARCH_URL = "https://images-api.nasa.gov/search"
 
+# سياسة Wikimedia (User-Agent Policy) تحظر الطلبات بدون User-Agent واضح يوضح
+# هوية التطبيق ومعلومات تواصل، وترفضها بـ HTTP 403 (نقطة إصلاح مشكلة
+# "Wikimedia Commons -> HTTP 403" الظاهرة في اللوج).
+COMMONS_USER_AGENT = (
+    "YouTube-Auto-Bot/1.0 "
+    "(https://github.com/; contact: admin@example.com) "
+    "python-aiohttp"
+)
+COMMONS_HEADERS = {"User-Agent": COMMONS_USER_AGENT}
+
 # عدد المقاطع الافتراضي المطلوب جلبه من كل مصدر لكل كلمة مفتاحية (نقطة 4)
 _PER_SOURCE_QUOTA = CANDIDATES_PER_KEYWORD_PER_SOURCE
 
@@ -274,7 +284,7 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
         "format": "json",
     }
     try:
-        async with session.get(COMMONS_API_URL, params=search_params, timeout=20) as resp:
+        async with session.get(COMMONS_API_URL, params=search_params, headers=COMMONS_HEADERS, timeout=20) as resp:
             if resp.status != 200:
                 logger.warning("Wikimedia Commons [%s] -> HTTP %s", keyword, resp.status)
                 return []
@@ -297,7 +307,7 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
             "format": "json",
         }
         try:
-            async with session.get(COMMONS_API_URL, params=info_params, timeout=20) as info_resp:
+            async with session.get(COMMONS_API_URL, params=info_params, headers=COMMONS_HEADERS, timeout=20) as info_resp:
                 if info_resp.status != 200:
                     continue
                 info_data = await info_resp.json()
@@ -435,8 +445,9 @@ async def download_candidate(candidate: dict, dest_dir: str) -> str:
     if os.path.exists(path):
         return path
 
+    dl_headers = COMMONS_HEADERS if candidate.get("source") == "wikimedia_commons" else None
     async with aiohttp.ClientSession() as session:
-        async with session.get(candidate["url"], timeout=60) as resp:
+        async with session.get(candidate["url"], headers=dl_headers, timeout=60) as resp:
             resp.raise_for_status()
             with open(path, "wb") as f:
                 async for chunk in resp.content.iter_chunked(1024 * 64):
