@@ -13,6 +13,7 @@ from config import (
     SPACE_ASTRONOMY_CATEGORY_KEYWORDS,
     MIN_ACCEPTABLE_VIDEO_HEIGHT,
     ALLOWED_VIDEO_ORIENTATIONS,
+    MAX_CANDIDATES_PER_VERIFICATION_BATCH,
 )
 
 logger = logging.getLogger("modules.media_downloader")
@@ -137,6 +138,8 @@ async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page:
                         "width": files[0].get("width"),
                         "height": files[0].get("height"),
                         "duration": video.get("duration"),
+                        "title": None,
+                        "description": f"Stock footage by {video.get('user', {}).get('name')}" if video.get("user") else None,
                     })
             return results
     except Exception as e:  # noqa: BLE001
@@ -181,6 +184,8 @@ async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page
                         "width": best.get("width"),
                         "height": best.get("height"),
                         "duration": hit.get("duration"),
+                        "title": None,
+                        "description": f"Tags: {hit.get('tags')}" if hit.get("tags") else None,
                     })
             return results
     except Exception as e:  # noqa: BLE001
@@ -267,10 +272,18 @@ async def _search_internet_archive(session: aiohttp.ClientSession, keyword: str,
             "duration": None,
             "requires_attribution": needs_attr,
             "attribution_text": f"\"{doc.get('title', identifier)}\" via Internet Archive" if needs_attr else None,
+            "title": doc.get("title"),
+            "description": (meta.get("metadata", {}) or {}).get("description"),
         })
         if len(results) >= limit:
             break
     return results
+
+
+def _strip_html(text: str) -> str:
+    """يزيل وسوم HTML البسيطة الشائعة في وصف Wikimedia Commons (extmetadata)."""
+    import re
+    return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
 async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
@@ -355,6 +368,8 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
             "duration": None,
             "requires_attribution": needs_attr,
             "attribution_text": f"\"{title}\" by {artist or 'Wikimedia Commons contributor'} via Wikimedia Commons" if needs_attr else None,
+            "title": title,
+            "description": _strip_html(ext.get("ImageDescription", {}).get("value", "")) or None,
         })
         if len(results) >= limit:
             break
@@ -398,6 +413,8 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
             "duration": None,
             "requires_attribution": True,
             "attribution_text": f"\"{title}\" courtesy of NASA",
+            "title": title,
+            "description": item_data.get("description"),
         })
         if len(results) >= limit:
             break
@@ -415,11 +432,33 @@ async def search_scene_media(
     (وناسا إن كانت الفئة/الموضوع/كلمات المشهد تخص الفضاء/الفلك) باستخدام كل
     الكلمات المفتاحية للمشهد، ويعيد قائمة موحّدة من المرشحين (بدون تحميل
     الملفات بعد). لكل كلمة مفتاحية نجلب حتى 3 مقاطع من كل مصدر (نقطة 4).
+
+    للمحتوى الفضائي/الفلكي: تُعطى ناسا أولوية فعلية (وليست مجرد مصدر إضافي
+    ضمن نفس الدفعة) — نبحث في ناسا أولاً، ولا نلجأ لبقية المصادر إلا إذا لم
+    تكفِ نتائج ناسا وحدها (أقل من MAX_CANDIDATES_PER_VERIFICATION_BATCH).
     """
     all_keywords = list(visual_keywords) + list(youtube_keywords or [])
     # نفحص الفئة والموضوع وكلمات المشهد نفسها معًا (وليس الفئة وحدها)، لأن
     # فئة عامة مثل "علوم" قد يكون موضوعها الفعلي فلكيًا (نقطة 4).
     use_nasa = _mentions_space_or_astronomy(category, topic, " ".join(all_keywords))
+
+    if use_nasa:
+        async with aiohttp.ClientSession() as session:
+            nasa_lists = await asyncio.gather(*[_search_nasa(session, kw) for kw in all_keywords])
+        nasa_candidates = [c for sub in nasa_lists for c in sub]
+        if len(nasa_candidates) >= MAX_CANDIDATES_PER_VERIFICATION_BATCH:
+            logger.info(
+                "المحتوى فضائي/فلكي: ناسا وحدها كافية (%d مرشح) — تخطي بقية المصادر لهذه الدفعة.",
+                len(nasa_candidates),
+            )
+            return nasa_candidates
+        logger.info(
+            "المحتوى فضائي/فلكي: ناسا أرجعت %d مرشح فقط (أقل من %d المطلوبة) — "
+            "استكمال البحث ببقية المصادر كخطة احتياطية.",
+            len(nasa_candidates), MAX_CANDIDATES_PER_VERIFICATION_BATCH,
+        )
+    else:
+        nasa_candidates = []
 
     async with aiohttp.ClientSession() as session:
         tasks = []
@@ -428,16 +467,16 @@ async def search_scene_media(
             tasks.append(_search_pixabay(session, kw))
             tasks.append(_search_internet_archive(session, kw))
             tasks.append(_search_wikimedia_commons(session, kw))
-            if use_nasa:
-                tasks.append(_search_nasa(session, kw))
         results_lists = await asyncio.gather(*tasks)
 
-    candidates = [c for sub in results_lists for c in sub]
+    candidates = nasa_candidates + [c for sub in results_lists for c in sub]
     return candidates
 
 
-async def download_candidate(candidate: dict, dest_dir: str) -> str:
-    """يحمّل ملف الفيديو الفعلي لمرشح معيّن ويعيد المسار المحلي."""
+async def download_candidate(candidate: dict, dest_dir: str, max_retries: int = 3) -> str:
+    """يحمّل ملف الفيديو الفعلي لمرشح معيّن ويعيد المسار المحلي.
+    يعيد المحاولة عند انقطاع/بطء الاتصال (شائع خصوصًا مع archive.org) قبل
+    الاستسلام، بدل فشل التحميل من أول محاولة (نقطة ب)."""
     os.makedirs(dest_dir, exist_ok=True)
     ext = ".mp4"
     filename = f"{candidate['source']}_{candidate['id']}{ext}"
@@ -446,13 +485,31 @@ async def download_candidate(candidate: dict, dest_dir: str) -> str:
         return path
 
     dl_headers = COMMONS_HEADERS if candidate.get("source") == "wikimedia_commons" else None
-    async with aiohttp.ClientSession() as session:
-        async with session.get(candidate["url"], headers=dl_headers, timeout=60) as resp:
-            resp.raise_for_status()
-            with open(path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 64):
-                    f.write(chunk)
-    return path
+    # archive.org أبطأ وأقل استقرارًا من بقية المصادر، فنمنحه مهلة أطول.
+    timeout = 120 if candidate.get("source") == "internet_archive" else 60
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(candidate["url"], headers=dl_headers, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    with open(path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(1024 * 64):
+                            f.write(chunk)
+            return path
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            if os.path.exists(path):
+                os.remove(path)  # لا نُبقي ملفًا جزئيًا/تالفًا بعد فشل محاولة
+            if attempt < max_retries:
+                logger.warning(
+                    "فشل تحميل %s (محاولة %d/%d): %s — إعادة المحاولة.",
+                    candidate.get("url"), attempt, max_retries, e,
+                )
+                await asyncio.sleep(2 * attempt)  # backoff تصاعدي بسيط
+    logger.warning("فشل تحميل %s نهائيًا بعد %d محاولات: %s", candidate.get("url"), max_retries, last_error)
+    raise last_error
 
 
 def search_scene_media_sync(visual_keywords, youtube_keywords=None, category="", topic=""):
