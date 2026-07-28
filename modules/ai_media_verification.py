@@ -40,6 +40,13 @@ _VERIFY_PROMPT = """
 لدي {n} مقاطع فيديو مرشحة لهذا الجزء من سكربت فيديو قصير:
 النص: "{narration_excerpt}"
 
+معلومات كل مقطع كما وردت من مصدره (العنوان/الوصف إن توفّرا) - استخدمها مع
+تحليلك البصري للفيديو نفسه معًا، فقد يكون الفيديو يمثّل شيئًا مختلفًا عمّا
+يبدو عليه بصريًا لأول وهلة (مثال: مقطع "سوائل ملونة تجريدية" قد يكون فعليًا
+عن ظاهرة علمية محددة يوضحها عنوانه، أو العكس - فيديو يبدو مناسبًا بصريًا لكن
+عنوانه/وصفه يكشف أنه عن موضوع مختلف تمامًا):
+{candidates_meta}
+
 لكل فيديو (بالترتيب الذي أُرسل به)، قيّم مدى ملاءمته من 0 إلى 10 لتمثيل هذا النص بصريًا،
 وحدد أفضل نطاق زمني (بالثواني) داخل الفيديو يمثل جوهر المشهد (لا يتجاوز طول المقطع الفعلي).
 
@@ -122,8 +129,24 @@ def _filter_by_actual_orientation(top3: list[dict], local_paths: list[str]) -> t
     return kept_candidates, kept_paths
 
 
+def _format_candidates_meta(candidates: list[dict]) -> str:
+    """يبني كتلة نصية بعنوان/وصف كل مرشح (إن توفّرا) لإرسالها مع الفيديو نفسه
+    لـ Gemini، بدل الاعتماد على التحليل البصري وحده (نقطة الطلب: تمرير
+    الميتاداتا مع الفيديو عند التحليل)."""
+    lines = []
+    for i, c in enumerate(candidates):
+        title = c.get("title") or "(بدون عنوان)"
+        description = c.get("description") or "(بدون وصف)"
+        lines.append(f"- الفيديو {i} [{c.get('source')}]: العنوان: {title} | الوصف: {description}")
+    return "\n".join(lines)
+
+
 def _verify_batch(narration_excerpt: str, candidates: list[dict], local_paths: list[str]) -> list[dict]:
-    prompt = _VERIFY_PROMPT.format(n=len(candidates), narration_excerpt=narration_excerpt)
+    prompt = _VERIFY_PROMPT.format(
+        n=len(candidates),
+        narration_excerpt=narration_excerpt,
+        candidates_meta=_format_candidates_meta(candidates),
+    )
     raw = call_gemini_with_rotation(
         STAGE, [prompt], media_paths=local_paths, response_mime_type="application/json"
     )
@@ -354,9 +377,7 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
             "requires_attribution": fb_candidate.get("requires_attribution", False),
             "attribution_text": fb_candidate.get("attribution_text"),
         }
-        run_state.set_scene_result(
-            scene_id, clip_path=clip_path, start=start, end=end, score=score,
-        )
+        run_state.set_scene_result(scene_id, **result)
         if needs_manual_review:
             logger.error(
                 "[%s] أفضل مرشح احتياطي (score=%.1f) أقل من الحد الأدنى المطلق "
