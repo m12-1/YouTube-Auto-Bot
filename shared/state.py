@@ -36,8 +36,13 @@ class RunState:
     def keyword_already_tried(self, scene_id: str, keyword: str) -> bool:
         return keyword in self.data["used_keywords"].get(scene_id, [])
 
-    def set_scene_result(self, scene_id: str, clip_path: str, start: float, end: float, score: float):
+    def set_scene_result(self, scene_id: str, clip_path: str, start: float, end: float, score: float,
+                          needs_manual_review: bool = False, requires_attribution: bool = False,
+                          attribution_text: str = None):
         self.data["scenes"][scene_id] = {
             "clip_path": clip_path, "start": start, "end": end, "score": score,
+            "needs_manual_review": needs_manual_review,
+            "requires_attribution": requires_attribution,
+            "attribution_text": attribution_text,
         }
         self.save()
