@@ -1,7 +1,11 @@
 """
 المرحلة 4: البحث المتوازي عن الوسائط في Pexels + Pixabay لكل مشهد،
 باستخدام visual_keywords (من المرحلة 3) مع youtube_keywords كبدائل احتياطية.
-تم التعديل: إضافة (Circuit Breaker) لـ NASA و Pixabay لتجنب إضاعة الوقت عند فشل المفاتيح (403/401).
+
+تم التعديل: تحسين التعامل مع NASA API:
+- فحص المفتاح قبل الطلب.
+- إضافة User-Agent مناسب.
+- تعطيل المصدر فوراً عند 403 مع رسالة توضيحية.
 """
 
 import os
@@ -27,7 +31,7 @@ IA_METADATA_URL = "https://archive.org/metadata/{identifier}"
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 NASA_SEARCH_URL = "https://images-api.nasa.gov/search"
 
-# سياسة Wikimedia (User-Agent Policy) تحظر الطلبات بدون User-Agent واضح
+# User-Agent لـ Wikimedia Commons
 COMMONS_USER_AGENT = (
     "YouTube-Auto-Bot/1.0 "
     "(https://github.com/; contact: admin@example.com) "
@@ -35,13 +39,15 @@ COMMONS_USER_AGENT = (
 )
 COMMONS_HEADERS = {"User-Agent": COMMONS_USER_AGENT}
 
-# عدد المقاطع الافتراضي المطلوب جلبه من كل مصدر لكل كلمة مفتاحية
+# User-Agent لـ NASA (بعض APIs تتطلبه)
+NASA_USER_AGENT = "Mozilla/5.0 (compatible; YouTubeAutoBot/1.0; +https://github.com/your-repo)"
+
 _PER_SOURCE_QUOTA = CANDIDATES_PER_KEYWORD_PER_SOURCE
 
 # ===== متغيرات حالة المصادر (Circuit Breaker) =====
-# لمنع إضاعة الوقت في محاولات فاشلة متكررة بسبب مفاتيح منتهية أو 403
-_NASA_ENABLED = True
+_NASA_ENABLED = True   # سنفحص المفتاح عند أول استخدام
 _PIXABAY_ENABLED = True
+_NASA_KEY_CHECKED = False  # لمنع تكرار فحص المفتاح
 
 
 def _mentions_space_or_astronomy(*texts: str) -> bool:
@@ -165,7 +171,6 @@ async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page
     params = {"key": api_key, "q": keyword, "per_page": per_page}
     try:
         async with session.get(PIXABAY_SEARCH_URL, params=params, timeout=20) as resp:
-            # إذا كان المفتاح خاطئاً أو منتهياً (401/403) أو تجاوزت الحصة (429)
             if resp.status in (401, 403, 429):
                 logger.warning("Pixabay [%s] -> HTTP %s (تعطيل Pixabay لتوفير الوقت)", keyword, resp.status)
                 _PIXABAY_ENABLED = False
@@ -392,23 +397,55 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
 
 
 async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
-    global _NASA_ENABLED
+    """
+    البحث في NASA API مع فحص صحة المفتاح مسبقاً.
+    إذا كان المفتاح مفقوداً أو أعاد 403، يتم تعطيل المصدر نهائياً لهذه الجولة.
+    """
+    global _NASA_ENABLED, _NASA_KEY_CHECKED
     if not _NASA_ENABLED:
         return []
 
     api_key = os.environ.get("Nasa_API_key")
-    if not api_key:
-        logger.warning("Nasa_API_key غير موجود، تعطيل NASA لهذه الجولة.")
-        _NASA_ENABLED = False
+    
+    # فحص المفتاح مرة واحدة فقط
+    if not _NASA_KEY_CHECKED:
+        _NASA_KEY_CHECKED = True
+        if not api_key:
+            logger.warning("Nasa_API_key غير موجود في البيئة. تعطيل NASA لتوفير الوقت.")
+            _NASA_ENABLED = False
+            return []
+        # نرسل طلب اختبار بسيط للتحقق من صحة المفتاح
+        test_params = {"api_key": api_key, "q": "earth", "media_type": "video", "page": 1}
+        headers = {"User-Agent": NASA_USER_AGENT}
+        try:
+            async with session.get(NASA_SEARCH_URL, params=test_params, headers=headers, timeout=10) as resp:
+                if resp.status == 403:
+                    logger.error(
+                        "مفتاح NASA غير صالح (HTTP 403). تحقق من المفتاح في https://api.nasa.gov . "
+                        "تعطيل NASA لهذه الجولة."
+                    )
+                    _NASA_ENABLED = False
+                    return []
+                if resp.status != 200:
+                    logger.warning("فشل اختبار NASA API (HTTP %s). تعطيل مؤقت.", resp.status)
+                    _NASA_ENABLED = False
+                    return []
+        except Exception as e:
+            logger.warning("فشل اختبار NASA API: %s. تعطيل مؤقت.", e)
+            _NASA_ENABLED = False
+            return []
+
+    if not _NASA_ENABLED:
         return []
 
+    # البحث الفعلي
     query_phrase = f'"{keyword}"' if " " in keyword.strip() else keyword
     params = {"q": query_phrase, "media_type": "video", "api_key": api_key}
+    headers = {"User-Agent": NASA_USER_AGENT}
     try:
-        async with session.get(NASA_SEARCH_URL, params=params, timeout=20) as resp:
-            # 403 يعني غالباً مفتاح خاطئ أو محظور. نعطله فوراً.
+        async with session.get(NASA_SEARCH_URL, params=params, headers=headers, timeout=20) as resp:
             if resp.status == 403:
-                logger.warning("NASA [%s] -> HTTP 403 (تعطيل NASA لتوفير الوقت)", keyword)
+                logger.warning("NASA [%s] -> HTTP 403 (المفتاح غير صالح). تعطيل NASA.", keyword)
                 _NASA_ENABLED = False
                 return []
             if resp.status != 200:
@@ -418,7 +455,6 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
             items = data.get("collection", {}).get("items", [])
     except Exception as e:
         logger.warning("خطأ بحث NASA عن '%s': %s", keyword, e)
-        # في حالة خطأ شبكة، لا نعطله فوراً (قد يكون مؤقتاً)، لكن نتركه يحاول مرة أخرى.
         return []
 
     results = []
