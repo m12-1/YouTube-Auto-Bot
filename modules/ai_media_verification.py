@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from shared.gemini_client import call_gemini_with_rotation, parse_json_response
 from shared.state import RunState
@@ -129,9 +130,14 @@ def _filter_by_actual_orientation(top3: list[dict], local_paths: list[str]) -> t
     ميتاداتا البحث أصلًا)، بعد فلاتر الاتجاه المبدئية في media_downloader
     التي تعتمد على أبعاد الميتاداتا المُعلَنة من كل مصدر.
     """
+    # فحص ffprobe لكل مرشح مستقل تمامًا عن البقية (كل فحص يقرأ ملفه الخاص فقط)،
+    # فتشغيلها بالتوازي عبر خيوط لا يغيّر أي نتيجة فحص، فقط يسرّع الوصول إليها
+    # (خصوصًا أن ffprobe نفسه ينتظر IO أغلب وقته لا CPU).
+    with ThreadPoolExecutor(max_workers=max(1, len(local_paths))) as ex:
+        orientations = list(ex.map(_get_actual_video_orientation, local_paths))
+
     kept_candidates, kept_paths = [], []
-    for cand, path in zip(top3, local_paths):
-        orientation = _get_actual_video_orientation(path)
+    for cand, path, orientation in zip(top3, local_paths, orientations):
         # اتجاه غير معروف (فشل الفحص) -> نستبعد حذرًا، نفس منطق الحذر
         # المطبّق على الرخص/الدقة غير الواضحة في بقية النظام.
         if orientation is None or orientation not in ALLOWED_VIDEO_ORIENTATIONS:
@@ -286,13 +292,22 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
         top3 = candidates[:MAX_CANDIDATES_PER_VERIFICATION_BATCH]
 
         async def _download_all(cands):
+            # تشغيل كل التحميلات معًا عبر gather بدل انتظار كل واحد قبل بدء
+            # التالي (كما كان سابقًا رغم استخدام async/await، كانت التحميلات
+            # فعليًا تسلسلية لأن كل await ينتظر قبل بدء التالي). download_candidate
+            # نفسها async فعليًا (aiohttp)، فالتوازي هنا حقيقي ولا يغيّر أي شيء
+            # في نتيجة التحميل نفسها أو إعادة المحاولة الداخلية لكل ملف.
+            results = await asyncio.gather(
+                *[download_candidate(c, media_dir) for c in cands],
+                return_exceptions=True,
+            )
             paths = []
-            for c in cands:
-                try:
-                    paths.append(await download_candidate(c, media_dir))
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("فشل تحميل %s: %s", c.get("url"), e)
+            for c, r in zip(cands, results):
+                if isinstance(r, Exception):
+                    logger.warning("فشل تحميل %s: %s", c.get("url"), r)
                     paths.append(None)
+                else:
+                    paths.append(r)
             return paths
 
         local_paths = asyncio.run(_download_all(top3))
@@ -321,9 +336,12 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
         # نولّد معاينة مضغوطة من كل فيديو لإرسالها لـ Gemini (بدل الملف الأصلي
         # الذي غالبًا يتجاوز حد الـ inline data)، مع الإبقاء على local_paths
         # الأصلية كاملة الجودة لاستخدامها لاحقًا في المونتاج النهائي.
-        preview_paths = [
-            _make_verification_preview(p, media_dir) or p for p in local_paths
-        ]
+        # توليد المعاينات المضغوطة بالتوازي (كل معاينة عملية ffmpeg مستقلة عن
+        # الأخرى بملف مختلف)؛ نفس أمر ffmpeg ونفس جودة/مدة المعاينة بالضبط،
+        # فقط تُنفَّذ كل العمليات في نفس الوقت بدل التتابع.
+        with ThreadPoolExecutor(max_workers=max(1, len(local_paths))) as ex:
+            raw_previews = list(ex.map(lambda p: _make_verification_preview(p, media_dir), local_paths))
+        preview_paths = [rp or p for rp, p in zip(raw_previews, local_paths)]
 
         try:
             results = _verify_batch(narration_excerpt, top3, preview_paths)
