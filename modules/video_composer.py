@@ -491,11 +491,24 @@ def compose_video(scene_results: list[dict], narration_audio_path: str, subtitle
     if gap > 0.05:
         logger.warning(
             "مدة الفيديو المُركَّب (%.2fث) أقصر من مدة الصوت الكامل (%.2fث) "
-            "بفارق %.2fث — سيُجمَّد آخر إطار لتغطية الفارق بدل شاشة سوداء. "
+            "بفارق %.2fث — سيُبطَّأ الفيديو كاملاً لتغطية الفارق بدل تجميد "
+            "آخر إطار (نفس منطق _extend_clip_to_duration). "
             "يُستحسن مراجعة تزامن compute_scene_timings إن تكرر فارق كبير.",
             video.duration, narration.duration, gap,
         )
-        video = video.fx(vfx.freeze, t="end", total_duration=narration.duration)
+        target_duration = narration.duration
+        stretch_ratio = target_duration / video.duration
+        if stretch_ratio <= MAX_CLIP_SLOWDOWN_STRETCH_RATIO:
+            # فجوة صغيرة نسبيًا: إبطاء بسيط لسرعة الفيديو كاملاً، غير ملحوظ
+            # للعين، ولا يفقد أي حركة/محتوى (بعكس التجميد الذي كان يوقف
+            # آخر مشهد - هنا الألعاب النارية - على إطار ثابت).
+            video = video.fx(vfx.speedx, factor=1 / stretch_ratio)
+            video = video.set_duration(target_duration)
+        else:
+            # فجوة كبيرة غير متوقعة: التجميد هنا ملاذ أخير فقط، لأن إبطاء
+            # الفيديو الكامل بنسبة كبيرة جدًا قد يشوّه الإيقاع العام أكثر
+            # من فائدته. الوصول لهذا الفرع يستحق مراجعة compute_scene_timings.
+            video = video.fx(vfx.freeze, t="end", total_duration=target_duration)
     elif gap < -0.05:
         video = video.subclip(0, narration.duration)
 
