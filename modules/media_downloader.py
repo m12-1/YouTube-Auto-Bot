@@ -14,6 +14,7 @@ from config import (
     MIN_ACCEPTABLE_VIDEO_HEIGHT,
     ALLOWED_VIDEO_ORIENTATIONS,
     MAX_CANDIDATES_PER_VERIFICATION_BATCH,
+    CONFLICTING_ENTITY_GROUPS,
 )
 
 logger = logging.getLogger("modules.media_downloader")
@@ -74,6 +75,37 @@ def _is_license_allowed_for_youtube(license_url: str = "", rights: str = "") -> 
 
     # ترخيص غير معروف/غير واضح -> إقصاء حذرًا (نفس منطق ملاحظة الفيديوهات الحرة)
     return False, False
+
+
+def _find_entity_group(text: str) -> list[str] | None:
+    """يبحث عن أول مجموعة فرعية (من CONFLICTING_ENTITY_GROUPS) يظهر أحد أسمائها
+    داخل النص، ويعيدها. None إن لم يظهر أي كيان معروف."""
+    text = (text or "").lower()
+    if not text:
+        return None
+    for group in CONFLICTING_ENTITY_GROUPS:
+        for subgroup in group:
+            if any(name.lower() in text for name in subgroup):
+                return subgroup
+    return None
+
+
+def _passes_entity_relevance(keyword: str, *texts: str) -> bool:
+    """يرفض المرشح إن كان عنوانه/وصفه يذكر كيانًا محددًا (مثل كوكب آخر) يختلف
+    عن الكيان الذي تستهدفه الكلمة المفتاحية فعليًا، حتى لو تشابه الموضوع
+    العام (مثال حقيقي: بحث عن 'Venus' أعاد فيديو 'Pluto' من ناسا لأن كليهما
+    ضمن نفس فئة 'planets/فضاء'). لا يُطبَّق إلا حين تحدّد الكلمة المفتاحية
+    نفسها كيانًا معروفًا من القائمة؛ خلاف ذلك لا قيد إضافي (لتفادي رفض بحث عام
+    لا يخص كيانًا بعينه)."""
+    keyword_group = _find_entity_group(keyword)
+    if keyword_group is None:
+        return True  # الكلمة المفتاحية لا تستهدف كيانًا محددًا من القائمة
+
+    combined_meta = " ".join(t for t in texts if t)
+    meta_group = _find_entity_group(combined_meta)
+    if meta_group is None:
+        return True  # لا معلومات كافية في الميتاداتا لتحديد كيان مغاير؛ لا نرفض حذرًا هنا لأن الفحص البصري اللاحق (Gemini) سيتكفل بالتأكد
+    return meta_group is keyword_group
 
 
 def _meets_min_resolution(height) -> bool:
@@ -262,6 +294,14 @@ async def _search_internet_archive(session: aiohttp.ClientSession, keyword: str,
         if not file_url:
             continue
 
+        ia_description = (meta.get("metadata", {}) or {}).get("description")
+        if not _passes_entity_relevance(keyword, doc.get("title"), ia_description):
+            logger.info(
+                "[تصفية كيان] استُبعد فيديو Internet Archive '%s' لأنه يذكر كيانًا مختلفًا عن الكلمة المفتاحية '%s'.",
+                doc.get("title"), keyword,
+            )
+            continue
+
         results.append({
             "source": "internet_archive",
             "keyword": keyword,
@@ -358,6 +398,14 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
         if not file_url:
             continue
 
+        commons_description = _strip_html(ext.get("ImageDescription", {}).get("value", ""))
+        if not _passes_entity_relevance(keyword, title, commons_description):
+            logger.info(
+                "[تصفية كيان] استُبعد فيديو Wikimedia Commons '%s' لأنه يذكر كيانًا مختلفًا عن الكلمة المفتاحية '%s'.",
+                title, keyword,
+            )
+            continue
+
         results.append({
             "source": "wikimedia_commons",
             "keyword": keyword,
@@ -383,7 +431,13 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
     api_key = os.environ.get("Nasa_API_key")
     if not api_key:
         return []
-    params = {"q": keyword, "media_type": "video", "api_key": api_key}
+    # مكتبة ناسا تبحث بحثًا نصيًا واسعًا (full-text) عبر كل الحقول، فكلمة عامة
+    # مثل "planet" أو حتى "Venus" قد تُرجع نتائج لكواكب/بعثات أخرى تتشارك
+    # الفئة نفسها فقط. تطويق الكلمة بعلامتي اقتباس يفرض تطابق العبارة الكاملة
+    # (Exact Phrase) بدل تطابق أي كلمة مفردة داخلها، لتوجيه البحث فعليًا لما
+    # نريده تحديدًا بدل موضوع عام مشابه.
+    query_phrase = f'"{keyword}"' if " " in keyword.strip() else keyword
+    params = {"q": query_phrase, "media_type": "video", "api_key": api_key}
     try:
         async with session.get(NASA_SEARCH_URL, params=params, timeout=20) as resp:
             if resp.status != 200:
@@ -403,6 +457,14 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
         if not video_link:
             continue
         title = item_data.get("title", "NASA video")
+        description = item_data.get("description") or ""
+        keywords_field = " ".join(item_data.get("keywords") or [])
+        if not _passes_entity_relevance(keyword, title, description, keywords_field):
+            logger.info(
+                "[تصفية كيان] استُبعد فيديو NASA '%s' لأنه يذكر كيانًا مختلفًا عن الكلمة المفتاحية '%s'.",
+                title, keyword,
+            )
+            continue
         results.append({
             "source": "nasa",
             "keyword": keyword,
