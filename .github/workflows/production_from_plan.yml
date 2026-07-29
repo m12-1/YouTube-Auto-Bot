@@ -12,7 +12,9 @@ concurrency:
 jobs:
   produce:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # كانت 45 دقيقة تُسبّب إلغاء المهمة تلقائيًا أثناء الرندرة الطويلة
+    # (رسالة "Error: The operation was canceled.") — رُفعت إلى 90.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
