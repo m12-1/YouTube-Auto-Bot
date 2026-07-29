@@ -4,6 +4,7 @@
 """
 
 import logging
+import re
 import requests
 from typing import Optional
 
@@ -44,8 +45,8 @@ def _fetch_wikipedia_summary(topic: str, lang: str = "en") -> Optional[str]:
             "action": "query",
             "pageids": page_id,
             "prop": "extracts",
-            "exintro": True,       # فقط المقدمة
-            "explaintext": True,   # نص عادي بدون HTML
+            "exintro": True,
+            "explaintext": True,
             "format": "json",
             "utf8": 1,
         }
@@ -59,7 +60,6 @@ def _fetch_wikipedia_summary(topic: str, lang: str = "en") -> Optional[str]:
         extract = page.get("extract", "").strip()
         
         # تنظيف بسيط: إزالة علامات المرجع [1] [2] إن وجدت
-        import re
         clean_extract = re.sub(r'\[\d+\]', '', extract)
         return clean_extract
         
@@ -88,4 +88,4 @@ def collect_facts(topic: str) -> str:
         return facts_ar
 
     logger.warning("لا نتائج Wikipedia في أي لغة. سيتم توليد الحقائق عبر Gemini (كخطة احتياطية).")
-    return ""  # القيمة الفارغة ستؤدي إلى توليد Gemini داخل script_and_seo_planner
+    return ""
