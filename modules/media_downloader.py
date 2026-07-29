@@ -1,6 +1,7 @@
 """
 المرحلة 4: البحث المتوازي عن الوسائط في Pexels + Pixabay لكل مشهد،
 باستخدام visual_keywords (من المرحلة 3) مع youtube_keywords كبدائل احتياطية.
+تم التعديل: إضافة (Circuit Breaker) لـ NASA و Pixabay لتجنب إضاعة الوقت عند فشل المفاتيح (403/401).
 """
 
 import os
@@ -26,9 +27,7 @@ IA_METADATA_URL = "https://archive.org/metadata/{identifier}"
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 NASA_SEARCH_URL = "https://images-api.nasa.gov/search"
 
-# سياسة Wikimedia (User-Agent Policy) تحظر الطلبات بدون User-Agent واضح يوضح
-# هوية التطبيق ومعلومات تواصل، وترفضها بـ HTTP 403 (نقطة إصلاح مشكلة
-# "Wikimedia Commons -> HTTP 403" الظاهرة في اللوج).
+# سياسة Wikimedia (User-Agent Policy) تحظر الطلبات بدون User-Agent واضح
 COMMONS_USER_AGENT = (
     "YouTube-Auto-Bot/1.0 "
     "(https://github.com/; contact: admin@example.com) "
@@ -36,15 +35,16 @@ COMMONS_USER_AGENT = (
 )
 COMMONS_HEADERS = {"User-Agent": COMMONS_USER_AGENT}
 
-# عدد المقاطع الافتراضي المطلوب جلبه من كل مصدر لكل كلمة مفتاحية (نقطة 4)
+# عدد المقاطع الافتراضي المطلوب جلبه من كل مصدر لكل كلمة مفتاحية
 _PER_SOURCE_QUOTA = CANDIDATES_PER_KEYWORD_PER_SOURCE
+
+# ===== متغيرات حالة المصادر (Circuit Breaker) =====
+# لمنع إضاعة الوقت في محاولات فاشلة متكررة بسبب مفاتيح منتهية أو 403
+_NASA_ENABLED = True
+_PIXABAY_ENABLED = True
 
 
 def _mentions_space_or_astronomy(*texts: str) -> bool:
-    """يتحقق إن كان أي من النصوص المُمرَّرة (الفئة، الموضوع، الكلمات المفتاحية
-    للمشهد) يشير للفضاء/الفلك، لتفعيل مصدر ناسا. فحص الفئة وحدها غير كافٍ:
-    فئة عامة مثل "علوم" قد يكون موضوعها الفعلي فلكيًا، لذلك نفحص كل النصوص
-    المتاحة معًا (نقطة 4)."""
     combined = " ".join(t for t in texts if t).lower()
     if not combined:
         return False
@@ -52,11 +52,6 @@ def _mentions_space_or_astronomy(*texts: str) -> bool:
 
 
 def _is_license_allowed_for_youtube(license_url: str = "", rights: str = "") -> tuple[bool, bool]:
-    """
-    يفلتر التراخيص المسموحة للاستخدام على يوتيوب فقط (Public Domain / CC0 /
-    CC-BY / CC-BY-SA)، ويرفض أي رخصة تحمل NC (غير تجاري) أو ND (لا تعديلات).
-    يعيد (مسموح, يتطلب_ذكر_المصدر).
-    """
     license_url = (license_url or "").lower()
     rights = (rights or "").lower()
 
@@ -70,16 +65,13 @@ def _is_license_allowed_for_youtube(license_url: str = "", rights: str = "") -> 
         return False, False
 
     cc_allowed = ["creativecommons.org/licenses/by/", "creativecommons.org/licenses/by-sa/"]
-    if any(a in license_url for a in cc_allowed):
+    if any(a in cc_allowed for a in license_url):
         return True, True
 
-    # ترخيص غير معروف/غير واضح -> إقصاء حذرًا (نفس منطق ملاحظة الفيديوهات الحرة)
     return False, False
 
 
 def _find_entity_group(text: str) -> list[str] | None:
-    """يبحث عن أول مجموعة فرعية (من CONFLICTING_ENTITY_GROUPS) يظهر أحد أسمائها
-    داخل النص، ويعيدها. None إن لم يظهر أي كيان معروف."""
     text = (text or "").lower()
     if not text:
         return None
@@ -91,34 +83,21 @@ def _find_entity_group(text: str) -> list[str] | None:
 
 
 def _passes_entity_relevance(keyword: str, *texts: str) -> bool:
-    """يرفض المرشح إن كان عنوانه/وصفه يذكر كيانًا محددًا (مثل كوكب آخر) يختلف
-    عن الكيان الذي تستهدفه الكلمة المفتاحية فعليًا، حتى لو تشابه الموضوع
-    العام (مثال حقيقي: بحث عن 'Venus' أعاد فيديو 'Pluto' من ناسا لأن كليهما
-    ضمن نفس فئة 'planets/فضاء'). لا يُطبَّق إلا حين تحدّد الكلمة المفتاحية
-    نفسها كيانًا معروفًا من القائمة؛ خلاف ذلك لا قيد إضافي (لتفادي رفض بحث عام
-    لا يخص كيانًا بعينه)."""
     keyword_group = _find_entity_group(keyword)
     if keyword_group is None:
-        return True  # الكلمة المفتاحية لا تستهدف كيانًا محددًا من القائمة
-
+        return True
     combined_meta = " ".join(t for t in texts if t)
     meta_group = _find_entity_group(combined_meta)
     if meta_group is None:
-        return True  # لا معلومات كافية في الميتاداتا لتحديد كيان مغاير؛ لا نرفض حذرًا هنا لأن الفحص البصري اللاحق (Gemini) سيتكفل بالتأكد
+        return True
     return meta_group is keyword_group
 
 
 def _meets_min_resolution(height) -> bool:
-    """فلتر دقة موحّد (>=1080p) عبر كل المصادر. أي ارتفاع غير معروف (None) يُرفض
-    حذرًا، بنفس منطق استبعاد الرخص غير الواضحة، لتفادي مسحات/ملفات قديمة
-    منخفضة الجودة من Internet Archive أو Wikimedia Commons (نقطة 2 من الطلب
-    الثاني: اتساق فلتر الجودة عبر كل المصادر)."""
     return bool(height) and height >= MIN_ACCEPTABLE_VIDEO_HEIGHT
 
 
 def _classify_orientation(width, height) -> str | None:
-    """يصنّف الاتجاه من الأبعاد: portrait (ارتفاع > عرض)، landscape (عرض >
-    ارتفاع)، square (متساويان). يعيد None لو الأبعاد غير معروفة."""
     if not width or not height:
         return None
     if height > width:
@@ -129,10 +108,6 @@ def _classify_orientation(width, height) -> str | None:
 
 
 def _orientation_allowed(width, height) -> bool:
-    """يفلتر حسب config.ALLOWED_VIDEO_ORIENTATIONS (عمودي فقط حاليًا، قابل
-    للتوسعة للأفقي لاحقًا بإضافة قيمة واحدة للقائمة). الأبعاد غير المعروفة عند
-    مصدر البحث تُقبل هنا مؤقتًا وتُفلتَر لاحقًا بفحص فعلي عبر ffprobe بعد
-    التحميل (انظر ai_media_verification._filter_by_actual_orientation)."""
     orientation = _classify_orientation(width, height)
     if orientation is None:
         return True
@@ -154,9 +129,6 @@ async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page:
             results = []
             for video in data.get("videos", []):
                 files = sorted(video.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True)
-                # الحد الأدنى المطلوب أصبح 1080p (بدل 720p سابقًا) بناءً على
-                # طلب صريح: لا يجوز أن تقل دقة أي مصدر مقبول عن 1080، حتى لو
-                # كان الأعلى المتاح لهذا الفيديو تحديدًا 720p فقط.
                 files = [
                     f for f in files
                     if (f.get("height") or 0) >= 1080 and _orientation_allowed(f.get("width"), f.get("height"))
@@ -174,37 +146,42 @@ async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page:
                         "description": f"Stock footage by {video.get('user', {}).get('name')}" if video.get("user") else None,
                     })
             return results
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("خطأ بحث Pexels عن '%s': %s", keyword, e)
         return []
 
 
 async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page: int = _PER_SOURCE_QUOTA):
+    global _PIXABAY_ENABLED
+    if not _PIXABAY_ENABLED:
+        return []
+
     api_key = os.environ.get("PIXABAY_API_KEY")
     if not api_key:
+        logger.warning("PIXABAY_API_KEY غير موجود، تعطيل Pixabay لهذه الجولة.")
+        _PIXABAY_ENABLED = False
         return []
+
     params = {"key": api_key, "q": keyword, "per_page": per_page}
     try:
         async with session.get(PIXABAY_SEARCH_URL, params=params, timeout=20) as resp:
+            # إذا كان المفتاح خاطئاً أو منتهياً (401/403) أو تجاوزت الحصة (429)
+            if resp.status in (401, 403, 429):
+                logger.warning("Pixabay [%s] -> HTTP %s (تعطيل Pixabay لتوفير الوقت)", keyword, resp.status)
+                _PIXABAY_ENABLED = False
+                return []
+
             if resp.status != 200:
                 logger.warning("Pixabay [%s] -> HTTP %s", keyword, resp.status)
                 return []
+
             data = await resp.json()
             results = []
             for hit in data.get("hits", []):
                 videos = hit.get("videos", {})
-                # الحد الأدنى أصبح 1080p: نقبل طبقة "large" فقط (عادة
-                # ~1920x1080 في Pixabay)، ونرفض "medium" (~720p) أيضًا الآن
-                # بعد أن كان مقبولاً سابقًا. إن لم تتوفر "large" لهذه
-                # الكلمة، لا نعيد هذا المرشح إطلاقًا بدل التنازل عن الدقة.
                 best = videos.get("large")
-                # بعض فيديوهات Pixabay تصنَّف "large" لكنها أقل فعليًا من
-                # 1080p (نادر لكن يحدث)، لذا نتحقق من height الفعلي أيضًا
-                # لا الاسم فقط.
                 if best and (best.get("height") or 0) < 1080:
                     best = None
-                # Pixabay لا يوفّر باراميتر orientation عند البحث (خلافًا
-                # لـPexels)، لذلك فلتر الاتجاه هنا ضروري فعليًا وليس احتياطيًا فقط.
                 if best and not _orientation_allowed(best.get("width"), best.get("height")):
                     best = None
                 if best:
@@ -220,22 +197,19 @@ async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page
                         "description": f"Tags: {hit.get('tags')}" if hit.get("tags") else None,
                     })
             return results
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("خطأ بحث Pixabay عن '%s': %s", keyword, e)
         return []
 
 
 async def _search_internet_archive(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
-    """يبحث في Internet Archive عن فيديوهات برخصة مسموحة ليوتيوب فقط (نقطة 5)."""
     params = {
         "q": f'{keyword} AND mediatype:movies',
         "fl[]": ["title", "identifier", "licenseurl", "rights"],
-        "rows": limit * 3,  # نجلب أكثر لتعويض ما يُستبعد بالفلترة، ثم نقص لـ limit
+        "rows": limit * 3,
         "page": 1,
         "output": "json",
     }
-    # مفاتيح S3 (S3_ACCESS_KEY / S3_SECRET_KEY) لا تلزم للبحث/القراءة العامة عن
-    # الميتاداتا، وتُستخدم فقط لو احتجنا وصولًا خاصًا لاحقًا (تحميل مصادَق عليه).
     access_key = os.environ.get("S3_ACCESS_KEY")
     secret_key = os.environ.get("S3_SECRET_KEY")
     headers = {}
@@ -248,7 +222,7 @@ async def _search_internet_archive(session: aiohttp.ClientSession, keyword: str,
                 return []
             data = await resp.json()
             docs = data.get("response", {}).get("docs", [])
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("خطأ بحث Internet Archive عن '%s': %s", keyword, e)
         return []
 
@@ -265,16 +239,13 @@ async def _search_internet_archive(session: aiohttp.ClientSession, keyword: str,
                 if meta_resp.status != 200:
                     continue
                 meta = await meta_resp.json()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("خطأ جلب ميتاداتا Internet Archive لـ '%s': %s", identifier, e)
             continue
 
         file_url = None
         file_width = None
         file_height = None
-        # نفضّل مشتقات mp4/webm الحديثة (غالبًا الوحيدة التي تحمل width/height
-        # موثوقة في الميتاداتا)، ونطبّق فلتر الدقة الموحّد؛ نتجاهل صيغ المسح
-        # القديمة (.mpg/.mpeg/.ogv) لأنها غالبًا لا تبلغ 1080p أصلًا.
         for f in meta.get("files", []):
             name = f.get("name", "")
             if not name.lower().endswith((".mp4", ".webm")):
@@ -321,13 +292,11 @@ async def _search_internet_archive(session: aiohttp.ClientSession, keyword: str,
 
 
 def _strip_html(text: str) -> str:
-    """يزيل وسوم HTML البسيطة الشائعة في وصف Wikimedia Commons (extmetadata)."""
     import re
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
 async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
-    """يبحث في Wikimedia Commons عن فيديوهات حرة (بدون مفتاح API) (نقطة 6)."""
     search_params = {
         "action": "query",
         "list": "search",
@@ -343,7 +312,7 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
                 return []
             data = await resp.json()
             search_results = data.get("query", {}).get("search", [])
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("خطأ بحث Wikimedia Commons عن '%s': %s", keyword, e)
         return []
 
@@ -364,7 +333,7 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
                 if info_resp.status != 200:
                     continue
                 info_data = await info_resp.json()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("خطأ جلب معلومات ملف Wikimedia Commons '%s': %s", title, e)
             continue
 
@@ -385,8 +354,6 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
         if not allowed:
             continue
 
-        # فلتر الدقة الموحّد (>=1080p)، نفس المطبّق على كل المصادر الأخرى -
-        # يستبعد سكانات الفيديو القديمة/منخفضة الدقة الشائعة في Commons.
         height = imageinfo.get("height")
         width = imageinfo.get("width")
         if not _meets_min_resolution(height):
@@ -425,28 +392,33 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
 
 
 async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
-    """يبحث في مكتبة ناسا للوسائط عن فيديوهات فضاء/فلك (نقطة 2). محتوى ناسا
-    عمومًا في المجال العام (Public Domain) ولا يحتاج ذكر مصدر إلزاميًا، لكننا
-    نضيف إسنادًا احترامًا للعرف."""
+    global _NASA_ENABLED
+    if not _NASA_ENABLED:
+        return []
+
     api_key = os.environ.get("Nasa_API_key")
     if not api_key:
+        logger.warning("Nasa_API_key غير موجود، تعطيل NASA لهذه الجولة.")
+        _NASA_ENABLED = False
         return []
-    # مكتبة ناسا تبحث بحثًا نصيًا واسعًا (full-text) عبر كل الحقول، فكلمة عامة
-    # مثل "planet" أو حتى "Venus" قد تُرجع نتائج لكواكب/بعثات أخرى تتشارك
-    # الفئة نفسها فقط. تطويق الكلمة بعلامتي اقتباس يفرض تطابق العبارة الكاملة
-    # (Exact Phrase) بدل تطابق أي كلمة مفردة داخلها، لتوجيه البحث فعليًا لما
-    # نريده تحديدًا بدل موضوع عام مشابه.
+
     query_phrase = f'"{keyword}"' if " " in keyword.strip() else keyword
     params = {"q": query_phrase, "media_type": "video", "api_key": api_key}
     try:
         async with session.get(NASA_SEARCH_URL, params=params, timeout=20) as resp:
+            # 403 يعني غالباً مفتاح خاطئ أو محظور. نعطله فوراً.
+            if resp.status == 403:
+                logger.warning("NASA [%s] -> HTTP 403 (تعطيل NASA لتوفير الوقت)", keyword)
+                _NASA_ENABLED = False
+                return []
             if resp.status != 200:
                 logger.warning("NASA [%s] -> HTTP %s", keyword, resp.status)
                 return []
             data = await resp.json()
             items = data.get("collection", {}).get("items", [])
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("خطأ بحث NASA عن '%s': %s", keyword, e)
+        # في حالة خطأ شبكة، لا نعطله فوراً (قد يكون مؤقتاً)، لكن نتركه يحاول مرة أخرى.
         return []
 
     results = []
@@ -489,24 +461,7 @@ async def search_scene_media(
     category: str = "",
     topic: str = "",
 ):
-    """
-    يبحث بالتوازي في Pexels وPixabay وInternet Archive وWikimedia Commons
-    (وناسا إن كانت الفئة/الموضوع/كلمات المشهد تخص الفضاء/الفلك) باستخدام كل
-    الكلمات المفتاحية للمشهد، ويعيد قائمة موحّدة من المرشحين (بدون تحميل
-    الملفات بعد). لكل كلمة مفتاحية نجلب حتى 3 مقاطع من كل مصدر (نقطة 4).
-
-    للمحتوى الفضائي/الفلكي: تُعطى ناسا أولوية فعلية (وليست مجرد مصدر إضافي
-    ضمن نفس الدفعة) — نبحث في ناسا أولاً، ولا نلجأ لبقية المصادر إلا إذا لم
-    تكفِ نتائج ناسا وحدها (أقل من MAX_CANDIDATES_PER_VERIFICATION_BATCH).
-    """
-    # نستخدم visual_keywords فقط للبحث — فهي الاستعلامات البصرية الموجَّهة التي
-    # ولَّدها جمناي خصيصًا لكل مشهد. youtube_keywords هي كلمات SEO (مثل
-    # "amazing facts", "history of") ولا علاقة لها بالبحث في مكتبات ستوك
-    # فيديو، وإضافتها تُلوِّث نتائج البحث وتُفقد الاستعلامات دقتها.
     all_keywords = list(visual_keywords)
-
-    # نفحص الفئة والموضوع وكلمات المشهد نفسها معًا (وليس الفئة وحدها)، لأن
-    # فئة عامة مثل "علوم" قد يكون موضوعها الفعلي فلكيًا.
     use_nasa = _mentions_space_or_astronomy(category, topic, " ".join(all_keywords))
 
     if use_nasa:
@@ -541,9 +496,6 @@ async def search_scene_media(
 
 
 async def download_candidate(candidate: dict, dest_dir: str, max_retries: int = 3) -> str:
-    """يحمّل ملف الفيديو الفعلي لمرشح معيّن ويعيد المسار المحلي.
-    يعيد المحاولة عند انقطاع/بطء الاتصال (شائع خصوصًا مع archive.org) قبل
-    الاستسلام، بدل فشل التحميل من أول محاولة (نقطة ب)."""
     os.makedirs(dest_dir, exist_ok=True)
     ext = ".mp4"
     filename = f"{candidate['source']}_{candidate['id']}{ext}"
@@ -552,7 +504,6 @@ async def download_candidate(candidate: dict, dest_dir: str, max_retries: int = 
         return path
 
     dl_headers = COMMONS_HEADERS if candidate.get("source") == "wikimedia_commons" else None
-    # archive.org أبطأ وأقل استقرارًا من بقية المصادر، فنمنحه مهلة أطول.
     timeout = 120 if candidate.get("source") == "internet_archive" else 60
 
     last_error = None
@@ -565,16 +516,16 @@ async def download_candidate(candidate: dict, dest_dir: str, max_retries: int = 
                         async for chunk in resp.content.iter_chunked(1024 * 64):
                             f.write(chunk)
             return path
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_error = e
             if os.path.exists(path):
-                os.remove(path)  # لا نُبقي ملفًا جزئيًا/تالفًا بعد فشل محاولة
+                os.remove(path)
             if attempt < max_retries:
                 logger.warning(
                     "فشل تحميل %s (محاولة %d/%d): %s — إعادة المحاولة.",
                     candidate.get("url"), attempt, max_retries, e,
                 )
-                await asyncio.sleep(2 * attempt)  # backoff تصاعدي بسيط
+                await asyncio.sleep(2 * attempt)
     logger.warning("فشل تحميل %s نهائيًا بعد %d محاولات: %s", candidate.get("url"), max_retries, last_error)
     raise last_error
 
