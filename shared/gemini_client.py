@@ -167,7 +167,21 @@ def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: li
             if not response.candidates:
                 raise TransientError("لا يوجد candidates في الاستجابة")
 
-            return response.text
+            response_text = response.text
+            if not response_text or not str(response_text).strip():
+                # يحدث هذا مثلاً عند finish_reason=MALFORMED_RESPONSE أو أي حالة
+                # يعيد فيها SDK كائن استجابة صالحًا (candidates موجودة) لكن بلا
+                # نص فعلي (response.text = None). سابقًا كان هذا يُعامَل كنجاح
+                # فيُعاد None للمستدعي، الذي يستدعي parse_json_response(None)
+                # فيفشل بـ AttributeError غير مُلتقَط يوقف خط الإنتاج بالكامل من
+                # دون أي محاولة تدوير. الآن نعامله كخطأ مؤقت فيُعاد المحاولة
+                # بنفس منطق 503/429 (نموذج/مفتاح تالٍ) بدل تسريب فشل صامت.
+                finish_reason = getattr(response.candidates[0], "finish_reason", None)
+                raise TransientError(
+                    f"استجابة فارغة بلا نص فعلي من {model_name} (finish_reason={finish_reason})"
+                )
+
+            return response_text
 
         except Exception as e:  # noqa: BLE001 - نحتاج التقاط أي استثناء من SDK لتصنيفه
             last_error = e
