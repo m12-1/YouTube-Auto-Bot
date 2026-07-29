@@ -51,6 +51,7 @@ jobs:
           GEMINI_KEY_LIGHT: ${{ secrets.GEMINI_KEY_LIGHT }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          Nasa_API_key: ${{ secrets.Nasa_API_key }}
           YOUTUBE_SEARCH_API_KEY: ${{ secrets.YOUTUBE_SEARCH_API_KEY }}
           YOUTUBE_OAUTH_CLIENT_ID: ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
           YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
