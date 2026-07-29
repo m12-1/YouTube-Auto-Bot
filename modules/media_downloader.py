@@ -499,9 +499,14 @@ async def search_scene_media(
     ضمن نفس الدفعة) — نبحث في ناسا أولاً، ولا نلجأ لبقية المصادر إلا إذا لم
     تكفِ نتائج ناسا وحدها (أقل من MAX_CANDIDATES_PER_VERIFICATION_BATCH).
     """
-    all_keywords = list(visual_keywords) + list(youtube_keywords or [])
+    # نستخدم visual_keywords فقط للبحث — فهي الاستعلامات البصرية الموجَّهة التي
+    # ولَّدها جمناي خصيصًا لكل مشهد. youtube_keywords هي كلمات SEO (مثل
+    # "amazing facts", "history of") ولا علاقة لها بالبحث في مكتبات ستوك
+    # فيديو، وإضافتها تُلوِّث نتائج البحث وتُفقد الاستعلامات دقتها.
+    all_keywords = list(visual_keywords)
+
     # نفحص الفئة والموضوع وكلمات المشهد نفسها معًا (وليس الفئة وحدها)، لأن
-    # فئة عامة مثل "علوم" قد يكون موضوعها الفعلي فلكيًا (نقطة 4).
+    # فئة عامة مثل "علوم" قد يكون موضوعها الفعلي فلكيًا.
     use_nasa = _mentions_space_or_astronomy(category, topic, " ".join(all_keywords))
 
     if use_nasa:
