@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from shared.gemini_client import call_gemini_with_rotation, parse_json_response
 from shared.state import RunState
-from modules.media_downloader import search_scene_media_sync, download_candidate
+from modules.media_downloader import search_scene_media_sync, download_candidate, search_scene_images_sync
 from config import (
     MEDIA_RELEVANCE_ACCEPT_THRESHOLD,
     MAX_CANDIDATES_PER_VERIFICATION_BATCH,
@@ -25,6 +25,10 @@ from config import (
     MIN_FALLBACK_ACCEPT_SCORE,
     ALLOWED_VIDEO_ORIENTATIONS,
     ENABLE_CROSS_SCENE_MEDIA_DEDUP,
+    MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD,
+    MIN_IMAGES_PER_SCENE,
+    MAX_IMAGES_PER_SCENE,
+    MAX_IMAGE_KEYWORD_RETRY_PER_SCENE,
 )
 
 logger = logging.getLogger("modules.ai_media_verification")
@@ -83,6 +87,176 @@ _ALT_KEYWORD_PROMPT = """
 
 أعد فقط كائن JSON: {{"alternative_keywords": ["...", "...", "...", "...", "..."]}}
 """
+
+
+_VERIFY_IMAGE_PROMPT = """
+لدي {n} صور مرشحة (خطة بديلة صارمة بعد فشل إيجاد فيديو مناسب) لهذا الجزء من سكربت فيديو قصير:
+النص: "{narration_excerpt}"
+
+معلومات كل صورة كما وردت من مصدرها (العنوان/الوصف إن توفّرا) - استخدمها مع
+تحليلك البصري للصورة نفسها معًا:
+{candidates_meta}
+
+قاعدة صارمة قبل أي تقييم: إن كان النص يذكر كيانًا محددًا بالاسم (كوكب، جرم
+سماوي، شخص، مكان، كائن...) وكانت الصورة (بصريًا، أو حسب عنوانها/وصفها) تُظهر
+كيانًا آخر مختلفًا فعليًا، فهذا خطأ فادح (Entity Mismatch) ويجب إعطاؤه 0 مهما
+بدا التطابق البصري العام جذابًا. لا تتساهل هنا حتى لو كانت هذه أفضل صورة متاحة.
+
+هذه صورة ثابتة ستُعرض لعدة ثوانٍ بدل فيديو، لذا يجب أن تكون مطابقتها لجوهر
+النص شبه مثالية (كن صارمًا جدًا في التقييم، لا تُعط 8 أو 9 إلا لتطابق فعلي
+واضح لا لبس فيه).
+
+لكل صورة (بالترتيب الذي أُرسلت به)، قيّم مدى ملاءمتها من 0 إلى 10 لتمثيل هذا النص بصريًا
+(بعد تطبيق قاعدة تطابق الهوية أعلاه أولاً).
+
+أعد **فقط** كائن JSON بهذا الشكل، بدون أي نص إضافي:
+{{
+  "results": [
+    {{"candidate_index": 0, "score": 0}}
+  ]
+}}
+"""
+
+
+def _verify_image_batch(narration_excerpt: str, candidates: list[dict], local_paths: list[str]) -> list[dict]:
+    prompt = _VERIFY_IMAGE_PROMPT.format(
+        n=len(candidates),
+        narration_excerpt=narration_excerpt,
+        candidates_meta=_format_candidates_meta(candidates),
+    )
+    raw = call_gemini_with_rotation(
+        STAGE, [prompt], media_paths=local_paths, response_mime_type="application/json"
+    )
+    return parse_json_response(raw).get("results", [])
+
+
+def _download_images_sync(candidates: list[dict], media_dir: str) -> list[str | None]:
+    async def _download_all(cands):
+        results = await asyncio.gather(
+            *[download_candidate(c, media_dir) for c in cands],
+            return_exceptions=True,
+        )
+        paths = []
+        for c, r in zip(cands, results):
+            if isinstance(r, Exception):
+                logger.warning("فشل تحميل صورة %s: %s", c.get("url"), r)
+                paths.append(None)
+            else:
+                paths.append(r)
+        return paths
+    return asyncio.run(_download_all(candidates))
+
+
+def _try_image_fallback(scene: dict, run_state: RunState, media_dir: str,
+                         category: str = "", topic: str = "") -> dict | None:
+    """
+    خطة بديلة صارمة تُستدعى فقط بعد استنفاد كل محاولات الفيديو العادية لمشهد
+    ما دون بلوغ عتبة القبول. تبحث عن صور (بدل فيديو) بنفس المصادر ونفس فلاتر
+    الجودة/الرخصة/تعارض الكيانات، وتقبل فقط صورًا بتقييم >= 
+    MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD (أعلى من عتبة الفيديو نفسها). يجمع
+    3-4 صور مقبولة (MIN/MAX_IMAGES_PER_SCENE) لتُعرض بالتتابع (زوم بطيء) بديلاً
+    عن الفيديو المفقود. إن لم يصل لعدد الصور الأدنى، يعيد None فيتراجع الكود
+    المستدعي لمنطق fallback الفيديو القديم (المراجعة اليدوية) كما كان.
+    """
+    scene_id = scene["id"]
+    narration_excerpt = scene["text"]
+    video_topic = run_state.data.get("video_title", "")
+    base_keywords = list(scene.get("visual_keywords", []))
+
+    tried_keywords: list[str] = []
+    accepted: list[tuple[float, str, dict]] = []  # (score, local_path, candidate)
+    used_source_keys: set[str] = set()
+
+    for round_idx in range(MAX_IMAGE_KEYWORD_RETRY_PER_SCENE):
+        if len(accepted) >= MIN_IMAGES_PER_SCENE:
+            break
+
+        keywords = base_keywords if round_idx == 0 else _request_alternative_keywords(
+            narration_excerpt, tried_keywords, video_topic
+        )
+        if not keywords:
+            continue
+        tried_keywords.extend(keywords)
+
+        candidates = search_scene_images_sync(keywords, category=category, topic=topic)
+        if not candidates:
+            logger.info("[%s] خطة الصور: لا نتائج للكلمات %s.", scene_id, keywords)
+            continue
+
+        if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
+            candidates = [c for c in candidates if not run_state.source_already_used(_source_key(c))]
+        candidates = [c for c in candidates if _source_key(c) not in used_source_keys]
+        if not candidates:
+            continue
+
+        batch = candidates[:MAX_CANDIDATES_PER_VERIFICATION_BATCH]
+        local_paths = _download_images_sync(batch, media_dir)
+        valid_pairs = [(c, p) for c, p in zip(batch, local_paths) if p is not None]
+        if not valid_pairs:
+            continue
+        batch = [c for c, _ in valid_pairs]
+        local_paths = [p for _, p in valid_pairs]
+
+        try:
+            results = _verify_image_batch(narration_excerpt, batch, local_paths)
+        except Exception as e:  # noqa: BLE001
+            logger.error("[%s] فشل التحقق من دفعة الصور: %s", scene_id, e)
+            results = []
+
+        for r in results:
+            idx = r.get("candidate_index")
+            score = r.get("score", 0)
+            if idx is None or not (0 <= idx < len(batch)):
+                continue
+            if score < MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD:
+                continue
+            cand = batch[idx]
+            skey = _source_key(cand)
+            if skey in used_source_keys:
+                continue
+            used_source_keys.add(skey)
+            accepted.append((score, local_paths[idx], cand))
+            logger.info("[%s] خطة الصور: قُبلت صورة (score=%.1f) من %s.", scene_id, score, cand.get("source"))
+            if len(accepted) >= MAX_IMAGES_PER_SCENE:
+                break
+
+    if len(accepted) < MIN_IMAGES_PER_SCENE:
+        logger.info(
+            "[%s] خطة الصور البديلة: لم يُعثر إلا على %d/%d صورة بعتبة %.1f، تراجع لمنطق fallback القديم.",
+            scene_id, len(accepted), MIN_IMAGES_PER_SCENE, MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD,
+        )
+        return None
+
+    accepted = sorted(accepted, key=lambda a: a[0], reverse=True)[:MAX_IMAGES_PER_SCENE]
+    image_paths = [p for _, p, _ in accepted]
+    chosen_candidates = [c for _, _, c in accepted]
+    min_score = min(s for s, _, _ in accepted)
+
+    if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
+        for c in chosen_candidates:
+            run_state.mark_source_used(_source_key(c))
+
+    attributions = [
+        c.get("attribution_text") for c in chosen_candidates
+        if c.get("requires_attribution") and c.get("attribution_text")
+    ]
+
+    result = {
+        "clip_path": image_paths[0],  # للتوافق مع أي كود/لوغ يفترض وجود clip_path
+        "start": 0, "end": 0,
+        "score": min_score,
+        "needs_manual_review": False,
+        "requires_attribution": bool(attributions),
+        "attribution_text": "; ".join(dict.fromkeys(attributions)) if attributions else None,
+        "media_type": "image_sequence",
+        "images": image_paths,
+    }
+    run_state.set_scene_result(scene_id, **result)
+    logger.info(
+        "[%s] خطة الصور البديلة نجحت: %d صور (أدنى score=%.1f) بدل الفيديو المفقود.",
+        scene_id, len(image_paths), min_score,
+    )
+    return result
 
 
 def _source_key(candidate: dict) -> str:
@@ -404,6 +578,7 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
                 "needs_manual_review": False,
                 "requires_attribution": chosen_candidate.get("requires_attribution", False),
                 "attribution_text": chosen_candidate.get("attribution_text"),
+                "media_type": "video",
             }
             run_state.set_scene_result(scene_id, **result)
             if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
@@ -413,6 +588,17 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
 
         logger.info("[%s] رُفضت كل المرشحين في هذه الجولة (محاولة %d/%d).",
                     scene_id, retry + 1, MAX_KEYWORD_RETRY_PER_SCENE)
+
+    # قبل اللجوء لأفضل مرشح فيديو ضعيف (fallback القديم) أو المراجعة اليدوية،
+    # نجرّب خطة الصور البديلة الصارمة: قد تتوفر صور مطابقة بدقة عالية جدًا
+    # (>= MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD) حتى لو فشل إيجاد فيديو مناسب.
+    # لو نجحت، نعتبر المشهد ناجحًا تمامًا (لا حاجة لمراجعة يدوية) ونتخطى منطق
+    # fallback الفيديو القديم بالكامل. لو فشلت (لم تكفِ 3 صور بهذه العتبة
+    # الصارمة)، نتابع بنفس المنطق القديم كما كان تمامًا دون أي تغيير.
+    logger.info("[%s] استُنفدت محاولات الفيديو دون بلوغ العتبة، تجربة خطة الصور البديلة الصارمة...", scene_id)
+    image_result = _try_image_fallback(scene, run_state, media_dir, category=category, topic=topic)
+    if image_result is not None:
+        return image_result
 
     if fallback_best is not None:
         score, clip_path, start, end, fb_candidate = fallback_best
@@ -429,6 +615,7 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
             "needs_manual_review": needs_manual_review,
             "requires_attribution": fb_candidate.get("requires_attribution", False),
             "attribution_text": fb_candidate.get("attribution_text"),
+            "media_type": "video",
         }
         run_state.set_scene_result(scene_id, **result)
         if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
