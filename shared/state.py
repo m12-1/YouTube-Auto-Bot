@@ -71,12 +71,19 @@ class RunState:
 
     def set_scene_result(self, scene_id: str, clip_path: str, start: float, end: float, score: float,
                           needs_manual_review: bool = False, requires_attribution: bool = False,
-                          attribution_text: str = None):
+                          attribution_text: str = None, media_type: str = "video",
+                          images: list[str] | None = None):
         with self._lock:
             self.data["scenes"][scene_id] = {
                 "clip_path": clip_path, "start": start, "end": end, "score": score,
                 "needs_manual_review": needs_manual_review,
                 "requires_attribution": requires_attribution,
                 "attribution_text": attribution_text,
+                # media_type: "video" (افتراضي، السلوك القديم كما هو) أو
+                # "image_sequence" (خطة الصور البديلة الصارمة - انظر
+                # ai_media_verification._try_image_fallback). images تُملأ
+                # فقط في حالة image_sequence.
+                "media_type": media_type,
+                "images": images or [],
             }
             self.save()
