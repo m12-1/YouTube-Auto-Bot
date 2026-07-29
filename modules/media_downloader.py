@@ -1,11 +1,7 @@
 """
 المرحلة 4: البحث المتوازي عن الوسائط في Pexels + Pixabay لكل مشهد،
 باستخدام visual_keywords (من المرحلة 3) مع youtube_keywords كبدائل احتياطية.
-
-تم التعديل: تحسين التعامل مع NASA API:
-- فحص المفتاح قبل الطلب.
-- إضافة User-Agent مناسب.
-- تعطيل المصدر فوراً عند 403 مع رسالة توضيحية.
+تم التعديل: إصلاح NASA 403 بإضافة User-Agent، وتحسين منطق التعطيل المؤقت عند الفشل.
 """
 
 import os
@@ -31,23 +27,20 @@ IA_METADATA_URL = "https://archive.org/metadata/{identifier}"
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 NASA_SEARCH_URL = "https://images-api.nasa.gov/search"
 
-# User-Agent لـ Wikimedia Commons
-COMMONS_USER_AGENT = (
+# ===== سياسة User-Agent الموحدة لجميع المصادر (حل جذري لـ 403) =====
+DEFAULT_USER_AGENT = (
     "YouTube-Auto-Bot/1.0 "
-    "(https://github.com/; contact: admin@example.com) "
+    "(https://github.com/your-repo; contact: admin@example.com) "
     "python-aiohttp"
 )
-COMMONS_HEADERS = {"User-Agent": COMMONS_USER_AGENT}
-
-# User-Agent لـ NASA (بعض APIs تتطلبه)
-NASA_USER_AGENT = "Mozilla/5.0 (compatible; YouTubeAutoBot/1.0; +https://github.com/your-repo)"
+COMMONS_HEADERS = {"User-Agent": DEFAULT_USER_AGENT}
+NASA_HEADERS = {"User-Agent": DEFAULT_USER_AGENT}  # <--- الحل السحري لـ NASA 403
 
 _PER_SOURCE_QUOTA = CANDIDATES_PER_KEYWORD_PER_SOURCE
 
-# ===== متغيرات حالة المصادر (Circuit Breaker) =====
-_NASA_ENABLED = True   # سنفحص المفتاح عند أول استخدام
+# ===== متغيرات حالة المصادر (تعطيل مؤقت بعد الفشل الأول) =====
+_NASA_ENABLED = True      # يبدأ مفعلاً، لكن إن فشل بـ 403 سينطفئ تلقائياً
 _PIXABAY_ENABLED = True
-_NASA_KEY_CHECKED = False  # لمنع تكرار فحص المفتاح
 
 
 def _mentions_space_or_astronomy(*texts: str) -> bool:
@@ -398,59 +391,49 @@ async def _search_wikimedia_commons(session: aiohttp.ClientSession, keyword: str
 
 async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
     """
-    البحث في NASA API مع فحص صحة المفتاح مسبقاً.
-    إذا كان المفتاح مفقوداً أو أعاد 403، يتم تعطيل المصدر نهائياً لهذه الجولة.
+    البحث في مكتبة ناسا.
+    تم الإصلاح: إضافة User-Agent صريح (الحل الأهم لـ 403)،
+    وتبسيط الكلمة المفتاحية بدون علامات تنصيص معقدة،
+    وتسجيل نص الخطأ عند 403 لتشخيص دقيق.
     """
-    global _NASA_ENABLED, _NASA_KEY_CHECKED
+    global _NASA_ENABLED
     if not _NASA_ENABLED:
         return []
 
     api_key = os.environ.get("Nasa_API_key")
-    
-    # فحص المفتاح مرة واحدة فقط
-    if not _NASA_KEY_CHECKED:
-        _NASA_KEY_CHECKED = True
-        if not api_key:
-            logger.warning("Nasa_API_key غير موجود في البيئة. تعطيل NASA لتوفير الوقت.")
-            _NASA_ENABLED = False
-            return []
-        # نرسل طلب اختبار بسيط للتحقق من صحة المفتاح
-        test_params = {"api_key": api_key, "q": "earth", "media_type": "video", "page": 1}
-        headers = {"User-Agent": NASA_USER_AGENT}
-        try:
-            async with session.get(NASA_SEARCH_URL, params=test_params, headers=headers, timeout=10) as resp:
-                if resp.status == 403:
-                    logger.error(
-                        "مفتاح NASA غير صالح (HTTP 403). تحقق من المفتاح في https://api.nasa.gov . "
-                        "تعطيل NASA لهذه الجولة."
-                    )
-                    _NASA_ENABLED = False
-                    return []
-                if resp.status != 200:
-                    logger.warning("فشل اختبار NASA API (HTTP %s). تعطيل مؤقت.", resp.status)
-                    _NASA_ENABLED = False
-                    return []
-        except Exception as e:
-            logger.warning("فشل اختبار NASA API: %s. تعطيل مؤقت.", e)
-            _NASA_ENABLED = False
-            return []
-
-    if not _NASA_ENABLED:
+    if not api_key:
+        logger.warning("Nasa_API_key غير موجود، تعطيل NASA لهذه الجولة.")
+        _NASA_ENABLED = False
         return []
 
-    # البحث الفعلي
-    query_phrase = f'"{keyword}"' if " " in keyword.strip() else keyword
-    params = {"q": query_phrase, "media_type": "video", "api_key": api_key}
-    headers = {"User-Agent": NASA_USER_AGENT}
+    # نُرسل الكلمة المفتاحية كما هي بدون علامات تنصيص إضافية (لتجنب خلل الـ URL)
+    params = {
+        "q": keyword,
+        "media_type": "video",
+        "api_key": api_key,
+    }
+    
     try:
-        async with session.get(NASA_SEARCH_URL, params=params, headers=headers, timeout=20) as resp:
+        async with session.get(NASA_SEARCH_URL, params=params, headers=NASA_HEADERS, timeout=20) as resp:
+            # === التشخيص الدقيق الذي اقترحته ===
             if resp.status == 403:
-                logger.warning("NASA [%s] -> HTTP 403 (المفتاح غير صالح). تعطيل NASA.", keyword)
+                try:
+                    error_body = await resp.text()
+                except:
+                    error_body = "غير قادر على قراءة الجسم"
+                logger.error(
+                    "NASA [%s] -> HTTP 403 (ممنوع). نص الخطأ: %s. "
+                    "تأكد من صحة Nasa_API_key في البيئة، أو أن المفتاح لم يُلغَ. "
+                    "سيتم تعطيل NASA مؤقتاً لتوفير الوقت.",
+                    keyword, error_body[:500]
+                )
                 _NASA_ENABLED = False
                 return []
+
             if resp.status != 200:
                 logger.warning("NASA [%s] -> HTTP %s", keyword, resp.status)
                 return []
+
             data = await resp.json()
             items = data.get("collection", {}).get("items", [])
     except Exception as e:
@@ -467,12 +450,14 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
         title = item_data.get("title", "NASA video")
         description = item_data.get("description") or ""
         keywords_field = " ".join(item_data.get("keywords") or [])
+        
         if not _passes_entity_relevance(keyword, title, description, keywords_field):
             logger.info(
                 "[تصفية كيان] استُبعد فيديو NASA '%s' لأنه يذكر كيانًا مختلفًا عن الكلمة المفتاحية '%s'.",
                 title, keyword,
             )
             continue
+            
         results.append({
             "source": "nasa",
             "keyword": keyword,
@@ -500,7 +485,8 @@ async def search_scene_media(
     all_keywords = list(visual_keywords)
     use_nasa = _mentions_space_or_astronomy(category, topic, " ".join(all_keywords))
 
-    if use_nasa:
+    nasa_candidates = []
+    if use_nasa and _NASA_ENABLED:
         async with aiohttp.ClientSession() as session:
             nasa_lists = await asyncio.gather(*[_search_nasa(session, kw) for kw in all_keywords])
         nasa_candidates = [c for sub in nasa_lists for c in sub]
@@ -515,8 +501,6 @@ async def search_scene_media(
             "استكمال البحث ببقية المصادر كخطة احتياطية.",
             len(nasa_candidates), MAX_CANDIDATES_PER_VERIFICATION_BATCH,
         )
-    else:
-        nasa_candidates = []
 
     async with aiohttp.ClientSession() as session:
         tasks = []
