@@ -265,7 +265,8 @@ async def _search_internet_archive(session: aiohttp.ClientSession, keyword: str,
             continue
 
         ia_description = (meta.get("metadata", {}) or {}).get("description")
-        if not _passes_entity_relevance(keyword, doc.get("title"), ia_description)):
+        # تم تصحيح الخطأ هنا: إزالة القوس الزائد
+        if not _passes_entity_relevance(keyword, doc.get("title"), ia_description):
             logger.info(
                 "[تصفية كيان] استُبعد فيديو Internet Archive '%s' لأنه يذكر كيانًا مختلفًا عن الكلمة المفتاحية '%s'.",
                 doc.get("title"), keyword,
@@ -408,7 +409,6 @@ async def _nasa_health_check(session: aiohttp.ClientSession) -> bool:
                     logger.error("NASA محظور بواسطة CloudFront/WAF. سيتم تعطيل NASA نهائياً.")
                     return False
                 else:
-                    # ربما مفتاح خاطئ
                     logger.warning("NASA 403 غير معتاد (ليس CloudFront). سيتم تعطيل NASA احتياطياً.")
                     return False
             elif resp.status == 200:
@@ -451,7 +451,6 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
     try:
         async with session.get(NASA_SEARCH_URL, params=params, headers=NASA_HEADERS, timeout=15) as resp:
             if resp.status == 403:
-                # لو حدث 403 بعد health check (نادر)، نعطله ونرجع قائمة فارغة
                 logger.warning("NASA فجأة أعاد 403 بعد health check. تعطيل.")
                 _NASA_ENABLED = False
                 return []
