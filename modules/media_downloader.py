@@ -497,6 +497,275 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
     return results
 
 
+# ============================================================================
+# ===== البحث عن الصور (خطة بديلة صارمة عند فشل إيجاد فيديو مناسب لمشهد) =====
+# ============================================================================
+# نفس بنية دوال بحث الفيديو أعلاه تمامًا (نفس المصادر، نفس فلاتر الرخصة/الدقة/
+# الاتجاه/تعارض الكيانات)، لكن موجّهة لنقاط نهاية الصور بدل الفيديو في كل مصدر.
+# لا تُستدعى هذه الدوال إطلاقًا إلا بعد فشل كل محاولات الفيديو العادية لمشهد
+# معيّن (انظر ai_media_verification.verify_scene_media)، والتحقق منها لاحقًا
+# يخضع لعتبة أعلى بكثير (MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD).
+
+PEXELS_PHOTO_SEARCH_URL = "https://api.pexels.com/v1/search"
+PIXABAY_IMAGE_SEARCH_URL = "https://pixabay.com/api/"
+
+
+async def _search_pexels_images(session: aiohttp.ClientSession, keyword: str, per_page: int = _PER_SOURCE_QUOTA):
+    api_key = os.environ.get("PEXELS_API_KEY")
+    if not api_key:
+        return []
+    headers = {"Authorization": api_key}
+    params = {"query": keyword, "per_page": per_page, "orientation": "portrait"}
+    try:
+        async with session.get(PEXELS_PHOTO_SEARCH_URL, headers=headers, params=params, timeout=20) as resp:
+            if resp.status != 200:
+                logger.warning("Pexels صور [%s] -> HTTP %s", keyword, resp.status)
+                return []
+            data = await resp.json()
+            results = []
+            for photo in data.get("photos", []):
+                width, height = photo.get("width"), photo.get("height")
+                if not _meets_min_resolution(height) or not _orientation_allowed(width, height):
+                    continue
+                src = photo.get("src", {})
+                url = src.get("large2x") or src.get("original")
+                if not url:
+                    continue
+                results.append({
+                    "source": "pexels_photo",
+                    "keyword": keyword,
+                    "id": str(photo["id"]),
+                    "url": url,
+                    "media_kind": "image",
+                    "width": width,
+                    "height": height,
+                    "duration": None,
+                    "title": None,
+                    "description": f"Photo by {photo.get('photographer')}" if photo.get("photographer") else None,
+                })
+            return results
+    except Exception as e:
+        logger.warning("خطأ بحث صور Pexels عن '%s': %s", keyword, e)
+        return []
+
+
+async def _search_pixabay_images(session: aiohttp.ClientSession, keyword: str, per_page: int = _PER_SOURCE_QUOTA):
+    global _PIXABAY_ENABLED
+    if not _PIXABAY_ENABLED:
+        return []
+    api_key = os.environ.get("PIXABAY_API_KEY")
+    if not api_key:
+        return []
+    params = {"key": api_key, "q": keyword, "per_page": per_page, "image_type": "photo"}
+    try:
+        async with session.get(PIXABAY_IMAGE_SEARCH_URL, params=params, timeout=20) as resp:
+            if resp.status in (401, 403, 429):
+                logger.warning("Pixabay صور [%s] -> HTTP %s", keyword, resp.status)
+                return []
+            if resp.status != 200:
+                logger.warning("Pixabay صور [%s] -> HTTP %s", keyword, resp.status)
+                return []
+            data = await resp.json()
+            results = []
+            for hit in data.get("hits", []):
+                width, height = hit.get("imageWidth"), hit.get("imageHeight")
+                if not _meets_min_resolution(height) or not _orientation_allowed(width, height):
+                    continue
+                url = hit.get("largeImageURL")
+                if not url:
+                    continue
+                results.append({
+                    "source": "pixabay_photo",
+                    "keyword": keyword,
+                    "id": str(hit["id"]),
+                    "url": url,
+                    "media_kind": "image",
+                    "width": width,
+                    "height": height,
+                    "duration": None,
+                    "title": None,
+                    "description": f"Tags: {hit.get('tags')}" if hit.get("tags") else None,
+                })
+            return results
+    except Exception as e:
+        logger.warning("خطأ بحث صور Pixabay عن '%s': %s", keyword, e)
+        return []
+
+
+async def _search_wikimedia_commons_images(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
+    search_params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": f"{keyword} filetype:bitmap",
+        "srnamespace": 6,
+        "srlimit": limit * 3,
+        "format": "json",
+    }
+    try:
+        async with session.get(COMMONS_API_URL, params=search_params, headers=COMMONS_HEADERS, timeout=20) as resp:
+            if resp.status != 200:
+                logger.warning("Wikimedia Commons صور [%s] -> HTTP %s", keyword, resp.status)
+                return []
+            data = await resp.json()
+            search_results = data.get("query", {}).get("search", [])
+    except Exception as e:
+        logger.warning("خطأ بحث صور Wikimedia Commons عن '%s': %s", keyword, e)
+        return []
+
+    results = []
+    for res in search_results:
+        title = res.get("title")
+        if not title:
+            continue
+        info_params = {
+            "action": "query",
+            "titles": title,
+            "prop": "imageinfo",
+            "iiprop": "url|mime|size|extmetadata",
+            "format": "json",
+        }
+        try:
+            async with session.get(COMMONS_API_URL, params=info_params, headers=COMMONS_HEADERS, timeout=20) as info_resp:
+                if info_resp.status != 200:
+                    continue
+                info_data = await info_resp.json()
+        except Exception as e:
+            logger.warning("خطأ جلب imageinfo لـ '%s': %s", title, e)
+            continue
+
+        pages = info_data.get("query", {}).get("pages", {})
+        page = next(iter(pages.values()), {})
+        imageinfo_list = page.get("imageinfo") or []
+        if not imageinfo_list:
+            continue
+        imageinfo = imageinfo_list[0]
+        mime = imageinfo.get("mime", "")
+        if not mime.startswith("image/"):
+            continue
+        width, height = imageinfo.get("width"), imageinfo.get("height")
+        if not _meets_min_resolution(height) or not _orientation_allowed(width, height):
+            continue
+        file_url = imageinfo.get("url")
+        if not file_url:
+            continue
+
+        ext_meta = imageinfo.get("extmetadata", {})
+        license_url = ext_meta.get("LicenseUrl", {}).get("value", "")
+        artist = _strip_html(ext_meta.get("Artist", {}).get("value", ""))
+        allowed, needs_attr = _is_license_allowed_for_youtube(license_url, "")
+        if not allowed:
+            continue
+        description = _strip_html(ext_meta.get("ImageDescription", {}).get("value", ""))
+        if not _passes_entity_relevance(keyword, title, description):
+            logger.info(
+                "[تصفية كيان] استُبعدت صورة Wikimedia Commons '%s' لأنها تذكر كيانًا مختلفًا عن '%s'.",
+                title, keyword,
+            )
+            continue
+
+        results.append({
+            "source": "wikimedia_commons_photo",
+            "keyword": keyword,
+            "id": title,
+            "url": file_url,
+            "media_kind": "image",
+            "width": width,
+            "height": height,
+            "duration": None,
+            "requires_attribution": needs_attr,
+            "attribution_text": f"\"{title}\" by {artist or 'Wikimedia Commons contributor'} via Wikimedia Commons" if needs_attr else None,
+            "title": title,
+            "description": description or None,
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+async def _search_nasa_images(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
+    global _NASA_ENABLED
+    if not _NASA_ENABLED:
+        return []
+    api_key = os.environ.get("Nasa_API_key")
+    if not api_key:
+        return []
+    params = {"q": keyword, "media_type": "image", "api_key": api_key}
+    try:
+        async with session.get(NASA_SEARCH_URL, params=params, headers=NASA_HEADERS, timeout=15) as resp:
+            if resp.status != 200:
+                logger.warning("NASA صور [%s] -> HTTP %s", keyword, resp.status)
+                return []
+            data = await resp.json()
+            items = data.get("collection", {}).get("items", [])
+    except Exception as e:
+        logger.warning("خطأ بحث صور NASA عن '%s': %s", keyword, e)
+        return []
+
+    results = []
+    for item in items:
+        item_data = (item.get("data") or [{}])[0]
+        links = item.get("links") or []
+        image_link = next(
+            (l.get("href") for l in links if l.get("href", "").lower().endswith((".jpg", ".jpeg", ".png"))),
+            None,
+        )
+        if not image_link:
+            continue
+        title = item_data.get("title", "NASA image")
+        description = item_data.get("description") or ""
+        keywords_field = " ".join(item_data.get("keywords") or [])
+        if not _passes_entity_relevance(keyword, title, description, keywords_field):
+            logger.info(
+                "[تصفية كيان] استُبعدت صورة NASA '%s' لأنها تذكر كيانًا مختلفًا عن '%s'.",
+                title, keyword,
+            )
+            continue
+        results.append({
+            "source": "nasa_photo",
+            "keyword": keyword,
+            "id": item_data.get("nasa_id", title),
+            "url": image_link,
+            "media_kind": "image",
+            "width": None,
+            "height": None,
+            "duration": None,
+            "requires_attribution": True,
+            "attribution_text": f"\"{title}\" courtesy of NASA",
+            "title": title,
+            "description": description,
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+async def search_scene_images(
+    visual_keywords: list[str],
+    category: str = "",
+    topic: str = "",
+):
+    """يبحث عن صور (بدل فيديو) لنفس الكلمات المفتاحية، عبر نفس المصادر
+    ونفس فلاتر الجودة/الرخصة/تعارض الكيانات. يُستدعى فقط من ai_media_verification
+    كخطة صارمة بعد فشل كل محاولات الفيديو العادية لمشهد ما."""
+    use_nasa = _mentions_space_or_astronomy(category, topic, " ".join(visual_keywords))
+
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for kw in visual_keywords:
+            tasks.append(_search_pexels_images(session, kw))
+            tasks.append(_search_pixabay_images(session, kw))
+            tasks.append(_search_wikimedia_commons_images(session, kw))
+            if use_nasa and _NASA_ENABLED:
+                tasks.append(_search_nasa_images(session, kw))
+        results_lists = await asyncio.gather(*tasks)
+
+    return [c for sub in results_lists for c in sub]
+
+
+def search_scene_images_sync(visual_keywords, category="", topic=""):
+    return asyncio.run(search_scene_images(visual_keywords, category=category, topic=topic))
+
+
 async def search_scene_media(
     visual_keywords: list[str],
     youtube_keywords: list[str] | None = None,
@@ -538,7 +807,16 @@ async def search_scene_media(
 
 async def download_candidate(candidate: dict, dest_dir: str, max_retries: int = 3) -> str:
     os.makedirs(dest_dir, exist_ok=True)
-    ext = ".mp4"
+    if candidate.get("media_kind") == "image":
+        # نحدد الامتداد من رابط الصورة نفسه إن أمكن (jpg/png/webp)، وإلا
+        # نفترض jpg كامتداد آمن افتراضي (كل المصادر التي أضفناها تعيد صورًا
+        # نقطية عادية، لا صيغًا خاصة تحتاج تعاملاً مختلفًا).
+        url_no_query = candidate["url"].split("?")[0]
+        ext = os.path.splitext(url_no_query)[1].lower()
+        if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+            ext = ".jpg"
+    else:
+        ext = ".mp4"
     filename = f"{candidate['source']}_{candidate['id']}{ext}"
     path = os.path.join(dest_dir, filename)
     if os.path.exists(path):
