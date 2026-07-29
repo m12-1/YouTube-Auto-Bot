@@ -39,6 +39,7 @@ from moviepy.editor import (
 from config import (
     EXPORT_RESOLUTION, FADE_DURATION,
     MAX_CLIP_SLOWDOWN_STRETCH_RATIO, MIN_SOURCE_SECONDS_FOR_BOOMERANG,
+    IMAGE_KEN_BURNS_ZOOM_RATIO,
 )
 
 logger = logging.getLogger("modules.video_composer")
@@ -265,8 +266,75 @@ def _extend_clip_to_duration(clip, target_duration: float, source_path: str, seg
     return boomerang.subclip(0, target_duration)
 
 
+def _ken_burns_image_clip(image_path: str, duration: float, target_size: tuple[int, int]):
+    """
+    يبني مقطع "زوم بطيء" (Ken Burns) لصورة ثابتة واحدة بطول duration: نكبّر
+    الصورة الأصلية بنسبة أكبر من إطار الهدف قليلاً (headroom)، ثم نطبّق تكبيرًا
+    تدريجيًا (resize بدالة زمنية) فوق قماش (CompositeVideoClip) بحجم الهدف
+    الثابت، فتُقصّ الحواف الزائدة تلقائيًا مع تحريك/تكبير الصورة - هذا الأسلوب
+    القياسي في moviepy لإنتاج حركة زوم سلسة من صورة ثابتة.
+    """
+    headroom = 1.15  # هامش إضافي كي لا تظهر حواف فارغة أثناء الزوم
+    base = ImageClip(image_path).set_duration(duration)
+    base = base.resize(height=int(target_size[1] * headroom))
+    if base.w < target_size[0] * headroom:
+        base = base.resize(width=int(target_size[0] * headroom))
+
+    zoom_ratio = IMAGE_KEN_BURNS_ZOOM_RATIO
+    zoomed = base.resize(lambda t: 1 + (zoom_ratio - 1) * (t / duration if duration > 0 else 0))
+    zoomed = zoomed.set_position("center")
+    return CompositeVideoClip([zoomed], size=target_size).set_duration(duration)
+
+
+def _build_image_sequence_clip(scene_result: dict, target_size: tuple[int, int]):
+    """
+    يبني تسلسل 3-4 صور (خطة الصور البديلة الصارمة من ai_media_verification)
+    تُعرض بالتتابع مع زوم بطيء لكل صورة، بحيث يغطي التسلسل الكامل بالضبط
+    audio_duration المطلوب للمشهد (نفس منطق التزامن المستخدم مع الفيديو
+    العادي)، مع تلاشٍ بسيط بين الصور المتتالية لسلاسة الانتقال.
+    """
+    images = scene_result["images"]
+    total_duration = scene_result.get("audio_duration") or 3.0
+    n = len(images)
+    per_image_duration = total_duration / n
+
+    # ملاحظة مهمة عن التزامن: جرّبنا في البداية تلاشيًا متبادلاً (crossfade)
+    # بين الصور عبر padding سالب في concatenate_videoclips (كما هو مستخدم بين
+    # المشاهد في compose_video)، لكن اتضح عمليًا أن هذا يُنقص إجمالي مدة
+    # التسلسل بمقدار غير ثابت (أكبر من مجموع الـ paddings المتوقع)، ما يكسر
+    # تزامن الصوت/الصورة الذي يعتمد عليه باقي النظام بدقة الثانية. لذلك
+    # التسلسل هنا قطع مباشر (hard cut) بين الصور بدل التلاشي المتبادل، لضمان
+    # أن مجموع الأطوال = audio_duration تمامًا دون أي انحراف - حركة الزوم
+    # البطيء (Ken Burns) نفسها تبقى موجودة على كل صورة على حدة، وهي مصدر
+    # الحيوية البصرية الأساسي هنا.
+    image_clips = [
+        _ken_burns_image_clip(img_path, per_image_duration, target_size)
+        for img_path in images
+    ]
+    sequence = image_clips[0] if len(image_clips) == 1 else concatenate_videoclips(image_clips)
+
+    # تصحيح دقيق لأي فارق تقريب صغير جدًا (أجزاء من الميلي ثانية) بين مجموع
+    # per_image_duration وaudio_duration الأصلي.
+    if abs(sequence.duration - total_duration) > 0.01:
+        if sequence.duration > total_duration:
+            sequence = sequence.subclip(0, total_duration)
+        else:
+            sequence = sequence.set_duration(total_duration)
+    return sequence
+
+
 def _prepare_clip(scene_result: dict, target_size: tuple[int, int],
                    is_first: bool = False, is_last: bool = False):
+    if scene_result.get("media_type") == "image_sequence":
+        clip = _build_image_sequence_clip(scene_result, target_size)
+        if is_first:
+            clip = clip.fadein(FADE_DURATION)
+        else:
+            clip = clip.crossfadein(FADE_DURATION)
+        if is_last:
+            clip = clip.fadeout(FADE_DURATION)
+        return clip
+
     clip = VideoFileClip(scene_result["clip_path"]).subclip(
         scene_result["start"], scene_result["end"]
     )
@@ -330,6 +398,9 @@ def _scene_cache_key(scene_result: dict, size: tuple[int, int],
         "fade": FADE_DURATION,
         "is_first": is_first,
         "is_last": is_last,
+        "media_type": scene_result.get("media_type", "video"),
+        "images": scene_result.get("images"),
+        "ken_burns_zoom": IMAGE_KEN_BURNS_ZOOM_RATIO,
     }
     raw = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
