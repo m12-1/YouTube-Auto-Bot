@@ -48,8 +48,31 @@ Write:
    long-term content-authenticity standing, not just viewer retention.
 2. scenes: split narration into consecutive scenes, each with:
    - text: the portion of narration text for this scene
-   - visual_keywords: 2-4 precise visual search terms (in English, suitable
-     for searching Pexels/Pixabay stock footage)
+   - visual_keywords: 3-4 stock-footage search queries (in English) sent
+     directly to Pexels / Pixabay / NASA video APIs.
+
+     Each query MUST follow the formula:
+       [specific subject] + [visible action or state] + [setting / context]
+
+     Rules for crafting these queries:
+     a) Be CONCRETE and VISUAL — describe what the camera literally sees,
+        NOT the abstract concept the narration discusses.
+        BAD:  "black hole", "gravity", "space"
+        GOOD: "stars swirling galactic center time-lapse",
+              "massive star exploding supernova shockwave",
+              "astronaut floating weightless inside space station"
+     b) Include motion/action words whenever the scene implies movement:
+        "waves crashing rocky coast slow motion",
+        "blood cells flowing vein microscope close-up",
+        "city traffic aerial timelapse night lights"
+     c) Vary the angle — each query targets a DIFFERENT visual angle
+        (establishing shot / close-up detail / action moment /
+        data-visualization or diagram) so candidates are diverse.
+     d) Do NOT add orientation words ("vertical", "portrait") — the API
+        filters handle that automatically.
+     e) Do NOT use SEO or marketing words ("amazing", "best", "incredible")
+        — they corrupt stock-search ranking.
+     f) Keep each query 3-6 words for maximum precision.
    - duration_estimate: estimated duration of this scene in seconds (decimal)
 3. video_title: a catchy English video title
 4. youtube_keywords: SEO keywords in English, ordered to match the narration flow
@@ -58,7 +81,7 @@ Return **only** a JSON object in this exact shape, no extra text or Markdown fen
 {{
   "narration": "...",
   "scenes": [
-    {{"id": "scene_1", "text": "...", "visual_keywords": ["...", "..."], "duration_estimate": 5.0}}
+    {{"id": "scene_1", "text": "...", "visual_keywords": ["subject action setting", "subject motion context", "subject detail close-up"], "duration_estimate": 5.0}}
   ],
   "video_title": "...",
   "youtube_keywords": ["...", "..."]
