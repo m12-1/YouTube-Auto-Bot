@@ -23,6 +23,7 @@ from config import (
     MAX_KEYWORD_RETRY_PER_SCENE,
     MIN_FALLBACK_ACCEPT_SCORE,
     ALLOWED_VIDEO_ORIENTATIONS,
+    ENABLE_CROSS_SCENE_MEDIA_DEDUP,
 )
 
 logger = logging.getLogger("modules.ai_media_verification")
@@ -73,6 +74,13 @@ _ALT_KEYWORD_PROMPT = """
 
 أعد فقط كائن JSON: {{"alternative_keywords": ["...", "...", "...", "...", "..."]}}
 """
+
+
+def _source_key(candidate: dict) -> str:
+    """مفتاح فريد لكل فيديو مصدر (وليس لكل مرشح/مقطع زمني منه)، يُستخدم لمنع
+    اختيار نفس الفيديو المصدر لأكثر من مشهد ضمن نفس الفيديو النهائي (إصلاح
+    "تكرار المشهد"). لا علاقة له بالنطاق الزمني (start/end) المختار من الفيديو."""
+    return f"{candidate.get('source')}:{candidate.get('id')}"
 
 
 def _get_actual_video_orientation(path: str) -> str | None:
@@ -249,6 +257,23 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
                 run_state.mark_keyword_used(scene_id, kw)
             continue
 
+        # نستبعد أي مرشح يعود لنفس الفيديو المصدر الذي استُخدم فعلاً في مشهد
+        # آخر مقبول ضمن هذا الفيديو، لمنع تكرار نفس اللقطة في أكثر من مشهد.
+        if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
+            before_dedup = len(candidates)
+            candidates = [c for c in candidates if not run_state.source_already_used(_source_key(c))]
+            removed = before_dedup - len(candidates)
+            if removed:
+                logger.info(
+                    "[%s] استُبعد %d مرشح لأن مصدره مستخدَم فعلاً في مشهد آخر من نفس الفيديو.",
+                    scene_id, removed,
+                )
+            if not candidates:
+                logger.warning("[%s] كل مرشحي هذه الجولة مستبعدون (مصادرهم مستخدَمة في مشاهد أخرى).", scene_id)
+                for kw in remaining_keywords:
+                    run_state.mark_keyword_used(scene_id, kw)
+                continue
+
         candidates = _interleave_candidates(candidates)
         top3 = candidates[:MAX_CANDIDATES_PER_VERIFICATION_BATCH]
 
@@ -355,6 +380,8 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
                 "attribution_text": chosen_candidate.get("attribution_text"),
             }
             run_state.set_scene_result(scene_id, **result)
+            if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
+                run_state.mark_source_used(_source_key(chosen_candidate))
             logger.info("[%s] قُبل بعد %d محاولة (score=%.1f).", scene_id, retry + 1, best["score"])
             return result
 
@@ -378,6 +405,8 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
             "attribution_text": fb_candidate.get("attribution_text"),
         }
         run_state.set_scene_result(scene_id, **result)
+        if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
+            run_state.mark_source_used(_source_key(fb_candidate))
         if needs_manual_review:
             logger.error(
                 "[%s] أفضل مرشح احتياطي (score=%.1f) أقل من الحد الأدنى المطلق "
