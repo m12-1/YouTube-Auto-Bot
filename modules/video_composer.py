@@ -14,9 +14,10 @@ import logging
 import os
 import subprocess
 
+import numpy as np
 import arabic_reshaper
 from bidi.algorithm import get_display
-from PIL import ImageFont
+from PIL import ImageFont, ImageDraw
 
 # توافقية Pillow>=10 مع moviepy 1.0.3: الإصدارات الحديثة من Pillow أزالت
 # PIL.Image.ANTIALIAS (كان يشير إلى LANCZOS)، بينما moviepy القديمة ما زالت
@@ -27,7 +28,7 @@ if not hasattr(_PILImage, "ANTIALIAS"):
 
 from moviepy.editor import (
     VideoFileClip, CompositeVideoClip, concatenate_videoclips,
-    AudioFileClip, TextClip, CompositeAudioClip, vfx,
+    AudioFileClip, ImageClip, CompositeAudioClip, vfx,
 )
 
 from config import (
@@ -48,6 +49,8 @@ _MAX_BOOMERANG_SEGMENTS = 4
 _SUBTITLE_FONT_NAME = "DejaVu-Sans-Bold"
 _SUBTITLE_FONT_SIZE = 60
 _SUBTITLE_MAX_WIDTH_PX = int(EXPORT_RESOLUTION[0] * 0.9)
+_SUBTITLE_STROKE_WIDTH = 2
+_SUBTITLE_LINE_SPACING = 10  # مسافة رأسية إضافية بين الأسطر (بالبكسل)
 
 
 def _shape_arabic(text: str) -> str:
@@ -129,6 +132,56 @@ def _wrap_arabic_by_pixel_width(
         lines.append(_shape_arabic(" ".join(current)))
 
     return "\n".join(lines)
+
+
+def _render_subtitle_image(text: str, font_size: int = _SUBTITLE_FONT_SIZE):
+    """
+    يرسم الترجمة كصورة PNG شفافة (RGBA) عبر PIL مباشرة، بدل TextClip الذي
+    يعتمد داخليًا على ImageMagick. السبب: عندما يحتوي النص على أسطر متعددة
+    (حالنا دائمًا بسبب _wrap_arabic_by_pixel_width)، يكتب moviepy النص لملف
+    مؤقت ويمرره لـ ImageMagick بصيغة "@ملف"، وهو نمط تحظره سياسة ImageMagick
+    الافتراضية (policy.xml) على أغلب توزيعات لينكس بلا أي صلاحية جذر أو
+    تعديل ملفات نظام — وهذا بالضبط سبب خطأ
+    "convert-im6.q16 ... not allowed by the security policy `@...`".
+    بالرسم عبر PIL مباشرة (نفس المكتبة المستخدمة أصلاً في قياس عرض النص
+    داخل _wrap_arabic_by_pixel_width) يصبح مسار الترجمة بالكامل بلا أي
+    اعتماد على ImageMagick، فلا حاجة لتعديل أي إعداد نظام على السيرفر.
+    النص يصل هنا مُهيَّأً عربيًا (reshape+bidi) ومُقسَّمًا لأسطر مسبقًا عبر
+    _wrap_arabic_by_pixel_width، فلا نعيد أي معالجة على ترتيب الأحرف هنا.
+    """
+    font_path = _resolve_font_path()
+    font = None
+    if font_path:
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception:
+            font = None
+    if font is None:
+        font = ImageFont.load_default()
+
+    display_text = text or " "
+
+    # قياس صندوق النص الكلي (كل الأسطر معًا) عبر multiline_textbbox قبل
+    # تحديد مقاس الكانفاس النهائي، بدل حساب يدوي عرضة للأخطاء.
+    tmp_img = _PILImage.new("RGBA", (1, 1))
+    tmp_draw = ImageDraw.Draw(tmp_img)
+    bbox = tmp_draw.multiline_textbbox(
+        (0, 0), display_text, font=font,
+        stroke_width=_SUBTITLE_STROKE_WIDTH, spacing=_SUBTITLE_LINE_SPACING,
+        align="center",
+    )
+    pad = _SUBTITLE_STROKE_WIDTH * 2
+    canvas_w = max(bbox[2] - bbox[0] + pad * 2, 1)
+    canvas_h = max(bbox[3] - bbox[1] + pad * 2, 1)
+
+    img = _PILImage.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.multiline_text(
+        (pad - bbox[0], pad - bbox[1]), display_text, font=font, fill="white",
+        stroke_width=_SUBTITLE_STROKE_WIDTH, stroke_fill="black",
+        spacing=_SUBTITLE_LINE_SPACING, align="center",
+    )
+    return np.array(img)
 
 
 def _extend_clip_to_duration(clip, target_duration: float, source_path: str, seg_start: float, seg_end: float):
@@ -338,14 +391,11 @@ def compose_video(scene_results: list[dict], narration_audio_path: str, subtitle
         wrapped_text = _wrap_arabic_by_pixel_width(
             seg["text"], max_width_px=int(size[0] * 0.9), font_size=_SUBTITLE_FONT_SIZE
         )
+        # صورة PIL شفافة بدل TextClip/ImageMagick (انظر شرح _render_subtitle_image
+        # أعلاه) — تتجنب نهائيًا خطأ ImageMagick policy على النصوص متعددة الأسطر.
+        subtitle_array = _render_subtitle_image(wrapped_text, font_size=_SUBTITLE_FONT_SIZE)
         txt = (
-            # method='label' (بدل 'caption') يحترم أسطر '\n' كما هي دون إعادة
-            # لفّها؛ اللفّ الفعلي محسوب مسبقًا بعرض بكسل حقيقي عبر
-            # _wrap_arabic_by_pixel_width بدل الاعتماد على لفّ ImageMagick
-            # التلقائي الذي يكسر ترتيب النص العربي المُهيَّأ بصريًا مسبقًا.
-            TextClip(wrapped_text, fontsize=_SUBTITLE_FONT_SIZE, color="white",
-                     font=_SUBTITLE_FONT_NAME,
-                     stroke_color="black", stroke_width=2, method="label")
+            ImageClip(subtitle_array, transparent=True)
             .set_start(seg["start"])
             .set_end(seg["end"])
             .set_position(("center", "bottom"))
