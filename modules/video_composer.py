@@ -1,7 +1,7 @@
 """
 المرحلة 6: المونتاج النهائي.
 - يقص كل فيديو حسب best_segment العائد من المرحلة 5 (وليس أول 10 ثوانٍ فقط).
-- انتقالات "fade" سريعة بين المشاهد.
+- انتقالات "crossfade" (تلاشي متبادل حقيقي) سريعة بين المشاهد.
 - يدمج الصوت (narration) والترجمة (SRT كاملة).
 - يصدّر بدقة 1080x1920 (عمودي، مناسب لليوتيوب شورتس).
 
@@ -30,9 +30,19 @@ from moviepy.editor import (
     AudioFileClip, TextClip, CompositeAudioClip, vfx,
 )
 
-from config import EXPORT_RESOLUTION, FADE_DURATION
+from config import (
+    EXPORT_RESOLUTION, FADE_DURATION,
+    MAX_CLIP_SLOWDOWN_STRETCH_RATIO, MIN_SOURCE_SECONDS_FOR_BOOMERANG,
+)
 
 logger = logging.getLogger("modules.video_composer")
+
+# أقصى عدد أجزاء (أمام/عكس بالتناوب) نبنيها في تمديد البومرانج. لقطة مصدر
+# قصيرة جدًا مقابل فجوة كبيرة قد تحتاج نظريًا عشرات التكرارات لتغطية المدة
+# المطلوبة، وهذا بالضبط نوع "تكرار المشهد" المرئي غير المرغوب حتى لو كان
+# داخل مشهد واحد فقط. لذلك نحدّ العدد، وأي فجوة متبقية بعد الحد نغطيها
+# بإبطاء التسلسل كاملاً بدل تكراره أكثر (انظر _extend_clip_to_duration).
+_MAX_BOOMERANG_SEGMENTS = 4
 
 
 _SUBTITLE_FONT_NAME = "DejaVu-Sans-Bold"
@@ -121,7 +131,75 @@ def _wrap_arabic_by_pixel_width(
     return "\n".join(lines)
 
 
-def _prepare_clip(scene_result: dict, target_size: tuple[int, int]):
+def _extend_clip_to_duration(clip, target_duration: float, source_path: str, seg_start: float, seg_end: float):
+    """
+    يمدّد مقطعًا أقصر من زمن النطق المطلوب (audio_duration) لهذا المشهد،
+    بدل تجميد الشاشة على إطار ثابت (vfx.freeze) الذي كان يُنتج "توقف
+    الشاشة" الملحوظ عند بعض الانتقالات - وهو بالضبط ما لاحظته في الفيديو.
+
+    الاستراتيجية مرتّبة حسب الأفضلية البصرية:
+      1) إن كانت الفجوة صغيرة (النسبة <= MAX_CLIP_SLOWDOWN_STRETCH_RATIO):
+         إبطاء بسيط لسرعة التشغيل. غير ملحوظ للعين في لقطات B-roll القصيرة،
+         ولا يفقد أي حركة/محتوى من المقطع.
+      2) فجوة أكبر: تمديد "بومرانج" (تشغيل للأمام ثم عكسي بالتناوب) بدل
+         التجميد أو التكرار الحرفي - لا يوجد قطع مفاجئ لأن آخر إطار من كل
+         جزء يطابق تمامًا أول إطار من الجزء التالي (نفس الإطار معكوسًا).
+      3) فقط لو كان المصدر قصيرًا جدًا (< MIN_SOURCE_SECONDS_FOR_BOOMERANG)
+         بحيث لا يمكن بناء بومرانج مفيد منه، نلجأ للتجميد كملاذ أخير نادر.
+
+    ملاحظة مهمة (تم اكتشافها فعليًا أثناء اختبار الكود قبل التسليم، وليست
+    افتراضية): بناء الاتجاه العكسي عبر vfx.time_mirror مباشرة على نفس كائن
+    الفيديو المستخدم للاتجاه الأمامي يجعلهما يتشاركان نفس "قارئ" ffmpeg
+    الداخلي (نفس الأنبوب/العملية الفرعية). قراءة نفس الأنبوب بترتيب عكسي
+    تتطلب من moviepy إعادة تشغيل/البحث (seek) داخل نفس العملية الفرعية
+    بشكل متكرر، مما يسبب أحيانًا فشل قراءة الإطار (IOError) عند الترميز
+    الفعلي. لتفادي هذا نهائيًا، نفتح قارئًا مستقلاً تمامًا (VideoFileClip
+    جديد من نفس ملف المصدر) خاصًا بالاتجاه العكسي فقط، فلا يتشارك أي حالة
+    داخلية مع الاتجاه الأمامي.
+    """
+    if clip.duration <= 0.05:
+        return clip.fx(vfx.freeze, t="end", total_duration=target_duration)
+
+    stretch_ratio = target_duration / clip.duration
+    if stretch_ratio <= MAX_CLIP_SLOWDOWN_STRETCH_RATIO:
+        # factor < 1 يعني إبطاء (يمدّد المدة)؛ speedx(factor) ينتج مدة = الأصلية/factor.
+        stretched = clip.fx(vfx.speedx, factor=1 / stretch_ratio)
+        return stretched.set_duration(target_duration)
+
+    if clip.duration < MIN_SOURCE_SECONDS_FOR_BOOMERANG:
+        return clip.fx(vfx.freeze, t="end", total_duration=target_duration)
+
+    forward = clip
+    backward_source = VideoFileClip(source_path).subclip(seg_start, seg_end)
+    backward = backward_source.fx(vfx.time_mirror)
+    segments = []
+    covered = 0.0
+    flip = False
+    # نحدّ عدد الأجزاء بـ _MAX_BOOMERANG_SEGMENTS: لقطة قصيرة جدًا مقابل فجوة
+    # كبيرة قد تحتاج نظريًا عشرات الجولات أمام/عكس، وهذا يصبح تكرارًا مرئيًا
+    # مزعجًا بحد ذاته حتى لو لم يكن "قطعًا" مفاجئًا. أي فجوة متبقية بعد الحد
+    # تُغطى بإبطاء التسلسل كاملاً أدناه بدل تكراره أكثر.
+    while covered < target_duration and len(segments) < _MAX_BOOMERANG_SEGMENTS:
+        seg = backward if flip else forward
+        segments.append(seg)
+        covered += seg.duration
+        flip = not flip
+    # method="chain" يكفي هنا (لا padding، نفس الأبعاد تمامًا لأنها نفس
+    # المصدر)، وأرخص من "compose" لأنه لا يحتاج تركيب طبقات.
+    boomerang = concatenate_videoclips(segments, method="chain")
+
+    if boomerang.duration < target_duration:
+        # وصلنا للحد الأقصى للأجزاء قبل تغطية المدة المطلوبة كاملة (لقطة
+        # قصيرة جدًا نسبيًا). نُبطئ التسلسل كاملاً ليمتد تمامًا لطول
+        # target_duration بدل إضافة جولات بومرانج إضافية.
+        slow_factor = boomerang.duration / target_duration  # < 1 => إبطاء
+        boomerang = boomerang.fx(vfx.speedx, factor=slow_factor)
+
+    return boomerang.subclip(0, target_duration)
+
+
+def _prepare_clip(scene_result: dict, target_size: tuple[int, int],
+                   is_first: bool = False, is_last: bool = False):
     clip = VideoFileClip(scene_result["clip_path"]).subclip(
         scene_result["start"], scene_result["end"]
     )
@@ -133,10 +211,14 @@ def _prepare_clip(scene_result: dict, target_size: tuple[int, int]):
     target_duration = scene_result.get("audio_duration")
     if target_duration and target_duration > 0:
         if clip.duration < target_duration:
-            # نمدّد اللقطة بتجميد آخر إطار (freeze-frame) بدل تكرارها (loop)،
-            # لأن التكرار الحرفي يُنتج قطعًا مفاجئًا واضحًا للعين ويكسر
-            # الإحساس بالاحترافية. التجميد على آخر فريم أكثر سلاسة وطبيعية.
-            clip = clip.fx(vfx.freeze, t="end", total_duration=target_duration)
+            # تصحيح: كانت هذه الاستدعاء تُمرِّر وسيطين فقط بينما الدالة تتطلب
+            # source_path/seg_start/seg_end أيضًا (لازمة لفتح قارئ مستقل
+            # للاتجاه العكسي في حالة البومرانج) — كانت ستفشل بـ TypeError عند
+            # أول مشهد أقصر من زمن نطقه.
+            clip = _extend_clip_to_duration(
+                clip, target_duration,
+                scene_result["clip_path"], scene_result["start"], scene_result["end"],
+            )
         elif clip.duration > target_duration:
             clip = clip.subclip(0, target_duration)
 
@@ -148,13 +230,30 @@ def _prepare_clip(scene_result: dict, target_size: tuple[int, int]):
         x_center=clip.w / 2, y_center=clip.h / 2,
         width=target_size[0], height=target_size[1],
     )
-    return clip.fadein(FADE_DURATION).fadeout(FADE_DURATION)
+
+    # انتقالات: المقطع الأول يتلاشى من الأسود عند بداية الفيديو (فتحة
+    # لطيفة)، وكل مقطع تالٍ يستخدم crossfadein (تلاشٍ بالشفافية) بدل
+    # fadein العادي (الذي يتلاشى من الأسود الصلب) - هذا هو الفرق الجوهري:
+    # crossfadein يجعل بداية المقطع شفافة تدريجيًا فيظهر المقطع السابق من
+    # خلفه أثناء التداخل الزمني الناتج عن padding سالب في concatenate_videoclips
+    # أدناه، فينتج تلاشٍ متبادل حقيقي (dissolve) بين المشهدين بدل "قطع أسود"
+    # قصير. المقطع الأخير يتلاشى للأسود عند نهاية الفيديو كخاتمة لطيفة.
+    if is_first:
+        clip = clip.fadein(FADE_DURATION)
+    else:
+        clip = clip.crossfadein(FADE_DURATION)
+    if is_last:
+        clip = clip.fadeout(FADE_DURATION)
+
+    return clip
 
 
-def _scene_cache_key(scene_result: dict, size: tuple[int, int]) -> str:
+def _scene_cache_key(scene_result: dict, size: tuple[int, int],
+                      is_first: bool, is_last: bool) -> str:
     """مفتاح يحدد بشكل فريد كل العوامل المؤثرة في شكل مقطع المشهد النهائي
-    (المصدر، القص، مدة الصوت المطلوبة، الدقة). أي تغيّر في أي منها يُبطل
-    الكاش لذلك المشهد فقط."""
+    (المصدر، القص، مدة الصوت المطلوبة، الدقة، موقعه في التسلسل - أول/أخير
+    مشهد يؤثران على نوع fade المُطبَّق). أي تغيّر في أي منها يُبطل الكاش
+    لذلك المشهد فقط."""
     payload = {
         "clip_path": scene_result["clip_path"],
         "start": scene_result["start"],
@@ -162,18 +261,21 @@ def _scene_cache_key(scene_result: dict, size: tuple[int, int]) -> str:
         "audio_duration": scene_result.get("audio_duration"),
         "size": size,
         "fade": FADE_DURATION,
+        "is_first": is_first,
+        "is_last": is_last,
     }
     raw = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _get_or_render_scene_clip(scene_id: str, scene_result: dict, size: tuple[int, int], cache_dir: str):
+def _get_or_render_scene_clip(scene_id: str, scene_result: dict, size: tuple[int, int], cache_dir: str,
+                               is_first: bool = False, is_last: bool = False):
     """يعيد مقطع الفيديو الجاهز (مع fade) لهذا المشهد: من الكاش إن كان
     موجودًا ومطابقًا (لا حاجة لإعادة قراءة/قص/تحجيم المصدر الخام)، أو
     يصيّره من جديد فقط إن تغيّر المصدر أو لم يكن مخزّنًا بعد.
     هذا هو ما يمنع إعادة معالجة كل المشاهد غير المرفوضة عند كل جولة تدقيق."""
     os.makedirs(cache_dir, exist_ok=True)
-    key = _scene_cache_key(scene_result, size)
+    key = _scene_cache_key(scene_result, size, is_first, is_last)
     cached_path = os.path.join(cache_dir, f"{scene_id}.mp4")
     meta_path = os.path.join(cache_dir, f"{scene_id}.key")
 
@@ -188,7 +290,7 @@ def _get_or_render_scene_clip(scene_id: str, scene_result: dict, size: tuple[int
             return VideoFileClip(cached_path)
 
     logger.info("[%s] تصيير مقطع جديد (مشهد جديد/مُستبدَل).", scene_id)
-    fresh_clip = _prepare_clip(scene_result, size)
+    fresh_clip = _prepare_clip(scene_result, size, is_first=is_first, is_last=is_last)
     fresh_clip.write_videofile(
         cached_path, fps=30, codec="libx264", audio=False,
         preset="medium", threads=4, logger=None,
@@ -208,17 +310,24 @@ def compose_video(scene_results: list[dict], narration_audio_path: str, subtitle
     (moviepy لا يدعم دمج صوت/ترجمة جزئيًا)، لكنها الآن خفيفة نسبيًا لأنها
     قراءة/دمج ملفات جاهزة الترميز بدل إعادة بناء كل مشهد من الصفر.
     """
+    n = len(scene_results)
     if scene_cache_dir:
-        # ملاحظة: fade مطبّق بالفعل داخل _prepare_clip قبل الكتابة إلى ملف
-        # الكاش، فلا يُعاد تطبيقه هنا (تجنّبًا لمضاعفة تأثير fade عند
+        # ملاحظة: fade/crossfade مطبّق بالفعل داخل _prepare_clip قبل الكتابة
+        # إلى ملف الكاش، فلا يُعاد تطبيقه هنا (تجنّبًا لمضاعفة التأثير عند
         # القراءة من الكاش في المرات اللاحقة).
         clips = [
-            _get_or_render_scene_clip(sr.get("scene_id") or sr.get("id") or f"scene_{i}",
-                                       sr, size, scene_cache_dir)
+            _get_or_render_scene_clip(
+                sr.get("scene_id") or sr.get("id") or f"scene_{i}",
+                sr, size, scene_cache_dir,
+                is_first=(i == 0), is_last=(i == n - 1),
+            )
             for i, sr in enumerate(scene_results)
         ]
     else:
-        clips = [_prepare_clip(sr, size) for sr in scene_results]
+        clips = [
+            _prepare_clip(sr, size, is_first=(i == 0), is_last=(i == n - 1))
+            for i, sr in enumerate(scene_results)
+        ]
     video = concatenate_videoclips(clips, method="compose", padding=-FADE_DURATION)
 
     narration = AudioFileClip(narration_audio_path)
