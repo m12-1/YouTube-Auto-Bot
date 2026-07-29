@@ -95,12 +95,26 @@ def get_failed_scenes(audit_results: list[dict]) -> list[dict]:
 
 def request_alternative_keywords_for_scene(narration: str, scene_text: str, issue: str) -> list[str]:
     prompt = f"""
-النص الكامل: "{narration}"
-جزء المشهد المشكل: "{scene_text}"
-المشكلة التي ذكرها المراجع: "{issue}"
+Full narration: "{narration}"
+Failing scene text: "{scene_text}"
+Reviewer issue: "{issue}"
 
-اقترح 3 كلمات/جمل بحث بصري إنجليزية جديدة لإيجاد مقطع فيديو أفضل لهذا الجزء.
-أعد فقط JSON: {{"alternative_keywords": ["...", "...", "..."]}}
+Generate 4 alternative stock-footage search queries in English for this scene.
+These queries will be sent directly to Pexels / Pixabay / NASA video APIs.
+
+Rules (follow strictly):
+1. Formula: [specific subject] + [visible action/state] + [setting/context]
+2. Be CONCRETE — describe what the camera literally sees, not the abstract concept.
+   BAD: "nature", "science", "history"
+   GOOD: "glacier melting arctic time-lapse", "neurons firing brain synapse close-up"
+3. Each query must target a DIFFERENT visual angle of the scene so results are diverse:
+   e.g. wide shot / close-up / action moment / diagram or visualization
+4. Include motion/action words when the scene implies movement.
+5. Do NOT use orientation words ("vertical", "portrait") — handled by API filters.
+6. Do NOT use marketing words ("amazing", "best", "incredible") — they hurt search precision.
+7. Each query: 3-6 words only.
+
+Return ONLY JSON: {{"alternative_keywords": ["query1", "query2", "query3", "query4"]}}
 """
     raw = call_gemini_with_rotation(STAGE, [prompt], response_mime_type="application/json")
     return parse_json_response(raw).get("alternative_keywords", [])
