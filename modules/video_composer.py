@@ -393,7 +393,37 @@ def compose_video(scene_results: list[dict], narration_audio_path: str, subtitle
     video = concatenate_videoclips(clips, method="compose", padding=-FADE_DURATION)
 
     narration = AudioFileClip(narration_audio_path)
-    video = video.set_audio(narration).set_duration(narration.duration)
+
+    # تصحيح: شاشة سوداء تامة تظهر في نهاية الفيديو بينما التعليق الصوتي
+    # يستمر بالحديث. السبب: video.set_duration(narration.duration) كانت
+    # تُغيّر فقط قيمة "المدة" المُعلَنة (metadata) للفيديو المُركَّب لتطابق
+    # مدة ملف الصوت الكامل، دون أن تُمدِّد المحتوى المرئي الفعلي بأي شكل.
+    # مدة الفيديو الفعلية (video.duration الطبيعية من concatenate_videoclips)
+    # قد تقصر عن مدة الصوت الكامل (narration.duration) لعدة أسباب مجتمعة:
+    # (1) تراكب الـ crossfade بين كل مشهدين يُنقِص (FADE_DURATION) من
+    # الزمن الإجمالي في كل انتقال (بسبب padding=-FADE_DURATION أعلاه)،
+    # و(2) احتمال عدم مطابقة كاملة بين نص كل مشهد وword boundaries
+    # الفعلية من edge-tts داخل compute_scene_timings، مما قد يجعل توقيت
+    # آخر مشهد/مشاهد ينتهي قبل نهاية الصوت الفعلية بقليل أو كثير. أي جزء
+    # من narration.duration يتجاوز طول الفيديو الفعلي كان يُعرَض كإطارات
+    # سوداء تمامًا (خلفية CompositeVideoClip الافتراضية) لأن moviepy لا
+    # يملك أي محتوى مرئي لرسمه هناك. الحل: لو كان الفيديو أقصر من الصوت،
+    # نُجمِّد آخر إطار (نفس أسلوب _extend_clip_to_duration أعلاه لكل مشهد
+    # منفرد) ليغطي الفارق بدل تركه أسود بالكامل؛ ولو كان أطول (نادر)،
+    # نقصّه لمدة الصوت بدل تمديد duration وهميًا بلا محتوى.
+    gap = narration.duration - video.duration
+    if gap > 0.05:
+        logger.warning(
+            "مدة الفيديو المُركَّب (%.2fث) أقصر من مدة الصوت الكامل (%.2fث) "
+            "بفارق %.2fث — سيُجمَّد آخر إطار لتغطية الفارق بدل شاشة سوداء. "
+            "يُستحسن مراجعة تزامن compute_scene_timings إن تكرر فارق كبير.",
+            video.duration, narration.duration, gap,
+        )
+        video = video.fx(vfx.freeze, t="end", total_duration=narration.duration)
+    elif gap < -0.05:
+        video = video.subclip(0, narration.duration)
+
+    video = video.set_audio(narration)
 
     subtitle_clips = []
     for seg in subtitle_segments:
