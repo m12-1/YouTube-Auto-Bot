@@ -170,6 +170,15 @@ def _render_subtitle_image(text: str, font_size: int = _SUBTITLE_FONT_SIZE):
         stroke_width=_SUBTITLE_STROKE_WIDTH, spacing=_SUBTITLE_LINE_SPACING,
         align="center",
     )
+    # تصحيح: عندما يكون محرك raqm متوفرًا في Pillow (يُفعَّل تلقائيًا مع
+    # النصوص المعقدة/ثنائية الاتجاه كالعربية)، تُعاد بعض إحداثيات bbox
+    # كأعداد عشرية (float) بدل صحيحة (مثال: -2.0 بدل -2) — بينما
+    # Image.new أدناه يتطلب مقاسًا صحيحًا (int) حصرًا. هذا بالضبط سبب
+    # خطأ "'float' object cannot be interpreted as an integer" الذي كان
+    # يظهر عند تجميع/تصدير الفيديو بمجرد وصول الكود لأول ترجمة (subtitle).
+    # نقرّب كل قيم bbox لأقرب عدد صحيح فور الحصول عليه لتفادي المشكلة
+    # جذريًا في كل الاستخدامات اللاحقة لها (canvas وموضع الرسم كليهما).
+    bbox = tuple(round(v) for v in bbox)
     pad = _SUBTITLE_STROKE_WIDTH * 2
     canvas_w = max(bbox[2] - bbox[0] + pad * 2, 1)
     canvas_h = max(bbox[3] - bbox[1] + pad * 2, 1)
