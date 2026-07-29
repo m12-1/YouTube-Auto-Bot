@@ -355,7 +355,7 @@ def _get_or_render_scene_clip(scene_id: str, scene_result: dict, size: tuple[int
     fresh_clip = _prepare_clip(scene_result, size, is_first=is_first, is_last=is_last)
     fresh_clip.write_videofile(
         cached_path, fps=30, codec="libx264", audio=False,
-        preset="medium", threads=4, logger=None,
+        preset="veryfast", threads=2, logger=None,
     )
     fresh_clip.close()
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -444,7 +444,7 @@ def compose_video(scene_results: list[dict], narration_audio_path: str, subtitle
     final = CompositeVideoClip([video] + subtitle_clips, size=size)
     final.write_videofile(
         out_path, fps=30, codec="libx264", audio_codec="aac",
-        preset="medium", threads=4,
+        preset="veryfast", threads=2,
     )
     for c in clips:
         c.close()
