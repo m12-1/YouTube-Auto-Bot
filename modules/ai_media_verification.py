@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -59,7 +60,7 @@ _VERIFY_PROMPT = """
 عن ظاهرة علمية محددة يوضحها عنوانه، أو العكس - فيديو يبدو مناسبًا بصريًا لكن
 عنوانه/وصفه يكشف أنه عن موضوع مختلف تمامًا):
 {candidates_meta}
-
+{prev_scene_context}
 قاعدة صارمة قبل أي تقييم: إن كان النص المتزامن أعلاه يذكر كيانًا محددًا
 بالاسم (كوكب، جرم سماوي، شخص، مكان، كائن...) وكان الفيديو (بصريًا، أو حسب
 عنوانه/وصفه) يُظهر كيانًا آخر مختلفًا فعليًا (مثال: النص عن "الزهرة" لكن
@@ -69,16 +70,47 @@ _VERIFY_PROMPT = """
 تحديدًا مع ما سيقرأه/يسمعه المشاهد في تلك اللحظة بالذات). لا تتساهل هنا حتى
 لو كان هذا أفضل مرشح متاح.
 
+⚠️ تحذير صارم بخصوص أسلوب التقييم: أنت مُدقِّق جودة، لست مجاملاً. مهمتك ليست
+إرضاء الجهة التي تشغّلك ولا "تسهيل" قبول المرشحين. قيّم بقسوة وصدق تامّين:
+- لا تعطِ درجة عالية (8+) إلا لتطابق فعلي واضح لا لبس فيه بين الفيديو والنص
+  المتزامن معه، وليس لمجرد أن الفيديو "قريب من الموضوع" أو "لا بأس به".
+- الشك يُفسَّر دائمًا ضد المرشح (benefit of the doubt يذهب للرفض لا للقبول):
+  إن لم تكن متأكدًا تمامًا من التطابق، أعطِ درجة منخفضة صراحة بدل تقريب
+  الدرجة للأعلى تفاؤلاً.
+- لا تتأثر بعدد المرشحين المتاحين أو بأن هذه ربما آخر محاولة لهذا المشهد؛
+  درجتك تعكس فقط مدى مطابقة الفيديو للنص (وللسياق البصري للمشهد السابق إن
+  وُجد)، وليس مدى "الحاجة" لقبول شيء ما.
+- كن دقيقًا في الأرقام: استخدم كامل مدى السلّم (0-10) بصدق، لا تكدّس الدرجات
+  حول 6-8 لمجرد أنها تبدو "آمنة" أو معتدلة.
+
 لكل فيديو (بالترتيب الذي أُرسل به)، قيّم مدى ملاءمته من 0 إلى 10 لتمثيل هذا
-النص المتزامن بصريًا (بعد تطبيق قاعدة تطابق الهوية أعلاه أولاً)،
-وحدد أفضل نطاق زمني (بالثواني) داخل الفيديو يمثل جوهر المشهد (لا يتجاوز طول المقطع الفعلي).
+النص المتزامن بصريًا (بعد تطبيق قاعدة تطابق الهوية والاتساق مع المشهد السابق
+أعلاه أولاً)، وحدد أفضل نطاق زمني (بالثواني) داخل الفيديو يمثل جوهر المشهد
+(لا يتجاوز طول المقطع الفعلي). أعد أيضًا لكل مرشح ملخصًا بصريًا مختصرًا جدًا
+(subject/action/setting) يصف ما يظهر فعليًا في الفيديو، بصرف النظر عن درجته،
+ليُستخدم عند تقييم المشهد التالي.
 
 أعد **فقط** كائن JSON بهذا الشكل، بدون أي نص إضافي:
 {{
   "results": [
-    {{"candidate_index": 0, "score": 0, "best_segment": {{"start": 0.0, "end": 0.0}}}}
+    {{"candidate_index": 0, "score": 0, "best_segment": {{"start": 0.0, "end": 0.0}},
+      "visual_summary": {{"subject": "...", "action": "...", "setting": "..."}}}}
   ]
 }}
+"""
+
+_PREV_SCENE_CONTEXT_TEMPLATE = """
+الملخص البصري لآخر مشهد مقبول قبل هذا المشهد مباشرة في نفس الفيديو (لمقارنة
+الاتساق، وليس فرض تطابق حرفي): {prev_summary_json}
+هام: لا تفرض تطابقًا مع هذا المشهد السابق إلا إذا كان نص المشهد الحالي نفسه
+يفترض استمرارية واضحة مع نفس الكائن/الشخصية/المكان (مثلاً ضمير عائد، أو
+إشارة صريحة، أو استكمال منطقي لنفس الموضوع الفرعي). إن كان نص المشهد الحالي
+يتحدث عن كيان أو فكرة مختلفة تمامًا عمدًا، تجاهل هذا السياق تمامًا ولا
+تعاقب المرشح على الاختلاف. لكن إن كانت الاستمرارية مطلوبة فعلاً واختلف
+المرشح في هوية الكائن الرئيسي (مثال: مشهد سابق عن سمكة نوع A، والمرشح
+الحالي يُظهر نوعًا مختلفًا B رغم أن النص يواصل الحديث عن نفس السمكة)، فهذا
+خطأ اتساق فادح يُعامَل مثل Entity Mismatch تمامًا (score=0)، حتى لو كان
+المرشح مطابقًا جيدًا لنص مشهده وحده بمعزل عن السياق.
 """
 
 _ALT_KEYWORD_PROMPT = """
@@ -118,6 +150,10 @@ _VERIFY_IMAGE_PROMPT = """
 عنوانها/وصفها) تُظهر كيانًا آخر مختلفًا فعليًا، فهذا خطأ فادح (Entity
 Mismatch) ويجب إعطاؤه 0 مهما بدا التطابق البصري العام جذابًا. لا تتساهل هنا
 حتى لو كانت هذه أفضل صورة متاحة.
+
+⚠️ أنت مُدقِّق جودة، لست مجاملاً. لا تعطِ درجة عالية إلا لتطابق فعلي واضح لا
+لبس فيه؛ الشك دائمًا يُفسَّر ضد المرشح (رفض لا قبول)، ولا تتأثر بأن هذه ربما
+آخر محاولة متاحة أو بعدد الصور المرسلة - درجتك تعكس المطابقة الفعلية فقط.
 
 هذه صورة ثابتة ستُعرض لعدة ثوانٍ بدل فيديو، لذا يجب أن تكون مطابقتها للنص
 المتزامن شبه مثالية (كن صارمًا جدًا في التقييم، لا تُعط 8 أو 9 إلا لتطابق
@@ -455,11 +491,18 @@ def _format_candidates_meta(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _verify_batch(narration_excerpt: str, candidates: list[dict], local_paths: list[str]) -> list[dict]:
+def _verify_batch(narration_excerpt: str, candidates: list[dict], local_paths: list[str],
+                   prev_visual_summary: dict | None = None) -> list[dict]:
+    prev_context = ""
+    if prev_visual_summary:
+        prev_context = _PREV_SCENE_CONTEXT_TEMPLATE.format(
+            prev_summary_json=json.dumps(prev_visual_summary, ensure_ascii=False)
+        )
     prompt = _VERIFY_PROMPT.format(
         n=len(candidates),
         narration_excerpt=narration_excerpt,
         candidates_meta=_format_candidates_meta(candidates),
+        prev_scene_context=prev_context,
     )
     raw = call_gemini_with_rotation(
         STAGE, [prompt], media_paths=local_paths, response_mime_type="application/json"
@@ -635,8 +678,9 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
             raw_previews = list(ex.map(lambda p: _make_verification_preview(p, media_dir), local_paths))
         preview_paths = [rp or p for rp, p in zip(raw_previews, local_paths)]
 
+        prev_visual_summary = run_state.get_previous_scene_visual_summary(scene_id)
         try:
-            results = _verify_batch(narration_excerpt, top3, preview_paths)
+            results = _verify_batch(narration_excerpt, top3, preview_paths, prev_visual_summary)
         except Exception as e:  # noqa: BLE001
             logger.error("[%s] فشل التحقق من الدفعة: %s", scene_id, e)
             results = []
@@ -662,6 +706,7 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
                     r_score, local_paths[r["candidate_index"]],
                     r_segment["start"], r_segment["end"],
                     top3[r["candidate_index"]],
+                    r.get("visual_summary"),
                 )
             break
 
@@ -699,6 +744,7 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
                 "media_type": "video",
             }
             run_state.set_scene_result(scene_id, **result)
+            run_state.set_scene_visual_summary(scene_id, best.get("visual_summary"))
             if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
                 run_state.mark_source_used(_source_key(chosen_candidate))
             logger.info("[%s] قُبل بعد %d محاولة (score=%.1f).", scene_id, retry + 1, best["score"])
@@ -719,7 +765,7 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
         return image_result
 
     if fallback_best is not None:
-        score, clip_path, start, end, fb_candidate = fallback_best
+        score, clip_path, start, end, fb_candidate, fb_visual_summary = fallback_best
 
         # نقطة 3 (ج): لا نقبل "أفضل مرشح مهما كانت درجته" حتى في وضع fallback؛
         # نفرض حدًا أدنى مطلقًا (MIN_FALLBACK_ACCEPT_SCORE). إن لم يتحقق، يُعلَّم
@@ -736,6 +782,7 @@ def verify_scene_media(scene: dict, run_state: RunState, media_dir: str, categor
             "media_type": "video",
         }
         run_state.set_scene_result(scene_id, **result)
+        run_state.set_scene_visual_summary(scene_id, fb_visual_summary)
         if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
             run_state.mark_source_used(_source_key(fb_candidate))
         if needs_manual_review:
