@@ -54,7 +54,6 @@ from modules import (
     subtitle_generator,
     video_composer,
     final_scene_audit,
-    graphic_fallback,
     competitor_seo_optimizer,
     publisher,
 )
@@ -239,60 +238,9 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
         else:
             logger.warning("لم يُستبدل أي مشهد فعليًا في هذه الجولة، تخطي إعادة الرندر.")
     else:
-        # نقطة "الملاذ الأخير المضمون": استُنفدت كل جولات التدقيق
-        # (MAX_SCENE_AUDIT_RETRIES) وبقيت مشاهد دون العتبة رغم إعادة البحث عن
-        # فيديو/صور بديلة. لبعض المشاهد (خصوصًا حقائق رقمية/مفاهيمية) لا يوجد
-        # فعليًا فيديو ستوك يطابق النص بدقة 9/10 في أي مصدر مجاني - هذا سقف
-        # واقعي في مصدر البيانات نفسه، لا عيب في منطق إعادة المحاولة. بدل ترك
-        # هذه المشاهد كما هي وإجبار مراجعة يدوية لكل الفيديو بسببها، تُستبدل
-        # كل مشهد فاشل ببطاقة رسومية متحركة (modules/graphic_fallback) تطابق
-        # نصه 100% لأنها مُنشأة برمجيًا لا مُبحث عنها، ثم يُعاد الرندر مرة
-        # أخيرة. لا تُفرض مراجعة يدوية إلا لو فشل توليد البطاقة نفسها لسبب ما
-        # (حالة نادرة جدًا لأن هذه الطبقة لا تعتمد على أي مصدر خارجي).
-        logger.warning(
-            "تم الوصول للحد الأقصى من محاولات التدقيق (%d) مع بقاء %d مشهد/مشاهد دون "
-            "المستوى (%s)؛ سيُستخدم الملاذ الأخير المضمون (بطاقات رسومية) لهذه المشاهد.",
-            MAX_SCENE_AUDIT_RETRIES, len(failed), [f["scene_id"] for f in failed],
-        )
-        _flush_logs()
-        fallback_clips_dir = os.path.join(run_dir, "graphic_fallback_clips")
-        any_fallback_applied = False
-        for f in failed:
-            scene_index = next((i for i, s in enumerate(plan["scenes"]) if s["id"] == f["scene_id"]), None)
-            if scene_index is None:
-                logger.warning("scene_id غير معروف من التدقيق: %s، تجاهل.", f["scene_id"])
-                continue
-            scene = plan["scenes"][scene_index]
-            timing = scene_timings.get(scene["id"])
-            fallback_duration = (
-                (timing[1] - timing[0]) if timing
-                else scene_results[scene_index].get("audio_duration", 3.0)
-            )
-            try:
-                fallback_result = graphic_fallback.build_fallback_scene_result(
-                    scene, fallback_duration, fallback_clips_dir, narration=plan["narration"],
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.error(
-                    "فشل توليد بطاقة الملاذ الأخير للمشهد %s (%s)؛ سيبقى دون تغيير "
-                    "وتُفرض مراجعة يدوية لهذا الفيديو.", f["scene_id"], e,
-                )
-                manual_review_required = True
-                continue
-            scene_results[scene_index] = fallback_result
-            any_fallback_applied = True
-            logger.info(
-                "[%s] استُبدل ببطاقة الملاذ الأخير المضمون (Motion Graphic Card، درجة ثابتة %.1f).",
-                scene["id"], graphic_fallback.GRAPHIC_FALLBACK_SCORE,
-            )
-
-        if any_fallback_applied:
-            logger.info("إعادة رندر الفيديو مرة أخيرة بعد تطبيق بطاقات الملاذ الأخير للمشاهد المتبقية.")
-            _flush_logs()
-            video_composer.compose_video(
-                scene_results, audio_path, subtitle_segments, final_video_path,
-                scene_cache_dir=scene_cache_dir,
-            )
+        logger.warning("تم الوصول للحد الأقصى من محاولات التدقيق (%d) مع بقاء مشاهد دون المستوى.",
+                        MAX_SCENE_AUDIT_RETRIES)
+        manual_review_required = True
 
     # نقطة 3: أي مشهد استخدم fallback بدرجة أقل من الحد الأدنى المطلق (
     # MIN_FALLBACK_ACCEPT_SCORE) يُعلَّم needs_manual_review من داخل
