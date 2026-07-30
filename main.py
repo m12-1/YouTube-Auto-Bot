@@ -128,6 +128,19 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
         result = ai_media_verification.verify_scene_media(scene, state, media_dir, category=category, topic=topic)
         if result is None:
             raise RuntimeError(f"فشل نهائي في إيجاد وسائط مناسبة للمشهد {scene['id']}")
+        rewritten = result.get("rewritten_narration_text")
+        if rewritten:
+            original_text = result.get("original_narration_text", scene["text"])
+            if original_text in plan["narration"]:
+                plan["narration"] = plan["narration"].replace(original_text, rewritten, 1)
+            else:
+                logger.warning(
+                    "[%s] تعذّر إيجاد النص الأصلي حرفيًا داخل narration الكامل لاستبداله؛ "
+                    "narration الكامل لن يعكس النص المعاد صياغته لهذا المشهد.",
+                    scene["id"],
+                )
+            scene["text"] = rewritten
+            logger.info("[%s] استُبدل نص السرد بنسخة معاد صياغتها لتناسب الصور المتاحة.", scene["id"])
         scene_results.append(result)
 
     # الصوت والترجمة
