@@ -63,7 +63,7 @@ MIN_SOURCE_SECONDS_FOR_BOOMERANG = 1.0
 ENABLE_CROSS_SCENE_MEDIA_DEDUP = True
 
 # ===== عتبات التقييم =====
-MEDIA_RELEVANCE_ACCEPT_THRESHOLD = 8       # من 10 - قبول المشهد من نتائج البحث
+MEDIA_RELEVANCE_ACCEPT_THRESHOLD = 9       # من 10 - قبول المشهد من نتائج البحث
 SCENE_AUDIT_ACCEPT_THRESHOLD = 7.5         # من 10 - قبول المشهد في التدقيق النهائي
 
 # من 10 - قبول الهوك (أول 2-3 ثوانٍ من النص) ضمن نفس استدعاء بناء السكربت
@@ -81,7 +81,7 @@ MAX_SCENE_AUDIT_RETRIES = 3       # عدد محاولات إعادة بناء م
 # الحد الأدنى المطلق المقبول لخطة fallback (أفضل مرشح لم يبلغ عتبة القبول
 # العادية MEDIA_RELEVANCE_ACCEPT_THRESHOLD). أي مرشح fallback بدرجة أقل من هذا
 # الحد لا يُقبل بصمت، بل يُعلَّم المشهد بعلم needs_manual_review.
-MIN_FALLBACK_ACCEPT_SCORE = 6
+MIN_FALLBACK_ACCEPT_SCORE = 7
 
 # ===== خطة الصور البديلة (Fallback) عند فشل إيجاد فيديو مناسب لمشهد =====
 # تُستخدم فقط بعد استنفاد كل محاولات الفيديو العادية (MAX_KEYWORD_RETRY_PER_SCENE)
@@ -89,7 +89,7 @@ MIN_FALLBACK_ACCEPT_SCORE = 6
 # الواحدة أقل ديناميكية من الفيديو، فيجب أن تكون مطابقتها للنص شبه مثالية
 # لتعويض ذلك، وإلا نُفضّل الرجوع لمنطق fallback الفيديو القديم/المراجعة اليدوية
 # بدل نشر صورة غير مطابقة فعليًا.
-MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD = 9   # من 10 - أعلى من عتبة الفيديو (8) عمدًا
+MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD = 9   # من 10 - مساوية لعتبة الفيديو (9) بعد توحيدهما
 MIN_IMAGES_PER_SCENE = 3    # أقل عدد صور مقبولة (score>=9) لتغطية مدة المشهد
 MAX_IMAGES_PER_SCENE = 4    # أعلى عدد صور تُعرض بالتتابع لتغطية مشهد واحد
 MAX_IMAGE_KEYWORD_RETRY_PER_SCENE = 4  # محاولات تبديل الكلمة المفتاحية أثناء البحث عن صور
