@@ -145,6 +145,7 @@ async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page:
                         "title": None,
                         "description": f"Stock footage by {video.get('user', {}).get('name')}" if video.get("user") else None,
                     })
+            logger.info("Pexels [%s] فيديو: %d نتيجة (بعد الفلاتر) من %d.", keyword, len(results), len(data.get("videos", [])))
             return results
     except Exception as e:
         logger.warning("خطأ بحث Pexels عن '%s': %s", keyword, e)
@@ -154,6 +155,7 @@ async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page:
 async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page: int = _PER_SOURCE_QUOTA):
     global _PIXABAY_ENABLED
     if not _PIXABAY_ENABLED:
+        logger.info("Pixabay [%s]: تخطي (المصدر معطّل حاليًا لهذا التشغيل).", keyword)
         return []
 
     api_key = os.environ.get("PIXABAY_API_KEY")
@@ -195,6 +197,7 @@ async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page
                         "title": None,
                         "description": f"Tags: {hit.get('tags')}" if hit.get("tags") else None,
                     })
+            logger.info("Pixabay [%s] فيديو: %d نتيجة (بعد الفلاتر) من %d.", keyword, len(results), len(data.get("hits", [])))
             return results
     except Exception as e:
         logger.warning("خطأ بحث Pixabay عن '%s': %s", keyword, e)
@@ -426,6 +429,7 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
     global _NASA_ENABLED, _NASA_HEALTH_CHECK_DONE
 
     if not _NASA_ENABLED:
+        logger.info("NASA [%s]: تخطي (المصدر معطّل حاليًا لهذا التشغيل).", keyword)
         return []
 
     # تشغيل health check مرة واحدة عند أول استدعاء لـ NASA
@@ -494,6 +498,7 @@ async def _search_nasa(session: aiohttp.ClientSession, keyword: str, limit: int 
         })
         if len(results) >= limit:
             break
+    logger.info("NASA [%s] فيديو: %d نتيجة (بعد الفلاتر) من %d.", keyword, len(results), len(items))
     return results
 
 
@@ -552,9 +557,12 @@ async def _search_pexels_images(session: aiohttp.ClientSession, keyword: str, pe
 async def _search_pixabay_images(session: aiohttp.ClientSession, keyword: str, per_page: int = _PER_SOURCE_QUOTA):
     global _PIXABAY_ENABLED
     if not _PIXABAY_ENABLED:
+        logger.info("Pixabay صور [%s]: تخطي (المصدر معطّل حاليًا لهذا التشغيل).", keyword)
         return []
     api_key = os.environ.get("PIXABAY_API_KEY")
     if not api_key:
+        logger.warning("PIXABAY_API_KEY غير موجود، تعطيل Pixabay (صور) لهذه الجولة.")
+        _PIXABAY_ENABLED = False
         return []
     params = {"key": api_key, "q": keyword, "per_page": per_page, "image_type": "photo"}
     try:
@@ -586,6 +594,7 @@ async def _search_pixabay_images(session: aiohttp.ClientSession, keyword: str, p
                     "title": None,
                     "description": f"Tags: {hit.get('tags')}" if hit.get("tags") else None,
                 })
+            logger.info("Pixabay صور [%s]: %d نتيجة (بعد الفلاتر) من %d.", keyword, len(results), len(data.get("hits", [])))
             return results
     except Exception as e:
         logger.warning("خطأ بحث صور Pixabay عن '%s': %s", keyword, e)
@@ -685,6 +694,7 @@ async def _search_wikimedia_commons_images(session: aiohttp.ClientSession, keywo
 async def _search_nasa_images(session: aiohttp.ClientSession, keyword: str, limit: int = _PER_SOURCE_QUOTA):
     global _NASA_ENABLED
     if not _NASA_ENABLED:
+        logger.info("NASA صور [%s]: تخطي (المصدر معطّل حاليًا لهذا التشغيل).", keyword)
         return []
     api_key = os.environ.get("Nasa_API_key")
     if not api_key:
@@ -736,6 +746,7 @@ async def _search_nasa_images(session: aiohttp.ClientSession, keyword: str, limi
         })
         if len(results) >= limit:
             break
+    logger.info("NASA صور [%s]: %d نتيجة (بعد الفلاتر) من %d.", keyword, len(results), len(items))
     return results
 
 
@@ -748,6 +759,10 @@ async def search_scene_images(
     ونفس فلاتر الجودة/الرخصة/تعارض الكيانات. يُستدعى فقط من ai_media_verification
     كخطة صارمة بعد فشل كل محاولات الفيديو العادية لمشهد ما."""
     use_nasa = _mentions_space_or_astronomy(category, topic, " ".join(visual_keywords))
+    logger.info(
+        "خطة الصور: use_nasa=%s (category=%r, topic=%r, keywords=%r), NASA_ENABLED=%s.",
+        use_nasa, category, topic, visual_keywords, _NASA_ENABLED,
+    )
 
     async with aiohttp.ClientSession() as session:
         tasks = []
@@ -759,6 +774,8 @@ async def search_scene_images(
                 tasks.append(_search_nasa_images(session, kw))
         results_lists = await asyncio.gather(*tasks)
 
+    total = sum(len(sub) for sub in results_lists)
+    logger.info("خطة الصور: إجمالي %d مرشح صورة من كل المصادر لهذه الجولة.", total)
     return [c for sub in results_lists for c in sub]
 
 
@@ -774,6 +791,10 @@ async def search_scene_media(
 ):
     all_keywords = list(visual_keywords)
     use_nasa = _mentions_space_or_astronomy(category, topic, " ".join(all_keywords))
+    logger.info(
+        "بحث الفيديو: use_nasa=%s (category=%r, topic=%r, keywords=%r), NASA_ENABLED=%s.",
+        use_nasa, category, topic, all_keywords, _NASA_ENABLED,
+    )
 
     nasa_candidates = []
     if use_nasa and _NASA_ENABLED:
