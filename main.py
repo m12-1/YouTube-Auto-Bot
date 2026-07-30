@@ -7,6 +7,7 @@
 يتطلب ملف .env (انظر .env.example) يحوي كل الأسرار المذكورة.
 """
 
+import json
 import os
 import sys
 import argparse
@@ -120,6 +121,9 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
     state.data["video_title"] = plan["video_title"]
     state.data["youtube_keywords"] = plan["youtube_keywords"]
     state.save()
+    # تسجيل ترتيب المشاهد كما ورد في السكربت، لتمكين مقارنة كل مشهد بصريًا مع
+    # المشهد السابق مباشرة له أثناء التحقق (ai_media_verification).
+    state.set_scene_order([s["id"] for s in plan["scenes"]])
 
     # 4+5) البحث المتوازي عن الوسائط + التحقق البصري لكل مشهد
     logger.info("=== المراحل 4-5: البحث والتحقق من الوسائط لكل مشهد ===")
@@ -243,6 +247,24 @@ def run_pipeline(category: str, run_dir: str = None, dry_run_publish: bool = Fal
     # ai_media_verification، فنجمعها هنا أيضًا لتوحيد قرار النشر.
     if any(r.get("needs_manual_review") for r in scene_results):
         manual_review_required = True
+
+    # ملف تجميعي واحد يحوي التحليل البصري الكامل (visual_summary) لكل مشهد
+    # تم قبوله فعليًا فقط، بترتيب ظهورها في الفيديو، لمراجعة اتساق الفيديو
+    # الكلي لاحقًا (يدويًا أو آليًا) دون الحاجة لإعادة فتح كل مشهد على حدة.
+    accepted_visual_analysis = []
+    for scene in plan["scenes"]:
+        scene_id = scene["id"]
+        result = state.data["scenes"].get(scene_id, {})
+        accepted_visual_analysis.append({
+            "scene_id": scene_id,
+            "text": scene["text"],
+            "score": result.get("score"),
+            "media_type": result.get("media_type"),
+            "needs_manual_review": result.get("needs_manual_review", False),
+            "visual_summary": state.data.get("scene_visual_summaries", {}).get(scene_id),
+        })
+    with open(os.path.join(run_dir, "accepted_scenes_visual_analysis.json"), "w", encoding="utf-8") as f:
+        json.dump(accepted_visual_analysis, f, ensure_ascii=False, indent=2)
 
     # 8) تحسين SEO بمقارنة المنافسين
     logger.info("=== المرحلة 8: تحسين السيو ===")
