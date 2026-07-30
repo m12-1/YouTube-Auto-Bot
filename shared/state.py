@@ -29,6 +29,14 @@ class RunState:
             "narration": None,
             "video_title": None,
             "youtube_keywords": [],
+            # scene_id -> ملخص بصري JSON مختصر (subject/action/setting/entities)
+            # لآخر مرشح مقبول في ذلك المشهد. يُستخدم لمقارنة المشهد التالي
+            # بصريًا مع المشهد السابق (اتساق عبر المشاهد)، وليس فقط مطابقة
+            # كل مشهد لنصه بمعزل عن بقية الفيديو.
+            "scene_visual_summaries": {},
+            # قائمة scene_id بترتيب ظهورها في السكربت، تُملأ مرة واحدة من
+            # main.py بعد بناء الخطة، لتمكين معرفة "المشهد السابق" لأي مشهد.
+            "scene_order": [],
         }
         if os.path.exists(self.path):
             with open(self.path, "r", encoding="utf-8") as f:
@@ -37,6 +45,10 @@ class RunState:
             # توافقية مع ملفات run_state.json قديمة أُنشئت قبل إضافة هذا الحقل
             # (تشغيلات سابقة على نسخة الكود قبل إصلاح تكرار المشهد).
             self.data.setdefault("used_source_keys", [])
+            # توافقية مع ملفات run_state.json قديمة أُنشئت قبل إضافة الاتساق
+            # البصري عبر المشاهد (cross-scene consistency).
+            self.data.setdefault("scene_visual_summaries", {})
+            self.data.setdefault("scene_order", [])
 
     def save(self):
         with self._lock:
@@ -68,6 +80,34 @@ class RunState:
     def source_already_used(self, source_key: str) -> bool:
         with self._lock:
             return bool(source_key) and source_key in self.data["used_source_keys"]
+
+    def set_scene_order(self, scene_ids: list[str]):
+        """تُستدعى مرة واحدة بعد بناء خطة المشاهد (main.py) لتسجيل ترتيبها،
+        فيُستخدم لاحقًا لمعرفة \"المشهد السابق\" لأي مشهد عبر get_previous_scene_visual_summary."""
+        with self._lock:
+            self.data["scene_order"] = list(scene_ids)
+            self.save()
+
+    def set_scene_visual_summary(self, scene_id: str, summary: dict | None):
+        """يخزّن الملخص البصري (subject/action/setting/entities) للمرشح الذي
+        تم قبوله فعليًا لهذا المشهد، ليُستخدم في مقارنة المشهد التالي معه."""
+        with self._lock:
+            if summary:
+                self.data["scene_visual_summaries"][scene_id] = summary
+                self.save()
+
+    def get_previous_scene_visual_summary(self, scene_id: str) -> dict | None:
+        """يعيد الملخص البصري للمشهد السابق مباشرة (حسب scene_order) لهذا
+        المشهد، أو None إن كان هذا أول مشهد أو لم يُسجَّل ترتيب/ملخص بعد."""
+        with self._lock:
+            order = self.data.get("scene_order", [])
+            if scene_id not in order:
+                return None
+            idx = order.index(scene_id)
+            if idx == 0:
+                return None
+            prev_id = order[idx - 1]
+            return self.data.get("scene_visual_summaries", {}).get(prev_id)
 
     def set_scene_result(self, scene_id: str, clip_path: str, start: float, end: float, score: float,
                           needs_manual_review: bool = False, requires_attribution: bool = False,
