@@ -107,11 +107,23 @@ def _classify_orientation(width, height) -> str | None:
     return "square"
 
 
-def _orientation_allowed(width, height) -> bool:
+# Pixabay تحديدًا لا يدعم تحديد الاتجاه عبر الـ API، ويُرجع فيديوهاته عالية
+# الدقة (tier "large") أفقية شبه دائمًا (مثال: 1920x1080). تقييده بـ
+# ALLOWED_VIDEO_ORIENTATIONS العادي (portrait فقط) كان يُصفّر نتائجه بالكامل.
+# لذا نقبل من Pixabay كل الاتجاهات (video وimages)، ونعتمد على crop-to-fill في
+# video_composer.py ليملأ الإطار العمودي النهائي. باقي المصادر (Pexels،
+# Internet Archive، Wikimedia Commons، NASA) تبقى مقيدة بـ
+# ALLOWED_VIDEO_ORIENTATIONS الأصلي كما كان قبل هذا التعديل.
+_PIXABAY_ALLOWED_ORIENTATIONS = ["portrait", "landscape", "square"]
+_PIXABAY_SOURCES = {"pixabay", "pixabay_photo"}
+
+
+def _orientation_allowed(width, height, source: str | None = None) -> bool:
     orientation = _classify_orientation(width, height)
     if orientation is None:
         return True
-    return orientation in ALLOWED_VIDEO_ORIENTATIONS
+    allowed = _PIXABAY_ALLOWED_ORIENTATIONS if source in _PIXABAY_SOURCES else ALLOWED_VIDEO_ORIENTATIONS
+    return orientation in allowed
 
 
 async def _search_pexels(session: aiohttp.ClientSession, keyword: str, per_page: int = _PER_SOURCE_QUOTA):
@@ -183,7 +195,7 @@ async def _search_pixabay(session: aiohttp.ClientSession, keyword: str, per_page
                 best = videos.get("large")
                 if best and (best.get("height") or 0) < 1080:
                     best = None
-                if best and not _orientation_allowed(best.get("width"), best.get("height")):
+                if best and not _orientation_allowed(best.get("width"), best.get("height"), source="pixabay"):
                     best = None
                 if best:
                     results.append({
@@ -577,7 +589,7 @@ async def _search_pixabay_images(session: aiohttp.ClientSession, keyword: str, p
             results = []
             for hit in data.get("hits", []):
                 width, height = hit.get("imageWidth"), hit.get("imageHeight")
-                if not _meets_min_resolution(height) or not _orientation_allowed(width, height):
+                if not _meets_min_resolution(height) or not _orientation_allowed(width, height, source="pixabay_photo"):
                     continue
                 url = hit.get("largeImageURL")
                 if not url:
