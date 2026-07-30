@@ -14,8 +14,33 @@ import os
 import subprocess
 import tempfile
 
+from google.genai import types
+
 from shared.gemini_client import call_gemini_with_rotation, parse_json_response
 from config import SCENE_AUDIT_ACCEPT_THRESHOLD, MAX_SCENE_AUDIT_RETRIES
+
+# سكيمة صارمة لمخرجات التدقيق النهائي: تُفرض على Gemini مباشرة عبر
+# response_schema بدل الاعتماد فقط على وصف الشكل داخل نص البرومبت، فيمنع
+# غالبية أخطاء "JSON غير سليم" (نص/اقتباسات غير مهرَّبة داخل حقل issue...)
+# التي كانت تُسقط هذه المرحلة بالكامل رغم استجابة Gemini الناجحة (200 OK).
+_AUDIT_RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "scenes": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "scene_id": types.Schema(type=types.Type.STRING),
+                    "score": types.Schema(type=types.Type.NUMBER),
+                    "issue": types.Schema(type=types.Type.STRING),
+                },
+                required=["scene_id", "score", "issue"],
+            ),
+        ),
+    },
+    required=["scenes"],
+)
 
 logger = logging.getLogger("modules.final_scene_audit")
 
@@ -92,7 +117,8 @@ def audit_video(final_video_path: str, narration: str, scenes: list[dict]) -> li
     prompt = _AUDIT_PROMPT.format(narration=narration, scene_list=scene_list_str)
     preview_path = _make_audit_preview(final_video_path)
     raw = call_gemini_with_rotation(
-        STAGE, [prompt], media_paths=[preview_path], response_mime_type="application/json"
+        STAGE, [prompt], media_paths=[preview_path],
+        response_mime_type="application/json", response_schema=_AUDIT_RESPONSE_SCHEMA,
     )
     return parse_json_response(raw).get("scenes", [])
 
