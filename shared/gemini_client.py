@@ -115,7 +115,7 @@ def _load_inline_media_part(path: str) -> dict:
 
 
 def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: list | None = None,
-                               response_mime_type: str = None,
+                               response_mime_type: str = None, response_schema=None,
                                max_output_tokens: int = 2048, temperature: float = 0.7):
     """
     يستدعي Gemini مع تدوير تلقائي بين المفاتيح والنماذج عند 429.
@@ -124,6 +124,10 @@ def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: li
     media_paths: مسارات ملفات وسائط محلية (فيديو/صورة) تُرسَل كـ inline data مباشرة
                  ضمن كل طلب (بدل Files API المعطّلة في هذه الحزمة المتوقفة).
     response_mime_type: مثلاً "application/json" لإجبار خرج JSON منظم
+    response_schema: (اختياري) types.Schema أو dict يصف بنية الـ JSON المطلوبة بدقة.
+                 عند تمريره مع response_mime_type="application/json" يفرض Gemini فعليًا
+                 الالتزام بالبنية (structured output)، بدل الاعتماد فقط على وصف البنية
+                 داخل نص البرومبت — يمنع الغالبية العظمى من أخطاء "JSON غير سليم".
     يعيد: نص الاستجابة (str)
     """
     rotator = GeminiKeyModelRotator(stage_name)
@@ -157,6 +161,8 @@ def call_gemini_with_rotation(stage_name: str, text_parts: list, media_paths: li
             }
             if response_mime_type:
                 config_kwargs["response_mime_type"] = response_mime_type
+            if response_schema is not None:
+                config_kwargs["response_schema"] = response_schema
 
             response = client.models.generate_content(
                 model=model_name,
@@ -253,11 +259,62 @@ def _extract_balanced_json_object(text: str) -> str:
     return text[start:]
 
 
+def _repair_common_json_issues(text: str) -> str:
+    """يصلح أكثر أخطاء JSON شيوعًا الناتجة عن نماذج اللغة قبل التخلي والفشل:
+    - فواصل زائدة قبل } أو ] (trailing commas).
+    - أسطر جديدة حرفية (\n حقيقي) داخل قيم السلاسل النصية، والتي يجب أن تكون
+      مهرَّبة (\\n) لكن النموذج أحيانًا يتركها كما هي فيكسر json.loads
+      برسالة مثل "Expecting ',' delimiter" لأنها تبدو للـ parser كسطر جديد
+      خارج السلسلة.
+    هذه معالجة نصية بسيطة وليست بديلاً كاملاً عن parser JSON5، لكنها تغطي
+    الغالبية العظمى من حالات الفشل الفعلية التي شوهدت في التشغيل."""
+    # 1) فواصل زائدة: ,} أو ,]
+    import re
+    repaired = re.sub(r",(\s*[}\]])", r"\1", text)
+
+    # 2) استبدال الأسطر الجديدة الحرفية داخل السلاسل النصية بـ \n مهرَّبة،
+    # مع تتبع ما إذا كنا داخل سلسلة نصية أم لا (بنفس منطق موازنة الأقواس).
+    out = []
+    in_string = False
+    escape = False
+    for ch in repaired:
+        if in_string:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out)
+
+
 def parse_json_response(raw_text: str) -> dict:
     """يستخرج أول كائن JSON متوازن {...} من النص عبر موازنة أقواس حقيقية
     (brace counting)، بدل الاعتماد فقط على إزالة أسوار Markdown أو على
     regex جشع، لأن النموذج قد يضيف جملة قبل/بعد الأقواس حتى مع
-    response_mime_type='application/json'."""
+    response_mime_type='application/json'.
+
+    عند فشل json.loads الأول (مثل "Expecting ',' delimiter" الذي أوقف
+    مرحلة التدقيق النهائي بالكامل سابقًا رغم استجابة 200 OK صحيحة)، تُجرَّب
+    محاولة ترميم للأخطاء الشائعة (فواصل زائدة، أسطر جديدة غير مهرَّبة داخل
+    السلاسل) قبل رفع الاستثناء نهائيًا، بدل إسقاط خط الإنتاج بالكامل من أول
+    خطأ تنسيق بسيط."""
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
@@ -265,4 +322,17 @@ def parse_json_response(raw_text: str) -> dict:
             cleaned = cleaned[4:]
     cleaned = cleaned.strip()
     cleaned = _extract_balanced_json_object(cleaned)
-    return json.loads(cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "فشل json.loads الأول (%s) — محاولة ترميم أخطاء التنسيق الشائعة.", e
+        )
+        repaired = _repair_common_json_issues(cleaned)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            # الترميم فشل أيضًا — نرفع الخطأ الأصلي بوضوح ليتعامل معه المستدعي
+            # (بدل استثناء غامض على نص مختلف بعد الترميم)
+            raise e
