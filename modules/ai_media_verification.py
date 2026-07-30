@@ -135,6 +135,50 @@ Mismatch) ويجب إعطاؤه 0 مهما بدا التطابق البصري ا
 """
 
 
+_REWRITE_SCENE_TEXT_PROMPT = """
+موضوع الفيديو العام: "{video_topic}"
+
+هذا الجزء من سكربت السرد الصوتي (narration) لمشهد واحد:
+"{narration_excerpt}"
+
+لم نجد أي صورة/فيديو حقيقي في مكتباتنا المجانية يطابق بصريًا هذا النص كما هو
+مكتوب حاليًا (الظاهرة/الحدث الموصوف نادر التصوير الحقيقي، مثل: انفجار نجمي،
+نافورة جليدية على قمر بعيد، إلخ). لدينا بدل ذلك أفضل صورة متاحة موصوفة أدناه،
+وهي مرتبطة بالموضوع لكنها لا تُظهر الحدث المحدد حرفيًا.
+
+وصف/عنوان أفضل صورة متاحة لدينا لنعرضها فعليًا كخلفية لهذا المشهد:
+{best_image_meta}
+
+المطلوب: أعد صياغة نص السرد أعلاه فقط (بنفس اللغة الأصلية للنص) بحيث:
+1. يصف الفكرة/الظاهرة كلاميًا بأسلوب سينمائي حيّ وتخيّلي ("تخيّل أن...")، بدل
+   افتراض أن المُشاهد يراها حرفيًا أمامه، لأن الصورة المعروضة رمزية/تقريبية
+   وليست توثيقًا مباشرًا للحدث.
+2. يبقى قريبًا جدًا من نفس عدد الكلمات وزمن النطق التقريبي للنص الأصلي (لا
+   تُطِل ولا تُقصّر بشكل كبير)، حتى لا يختل توقيت الفيديو.
+3. لا يذكر أنه "لا توجد صورة حقيقية" أو أي إشارة تقنية للمشاهد - فقط سرد
+   طبيعي مستمر يبدو جزءًا أصيلاً من باقي السكربت.
+4. يحافظ على نفس المعنى العلمي/الجوهري للجملة الأصلية دون تحريف الحقائق.
+
+أعد فقط كائن JSON بهذا الشكل، بدون أي نص إضافي:
+{{"rewritten_text": "..."}}
+"""
+
+
+def _rewrite_scene_narration(narration_excerpt: str, video_topic: str, best_candidate: dict) -> str | None:
+    prompt = _REWRITE_SCENE_TEXT_PROMPT.format(
+        video_topic=video_topic,
+        narration_excerpt=narration_excerpt,
+        best_image_meta=_format_candidates_meta([best_candidate]),
+    )
+    try:
+        raw = call_gemini_with_rotation(STAGE, [prompt], response_mime_type="application/json")
+        text = parse_json_response(raw).get("rewritten_text")
+        return text.strip() if text else None
+    except Exception as e:  # noqa: BLE001
+        logger.error("فشل إعادة صياغة نص المشهد: %s", e)
+        return None
+
+
 def _verify_image_batch(narration_excerpt: str, candidates: list[dict], local_paths: list[str]) -> list[dict]:
     prompt = _VERIFY_IMAGE_PROMPT.format(
         n=len(candidates),
@@ -167,13 +211,17 @@ def _download_images_sync(candidates: list[dict], media_dir: str) -> list[str | 
 def _try_image_fallback(scene: dict, run_state: RunState, media_dir: str,
                          category: str = "", topic: str = "") -> dict | None:
     """
-    خطة بديلة صارمة تُستدعى فقط بعد استنفاد كل محاولات الفيديو العادية لمشهد
-    ما دون بلوغ عتبة القبول. تبحث عن صور (بدل فيديو) بنفس المصادر ونفس فلاتر
-    الجودة/الرخصة/تعارض الكيانات، وتقبل فقط صورًا بتقييم >= 
-    MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD (أعلى من عتبة الفيديو نفسها). يجمع
-    3-4 صور مقبولة (MIN/MAX_IMAGES_PER_SCENE) لتُعرض بالتتابع (زوم بطيء) بديلاً
-    عن الفيديو المفقود. إن لم يصل لعدد الصور الأدنى، يعيد None فيتراجع الكود
-    المستدعي لمنطق fallback الفيديو القديم (المراجعة اليدوية) كما كان.
+    خطة بديلة تُستدعى فقط بعد استنفاد كل محاولات الفيديو العادية لمشهد ما دون
+    بلوغ عتبة القبول. لها ثلاثة مستويات:
+    1. صور بعتبة >= MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD (صارمة، أعلى من
+       عتبة الفيديو): تُجمع 3-4 صور (MIN/MAX_IMAGES_PER_SCENE) لتُعرض بالتتابع.
+    2. إن لم تتوفر صور كافية بهذه العتبة لكن توجد صور مرتبطة بدرجة أضعف: يُطلب
+       من Gemini إعادة صياغة نص المشهد كوصف سردي/تخيلي يناسب أفضل صورة متاحة
+       فعليًا، وتُختار أفضل 2-3 صور لعرضها مع النص المعاد صياغته
+       (rewritten_narration_text في القيمة المُعادة، يجب على المستدعي تحديث
+       narration/scene["text"] بها قبل توليد الصوت).
+    3. لا يوجد أي مرشح صور إطلاقًا: تُعاد None فيتراجع الكود المستدعي لمنطق
+       fallback الفيديو القديم (المراجعة اليدوية).
     """
     scene_id = scene["id"]
     narration_excerpt = scene["text"]
@@ -181,8 +229,10 @@ def _try_image_fallback(scene: dict, run_state: RunState, media_dir: str,
     base_keywords = list(scene.get("visual_keywords", []))
 
     tried_keywords: list[str] = []
-    accepted: list[tuple[float, str, dict]] = []  # (score, local_path, candidate)
+    accepted: list[tuple[float, str, dict]] = []  # (score, local_path, candidate) بعتبة >= 9
+    all_seen: list[tuple[float, str, dict]] = []  # كل من قُيِّم فعليًا، أيًا كانت درجته
     used_source_keys: set[str] = set()
+    seen_source_keys: set[str] = set()
 
     for round_idx in range(MAX_IMAGE_KEYWORD_RETRY_PER_SCENE):
         if len(accepted) >= MIN_IMAGES_PER_SCENE:
@@ -225,10 +275,13 @@ def _try_image_fallback(scene: dict, run_state: RunState, media_dir: str,
             score = r.get("score", 0)
             if idx is None or not (0 <= idx < len(batch)):
                 continue
-            if score < MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD:
-                continue
             cand = batch[idx]
             skey = _source_key(cand)
+            if skey not in seen_source_keys:
+                seen_source_keys.add(skey)
+                all_seen.append((score, local_paths[idx], cand))
+            if score < MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD:
+                continue
             if skey in used_source_keys:
                 continue
             used_source_keys.add(skey)
@@ -238,11 +291,59 @@ def _try_image_fallback(scene: dict, run_state: RunState, media_dir: str,
                 break
 
     if len(accepted) < MIN_IMAGES_PER_SCENE:
+        if not all_seen:
+            logger.info(
+                "[%s] خطة الصور البديلة: لا يوجد أي مرشح صور على الإطلاق، تراجع لمنطق fallback القديم.",
+                scene_id,
+            )
+            return None
+
+        # المستوى الثالث: لا توجد صور كافية بعتبة صارمة (9+)، لكن توجد صور
+        # مرتبطة بدرجة أضعف. بدل استخدام أضعف نتيجة بصمت (توهم المشاهد بأن
+        # الصورة تطابق النص حرفيًا)، نطلب من Gemini إعادة صياغة نص السرد
+        # لهذا المشهد تحديدًا كوصف سردي/تخيلي يتوافق مع الصورة المتاحة فعلًا،
+        # ونختار أفضل 2-3 صور (وليس صورة واحدة) لتجنّب رتابة المشهد.
+        best_by_score = sorted(all_seen, key=lambda a: a[0], reverse=True)
+        best_candidate = best_by_score[0][2]
+        rewritten = _rewrite_scene_narration(narration_excerpt, video_topic, best_candidate)
+        if not rewritten:
+            logger.warning(
+                "[%s] فشلت إعادة صياغة النص، تراجع لمنطق fallback القديم.", scene_id
+            )
+            return None
+
+        top_n = best_by_score[:min(MAX_IMAGES_PER_SCENE, max(2, min(3, len(best_by_score))))]
+        image_paths = [p for _, p, _ in top_n]
+        chosen_candidates = [c for _, _, c in top_n]
+        min_score = min(s for s, _, _ in top_n)
+
+        if ENABLE_CROSS_SCENE_MEDIA_DEDUP:
+            for c in chosen_candidates:
+                run_state.mark_source_used(_source_key(c))
+
+        attributions = [
+            c.get("attribution_text") for c in chosen_candidates
+            if c.get("requires_attribution") and c.get("attribution_text")
+        ]
+
         logger.info(
-            "[%s] خطة الصور البديلة: لم يُعثر إلا على %d/%d صورة بعتبة %.1f، تراجع لمنطق fallback القديم.",
-            scene_id, len(accepted), MIN_IMAGES_PER_SCENE, MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD,
+            "[%s] خطة الصور: تفعيل مسار إعادة الصياغة (%d صور بأفضل درجة %.1f، دون بلوغ عتبة %.1f). "
+            "النص الجديد: \"%s\"",
+            scene_id, len(top_n), min_score, MEDIA_IMAGE_RELEVANCE_ACCEPT_THRESHOLD, rewritten,
         )
-        return None
+
+        return {
+            "clip_path": image_paths[0],
+            "start": 0, "end": 0,
+            "score": min_score,
+            "needs_manual_review": False,
+            "requires_attribution": bool(attributions),
+            "attribution_text": "; ".join(dict.fromkeys(attributions)) if attributions else None,
+            "media_type": "image_sequence",
+            "images": image_paths,
+            "rewritten_narration_text": rewritten,
+            "original_narration_text": narration_excerpt,
+        }
 
     accepted = sorted(accepted, key=lambda a: a[0], reverse=True)[:MAX_IMAGES_PER_SCENE]
     image_paths = [p for _, p, _ in accepted]
