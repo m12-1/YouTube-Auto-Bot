@@ -8,7 +8,7 @@ import json
 import logging
 
 from shared.gemini_client import call_gemini_with_rotation, parse_json_response
-from config import MIN_VIDEO_SECONDS, MAX_VIDEO_SECONDS
+from config import MIN_VIDEO_SECONDS, MAX_VIDEO_SECONDS, HOOK_QUALITY_ACCEPT_THRESHOLD
 
 logger = logging.getLogger("modules.script_and_seo_planner")
 
@@ -76,6 +76,18 @@ Write:
    - duration_estimate: estimated duration of this scene in seconds (decimal)
 3. video_title: a catchy English video title
 4. youtube_keywords: SEO keywords in English, ordered to match the narration flow
+5. hook_self_review: after writing the narration above, critique your OWN hook
+   (the first 2-3 seconds of narration) honestly, as a strict short-form-video
+   editor would, using these exact criteria:
+   a) Does it create a genuine curiosity gap that stays UNRESOLVED until later
+      in the script (not a fact that's already fully explained in the hook itself)?
+   b) Did it actually avoid generic/banned openers ("Did you know...", a flat
+      topic description, or any template-sounding phrase)?
+   c) Is it written specifically for THIS topic and these facts (not a generic
+      sentence that could be reused for almost any topic by swapping one word)?
+   Score your own hook honestly from 0 to 10 (score, not score of the whole
+   script) — be a harsh critic, most first-draft hooks deserve 5-7, not 9-10.
+   Return: {{"score": 0.0, "issue": "specific honest weakness if score < 8, else empty string"}}
 
 Return **only** a JSON object in this exact shape, no extra text or Markdown fences:
 {{
@@ -84,7 +96,8 @@ Return **only** a JSON object in this exact shape, no extra text or Markdown fen
     {{"id": "scene_1", "text": "...", "visual_keywords": ["subject action setting", "subject motion context", "subject detail close-up"], "duration_estimate": 5.0}}
   ],
   "video_title": "...",
-  "youtube_keywords": ["...", "..."]
+  "youtube_keywords": ["...", "..."],
+  "hook_self_review": {{"score": 0.0, "issue": "..."}}
 }}
 """
 
@@ -93,10 +106,18 @@ def _total_duration(plan: dict) -> float:
     return sum(s.get("duration_estimate", 0) for s in plan.get("scenes", []))
 
 
-def build_plan(topic: str, facts: str, max_retries: int = 3) -> dict:
+def build_plan(topic: str, facts: str, max_retries: int = 4) -> dict:
     """
-    يستدعي Gemini لبناء الخطة، ويتحقق أن مجموع مدة المشاهد ضمن [MIN, MAX].
-    إن خرج عن النطاق يطلب من جمناي إعادة الضبط (validation loop).
+    يستدعي Gemini لبناء الخطة، ويتحقق من شرطين قبل القبول:
+    1) مجموع مدة المشاهد ضمن [MIN, MAX] (كما كان).
+    2) تقييم Gemini الذاتي لجودة الهوك (hook_self_review.score) >=
+       HOOK_QUALITY_ACCEPT_THRESHOLD - نفس فلسفة إعادة استبدال المشهد المرفوض
+       في التدقيق البصري النهائي، لكن مطبّقة هنا على الهوك النصي بدل اللقطة
+       المرئية، وضمن نفس استدعاء بناء السكربت (بلا أي استدعاء Gemini إضافي).
+    إن فشل أي شرط، تُدمَج كل الملاحظات في رسالة واحدة وتُطلب إعادة المحاولة،
+    مع توضيح أنه لو كان الهوك فقط هو المشكلة، يُعاد كتابة الهوك (أول 2-3 ثوانٍ
+    من السكربت) فقط بما يعالج الملاحظة ويناسب الموضوع تحديدًا، مع إبقاء بقية
+    السكربت/المشاهد كما هي قدر الإمكان.
     """
     feedback = ""
     plan = None
@@ -115,25 +136,49 @@ def build_plan(topic: str, facts: str, max_retries: int = 3) -> dict:
             logger.warning("محاولة %d: JSON غير صالح (%s)، إعادة المحاولة.", attempt + 1, e)
             feedback = "\n\nملاحظة: ردّك السابق لم يكن JSON صالحًا بالكامل. أعد الإخراج بعناية."
             continue
-        total = _total_duration(plan)
 
-        if MIN_VIDEO_SECONDS <= total <= MAX_VIDEO_SECONDS:
+        total = _total_duration(plan)
+        duration_ok = MIN_VIDEO_SECONDS <= total <= MAX_VIDEO_SECONDS
+
+        hook_review = plan.get("hook_self_review") or {}
+        hook_score = hook_review.get("score", 10)
+        hook_issue = hook_review.get("issue", "")
+        hook_ok = hook_score >= HOOK_QUALITY_ACCEPT_THRESHOLD
+
+        if duration_ok and hook_ok:
             plan["_total_duration"] = total
             return plan
 
-        logger.warning(
-            "محاولة %d: مجموع مدة المشاهد = %.1f ثانية (خارج النطاق %d-%d)، إعادة الضبط.",
-            attempt + 1, total, MIN_VIDEO_SECONDS, MAX_VIDEO_SECONDS,
-        )
-        feedback = (
-            f"\n\nملاحظة: خطتك السابقة كانت مجموع مدتها {total:.1f} ثانية وهذا خارج النطاق "
-            f"المطلوب ({MIN_VIDEO_SECONDS}-{MAX_VIDEO_SECONDS}). أعد التوزيع بدقة أكبر."
-        )
+        issues = []
+        if not duration_ok:
+            logger.warning(
+                "محاولة %d: مجموع مدة المشاهد = %.1f ثانية (خارج النطاق %d-%d).",
+                attempt + 1, total, MIN_VIDEO_SECONDS, MAX_VIDEO_SECONDS,
+            )
+            issues.append(
+                f"- المدة: خطتك السابقة كانت مجموع مدتها {total:.1f} ثانية وهذا خارج النطاق "
+                f"المطلوب ({MIN_VIDEO_SECONDS}-{MAX_VIDEO_SECONDS}). أعد التوزيع بدقة أكبر."
+            )
+        if not hook_ok:
+            logger.warning(
+                "محاولة %d: تقييم الهوك الذاتي = %.1f (دون العتبة %.1f). الملاحظة: %s",
+                attempt + 1, hook_score, HOOK_QUALITY_ACCEPT_THRESHOLD, hook_issue or "(لا توجد)",
+            )
+            issues.append(
+                f"- الهوك: قيّمتَ هوكك السابق بنفسك بـ {hook_score:.1f}/10 (دون العتبة "
+                f"{HOOK_QUALITY_ACCEPT_THRESHOLD}) بسبب: \"{hook_issue}\". أعد كتابة الهوك "
+                f"فقط (أول 2-3 ثوانٍ من السكربت) بما يعالج هذه الملاحظة تحديدًا ويناسب موضوع "
+                f"\"{topic}\" بدقة أكبر - لا تكتب هوكًا عامًا قابلاً لإعادة استخدامه لأي موضوع "
+                f"آخر. أبقِ بقية السكربت والمشاهد كما هي قدر الإمكان طالما تظل متماسكة مع الهوك "
+                f"الجديد."
+            )
+
+        feedback = "\n\nملاحظات على المحاولة السابقة يجب معالجتها في هذه المحاولة:\n" + "\n".join(issues)
 
     # آخر محاولة: نعيد آخر خطة حتى لو لم تُطابق تمامًا، مع تحذير
     if plan is None:
         raise ValueError(f"فشل الحصول على JSON صالح بعد {max_retries} محاولات.")
-    logger.error("لم يتم ضبط المدة ضمن النطاق بعد %d محاولات، استخدام آخر نتيجة.", max_retries)
+    logger.error("لم يتم استيفاء شرط المدة و/أو جودة الهوك بعد %d محاولات، استخدام آخر نتيجة.", max_retries)
     plan["_total_duration"] = total
     return plan
 
